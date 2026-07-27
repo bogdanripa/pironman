@@ -1,5 +1,11 @@
 import os
 
+_REQUIRED = ["COOLIFY_TOKEN", "COOLIFY_PROJECT", "COOLIFY_SERVER",
+             "COOLIFY_DESTINATION", "PAAS_DB_HOST", "PAAS_DB_PASSWORD"]
+_missing = [k for k in _REQUIRED if not os.environ.get(k)]
+if _missing:
+    raise SystemExit("missing required environment variables: " + ", ".join(_missing))
+
 COOLIFY_URL         = os.environ.get("COOLIFY_URL", "http://coolify:8000")
 COOLIFY_TOKEN       = os.environ["COOLIFY_TOKEN"]
 COOLIFY_PROJECT     = os.environ["COOLIFY_PROJECT"]
