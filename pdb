@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# pdb — provision databases.
+# Usage: pdb <create|drop|list|host> [name] [--engine postgres|mongo]
+set -euo pipefail
+
+ACTION=""; NAME=""; ENGINE="postgres"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --engine) ENGINE="${2:?engine required}"; shift 2 ;;
+    *) if [[ -z "$ACTION" ]]; then ACTION="$1"; else NAME="$1"; fi; shift ;;
+  esac
+done
+[[ -n "$ACTION" ]] || { echo "usage: pdb <create|drop|list|host> [name] [--engine postgres|mongo]" >&2; exit 1; }
+
+find_container() {
+  docker ps --format '{{.Names}}\t{{.Image}}' \
+    | awk -v p="^$1" '$2 ~ p && $1 != "coolify-db" {print $1}' | head -1
+}
+
+PG_C=$(find_container "postgres:")
+MG_C=$(find_container "mongo:")
+
+pg() { docker exec -i "$PG_C" psql -U postgres -tAc "$1"; }
+mg() {
+  local u p
+  u=$(docker exec "$MG_C" printenv MONGO_INITDB_ROOT_USERNAME 2>/dev/null || echo "")
+  p=$(docker exec "$MG_C" printenv MONGO_INITDB_ROOT_PASSWORD 2>/dev/null || echo "")
+  if [[ -n "$u" ]]; then
+    docker exec -i "$MG_C" mongosh --quiet -u "$u" -p "$p" --authenticationDatabase admin --eval "$1"
+  else
+    docker exec -i "$MG_C" mongosh --quiet --eval "$1"
+  fi
+}
+
+json() { printf '{"engine":"%s","host":"%s","port":%s,"user":"%s","password":"%s","database":"%s"}\n' "$1" "$2" "$3" "$4" "$5" "$6"; }
+
+case "$ENGINE:$ACTION" in
+  postgres:host)   echo "$PG_C" ;;
+  mongo:host)      echo "$MG_C" ;;
+  postgres:create)
+    [[ -n "$NAME" ]] || { echo "name required" >&2; exit 1; }
+    PW=$(openssl rand -hex 24)
+    pg "CREATE USER \"$NAME\" WITH PASSWORD '$PW'" >/dev/null
+    pg "CREATE DATABASE \"$NAME\" OWNER \"$NAME\"" >/dev/null
+    json postgres "$PG_C" 5432 "$NAME" "$PW" "$NAME"
+    ;;
+  postgres:drop)
+    pg "DROP DATABASE IF EXISTS \"$NAME\"" >/dev/null
+    pg "DROP USER IF EXISTS \"$NAME\"" >/dev/null
+    echo '{"dropped":"'"$NAME"'"}'
+    ;;
+  postgres:list)   pg "SELECT datname FROM pg_database WHERE datistemplate = false" ;;
+  mongo:create)
+    [[ -n "$NAME" ]] || { echo "name required" >&2; exit 1; }
+    PW=$(openssl rand -hex 24)
+    mg "db.getSiblingDB('$NAME').createUser({user:'$NAME',pwd:'$PW',roles:[{role:'dbOwner',db:'$NAME'}]})" >/dev/null
+    json mongo "$MG_C" 27017 "$NAME" "$PW" "$NAME"
+    ;;
+  mongo:drop)
+    mg "db.getSiblingDB('$NAME').dropUser('$NAME')" >/dev/null 2>&1 || true
+    mg "db.getSiblingDB('$NAME').dropDatabase()" >/dev/null
+    echo '{"dropped":"'"$NAME"'"}'
+    ;;
+  mongo:list)      mg "db.adminCommand('listDatabases').databases.forEach(d => print(d.name))" ;;
+  *) echo "unknown: $ENGINE:$ACTION" >&2; exit 1 ;;
+esac

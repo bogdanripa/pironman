@@ -16,3 +16,6 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=15s \
   CMD curl -fsS http://localhost:80/health || exit 1
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80"]
+
+COPY pdb /usr/local/bin/pdb
+RUN chmod +x /usr/local/bin/pdb
