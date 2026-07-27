@@ -1,7 +1,7 @@
 import os
 
 _REQUIRED = ["COOLIFY_TOKEN", "COOLIFY_PROJECT", "COOLIFY_SERVER",
-             "COOLIFY_DESTINATION", "PAAS_DB_HOST", "PAAS_DB_PASSWORD"]
+             "COOLIFY_DESTINATION", "PAAS_DB_PASSWORD"]
 _missing = [k for k in _REQUIRED if not os.environ.get(k)]
 if _missing:
     raise SystemExit("missing required environment variables: " + ", ".join(_missing))
@@ -15,8 +15,20 @@ COOLIFY_ENV_NAME    = os.environ.get("COOLIFY_ENV_NAME", "production")
 
 DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
 
+def _pg_host() -> str:
+    """Resolve the Postgres container name live. Coolify recreates database
+    resources on routine config edits and the name changes each time, so a
+    hardcoded host would strand the API from its own registry."""
+    h = os.environ.get("PAAS_DB_HOST")
+    if h:
+        return h
+    import subprocess
+    return subprocess.run(["/usr/local/bin/pdb", "host", "--engine", "postgres"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
 PAAS_DB = dict(
-    host=os.environ["PAAS_DB_HOST"],
+    host=_pg_host(),
     port=int(os.environ.get("PAAS_DB_PORT", 5432)),
     user=os.environ.get("PAAS_DB_USER", "_paas"),
     password=os.environ["PAAS_DB_PASSWORD"],
