@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Host-side cron dispatcher. One crontab entry runs this every minute:
+
+    * * * * * /usr/local/bin/paas-cron-dispatch >> /var/log/paas-cron.log 2>&1
+
+Reads the crons table straight out of Postgres via `docker exec`, so the host
+needs no Python database driver — only the stdlib.
+
+Calls each due job at the app's PUBLIC url, deliberately: once Sablier is in
+place, a cron hitting a slept app wakes it.
+"""
+import json
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+
+sys.path.insert(0, "/opt/paas")          # where app/cronmatch.py is mounted
+from app.cronmatch import due            # noqa: E402
+
+DOMAIN_SUFFIX = "-coolify.bogdanripa.com"
+SQL = ("SELECT c.app_id, c.schedule, c.method, c.path, "
+       "coalesce(c.body,'') FROM crons c WHERE c.enabled")
+
+
+def pg_container() -> str:
+    out = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"],
+        capture_output=True, text=True, check=True).stdout
+    for line in out.splitlines():
+        name, _, image = line.partition("\t")
+        if image.startswith("postgres:") and name != "coolify-db":
+            return name
+    raise SystemExit("no app postgres container")
+
+
+def rows() -> list[list[str]]:
+    r = subprocess.run(
+        ["docker", "exec", "-i", pg_container(),
+         "psql", "-U", "postgres", "-d", "_paas", "-tAF", "\x1f", "-c", SQL],
+        capture_output=True, text=True, check=True)
+    return [l.split("\x1f") for l in r.stdout.strip().splitlines() if l]
+
+
+def fire(app_id: str, method: str, path: str, body: str) -> None:
+    url = f"https://{app_id}{DOMAIN_SUFFIX}{path}"
+    data = body.encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            print(f"{stamp} {method} {url} -> {resp.status}")
+    except Exception as e:                                  # noqa: BLE001
+        print(f"{stamp} {method} {url} -> ERROR {e}")
+
+
+def main() -> None:
+    now = datetime.now()
+    for app_id, schedule, method, path, body in rows():
+        if due(schedule, now):
+            fire(app_id, method, path, body)
+
+
+if __name__ == "__main__":
+    main()
