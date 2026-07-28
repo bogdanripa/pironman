@@ -115,9 +115,18 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "re-pushing :latest does not reliably force a fresh pull.",
         "The app must already exist here before the first workflow run; CI only "
         "ever updates an existing app.",
-        "First run will fail if the ghcr package is private and the Pi has no "
-        "pull credential for it — it does, but a brand-new package may need to be "
-        "linked to its repository in the package's GitHub settings.",
+        "The push authenticates with the built-in GITHUB_TOKEN, which works "
+        "because the package CI creates is automatically linked to this repo. "
+        "The one case where it does NOT work: if the image was ever pushed by "
+        "hand first (a manual `docker push` during setup), the ghcr package "
+        "already exists owned by your account with no repo link, and CI then "
+        "fails at push with '403 Forbidden'. Fix it in the package's GitHub "
+        "settings → Manage Actions access → add this repo with the Write role; "
+        "or delete the hand-pushed package and let the first CI run create it. "
+        "Letting CI create the package from the start avoids this entirely.",
+        "If the package is private, the Pi needs a pull credential for it — it "
+        "has one, but a brand-new private package may need to be linked to its "
+        "repository in the package's GitHub settings before the Pi can pull.",
     ]
     if row["db_engine"]:
         notes.append(

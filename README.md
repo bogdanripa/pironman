@@ -65,17 +65,27 @@ The app's registry id is **`api`** (it serves `api-coolify.bogdanripa.com`, and
 differ — the workflow in `.github/workflows/deploy.yml` spells them out
 explicitly rather than deriving them from the repo name.
 
+Unlike a normally-scaffolded app, this workflow logs in to ghcr with a **PAT**
+(`GHCR_PAT` secret) rather than the built-in `GITHUB_TOKEN`. The `paas-api`
+package was first pushed by hand during bootstrap, so it exists owned by the
+account with no link to the repo, and `GITHUB_TOKEN` gets `403 Forbidden` on
+push. A fresh app whose package is created by its first CI run does not need
+this — see the note that `apps_deploy_workflow` returns.
+
 One-time setup, in order:
 
 1. Get the current code (this feature) running once by hand — build/push the
    image and hit **Redeploy** in Coolify — so `apps_adopt` exists on the live
    instance.
-2. Mint a dedicated key for CI and add it as the `PAAS_KEY` repository secret on
-   `bogdanripa/pironman`:
+2. Add two repository secrets on `bogdanripa/pironman`:
+   - `PAAS_KEY` — a dedicated platform key for the redeploy call, minted with:
 
-   ```
-   docker exec -it <api-container> python -m app.cli create ci-paas-api
-   ```
+     ```
+     docker exec -it <api-container> python -m app.cli create ci-paas-api
+     ```
+
+   - `GHCR_PAT` — a classic PAT with `write:packages`, so the workflow can push
+     to the hand-created `paas-api` package (see above).
 
 3. Adopt paas-api into its own registry (once):
 
