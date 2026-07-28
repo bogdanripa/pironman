@@ -12,18 +12,51 @@ router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_
 
 
 class CreateApp(BaseModel):
-    id: str = Field(description="slug; becomes the hostname")
-    image: str = Field(description="e.g. ghcr.io/bogdanripa/notes:latest")
-    db_engine: Literal["postgres", "mongo"] | None = None
-    health_path: str = Field(default="/", description="path the healthcheck hits")
+    id: str = Field(
+        description="Short lowercase slug, e.g. 'notes'. Must match "
+                    "^[a-z][a-z0-9-]{1,30}$. This becomes the hostname: the app "
+                    "will be served at https://<id>-coolify.bogdanripa.com. "
+                    "Cannot be changed later.")
+    image: str = Field(
+        description="Pullable docker image reference including tag, e.g. "
+                    "'ghcr.io/bogdanripa/notes:latest' or 'nginx:alpine'. MUST be "
+                    "built for linux/arm64 — the host is a Raspberry Pi 5, and an "
+                    "amd64 image will pull successfully and then fail to start. "
+                    "The container MUST listen on port 80.")
+    db_engine: Literal["postgres", "mongo"] | None = Field(
+        default=None,
+        description="Omit for an app with no database. Set to 'postgres' or "
+                    "'mongo' to provision a dedicated database and user for this "
+                    "app; the connection string is injected into the container as "
+                    "the DATABASE_URL environment variable. Postgres is the "
+                    "better default — its JSONB type covers most document "
+                    "workloads and it has a simpler backup story.")
+    health_path: str = Field(
+        default="/",
+        description="Path the container healthcheck requests, e.g. '/health'. Must "
+                    "return HTTP 200 without authentication. Leave as '/' unless "
+                    "the app has a dedicated health endpoint or its root path "
+                    "requires a login.")
 
 
 class UpdateCode(BaseModel):
-    image: str
+    image: str = Field(
+        description="New docker image reference, e.g. "
+                    "'ghcr.io/bogdanripa/notes:sha-a1b2c3d'. Prefer an immutable "
+                    "tag over ':latest' — the platform pulls by tag, and pushing a "
+                    "new ':latest' does not reliably force a fresh pull. Must be "
+                    "linux/arm64.")
 
 
-@router.get("", operation_id="list_apps", summary="List all deployed apps")
+@router.get("", operation_id="list_apps",
+            summary="List every app deployed on the Pi")
 async def list_apps():
+    """List all deployed apps with their image, database engine, public URL and
+    number of scheduled jobs.
+
+    Call this first whenever the user refers to an app by name — it confirms the
+    app exists and shows how it is configured, which avoids guessing at ids.
+    """
     async with pool().acquire() as c:
         rows = await c.fetch(
             "SELECT a.id, a.image, a.db_engine, a.created_at, "
@@ -36,8 +69,17 @@ async def list_apps():
     ]
 
 
-@router.get("/{app_id}", operation_id="get_app", summary="Get one app with its crons and database URL")
+@router.get("/{app_id}", operation_id="get_app",
+            summary="Get one app's full configuration, including database credentials")
 async def get_app(app_id: str):
+    """Full detail for a single app: current image, database engine, a
+    ready-to-use database connection string, every scheduled job, and the public
+    URL.
+
+    The connection string is composed fresh on each call rather than stored,
+    because the database container's hostname changes whenever the database
+    resource is rebuilt. Always read it from here rather than caching it.
+    """
     async with pool().acquire() as c:
         row = await c.fetchrow("SELECT * FROM apps WHERE id = $1", app_id)
         if not row:
@@ -57,8 +99,27 @@ async def get_app(app_id: str):
     return out
 
 
-@router.post("", status_code=201, operation_id="create_app", summary="Create and deploy a new app from a docker image, optionally with a postgres or mongo database")
+@router.post("", status_code=201, operation_id="create_app",
+             summary="Create and deploy a new app from a docker image, optionally with a database")
 async def create_app(body: CreateApp):
+    """Create a new app: registers it, enables a healthcheck, optionally
+    provisions a database, injects DATABASE_URL, and deploys it.
+
+    The public URL is assigned automatically — there is no DNS or certificate
+    step, and the app is reachable over HTTPS within about 30 seconds. Requests
+    made before the image finishes pulling may return 502 briefly.
+
+    Two constraints cause almost every failed first deploy, so check them before
+    calling: the image must be built for **linux/arm64**, and the container must
+    listen on **port 80**.
+
+    Fails with 409 if the id is already taken. If anything fails partway, the
+    whole operation is rolled back, so a half-created app never lingers holding
+    the hostname.
+
+    This only creates the app. Subsequent code changes go through
+    update_app_code, which is also what a CI pipeline calls.
+    """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
 
@@ -68,8 +129,6 @@ async def create_app(body: CreateApp):
 
     uuid = await coolify.create_app(body.image, app_fqdn(body.id))
 
-    # Anything that fails from here leaves a Coolify app with no registry row —
-    # invisible to this API but still holding the hostname. Always roll back.
     db_info = None
     try:
         await coolify.set_healthcheck(uuid, body.health_path)
@@ -114,8 +173,19 @@ async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:
             pass
 
 
-@router.put("/{app_id}/code", operation_id="update_app_code", summary="Point an app at a new image tag and redeploy it")
+@router.put("/{app_id}/code", operation_id="update_app_code",
+            summary="Point an app at a new image tag and redeploy it")
 async def update_code(app_id: str, body: UpdateCode):
+    """Deploy new code by pointing an existing app at a new docker image tag.
+
+    This is the endpoint a CI pipeline calls after building and pushing an image.
+    The app keeps its URL, its database and all its scheduled jobs; DATABASE_URL
+    is recomposed and re-injected, so it stays correct even if the database
+    container has been rebuilt since the last deploy.
+
+    Use an immutable tag such as ':sha-a1b2c3d'. Re-pushing ':latest' and
+    redeploying does not reliably pull the new image.
+    """
     async with pool().acquire() as c:
         row = await c.fetchrow(
             "SELECT coolify_uuid, db_engine, db_user, db_password, db_name "
@@ -125,8 +195,6 @@ async def update_code(app_id: str, body: UpdateCode):
 
     await coolify.set_image(row["coolify_uuid"], body.image)
 
-    # Recompose DATABASE_URL on every deploy: the container name may have
-    # changed since last time.
     if row["db_engine"]:
         url = await provision.compose_url(
             row["db_engine"], row["db_user"], row["db_password"], row["db_name"])
@@ -140,8 +208,19 @@ async def update_code(app_id: str, body: UpdateCode):
     return {"id": app_id, "image": body.image}
 
 
-@router.delete("/{app_id}", status_code=204, operation_id="delete_app", summary="Delete an app, its database and its crons")
+@router.delete("/{app_id}", status_code=204, operation_id="delete_app",
+               summary="Permanently delete an app, its database and its schedules")
 async def delete_app(app_id: str):
+    """Destroy an app completely: the container, its database **including all
+    data**, and every scheduled job attached to it.
+
+    This is irreversible and there is no undo. Confirm with the user before
+    calling it, and say explicitly that the database will be dropped.
+
+    Deletion of the container is asynchronous, so creating a new app with the
+    same id immediately afterwards can collide with the one still shutting down.
+    Wait a few seconds if recreating.
+    """
     async with pool().acquire() as c:
         row = await c.fetchrow(
             "SELECT coolify_uuid, db_engine FROM apps WHERE id = $1", app_id)
