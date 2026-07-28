@@ -150,10 +150,12 @@ show a masked preview only, so a secret never lands in a tool result.
 
 ## Known-unverified
 
-`set_image`, `set_env`, `list_envs`, `delete_env` and `deploy` in `coolify.py`
-were not exercised against the live instance — only `create_app` and
-`delete_app` were. The environment-variable feature depends on the env calls, so
-the first real `env_set`/`apps_env_set` is where to confirm those shapes. If a
-redeploy or env injection misbehaves, read `https://coolify.bogdanripa.com/docs`
-in a browser (it is session-authenticated; a bearer token will not fetch it) and
-correct the body shapes there first.
+`create_app`, `delete_app`, `set_image`, `deploy` and `get_app` in `coolify.py`
+have all now run against the live instance — `set_image`/`deploy` via the
+recursive self-deploy and `get_app` via `apps_adopt`. Still unexercised:
+`set_env`, `list_envs` and `delete_env`. The self-deploy did **not** cover
+`set_env`, because paas-api has no env vars and no database, so the first real
+`env_set`/`apps_env_set` is where those env shapes get confirmed. If env
+injection misbehaves, read `https://coolify.bogdanripa.com/docs` in a browser (it
+is session-authenticated; a bearer token will not fetch it) and correct the body
+shapes there first.

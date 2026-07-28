@@ -60,15 +60,16 @@ async def delete_app(uuid: str) -> None:
 
 
 async def get_app(uuid: str) -> dict:
-    """Read one application. Same /applications/{uuid} path as the VERIFIED
-    delete_app, so the shape is trustworthy. Raises CoolifyError (404) if the
-    uuid does not exist — used to reject adopting a dangling uuid."""
+    """VERIFIED. Read one application — exercised by apps_adopt when paas-api
+    adopted itself. Raises CoolifyError (404) if the uuid does not exist, which
+    is how adopt rejects a dangling uuid."""
     data = await _request("GET", f"/applications/{uuid}")
     return data if isinstance(data, dict) else {}
 
 
 async def set_image(uuid: str, image: str) -> None:
-    """UNVERIFIED shape."""
+    """VERIFIED. Exercised by the recursive self-deploy: apps_update_code called
+    this to repoint paas-api at a new sha- tag, and the new image came up."""
     name, _, tag = image.partition(":")
     await _request("PATCH", f"/applications/{uuid}", json={
         "docker_registry_image_name": name,
@@ -77,7 +78,9 @@ async def set_image(uuid: str, image: str) -> None:
 
 
 async def set_env(uuid: str, key: str, value: str) -> None:
-    """UNVERIFIED shape. Tries create, falls back to update on conflict."""
+    """UNVERIFIED shape. Tries create, falls back to update on conflict. Note the
+    self-deploy did NOT exercise this — paas-api has no env vars and no database,
+    so sync_env's loop was empty. The first real env_set is still the test."""
     body = {"key": key, "value": value, "is_preview": False}
     try:
         await _request("POST", f"/applications/{uuid}/envs", json=body)
@@ -123,5 +126,6 @@ async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
 
 
 async def deploy(uuid: str) -> None:
-    """UNVERIFIED shape."""
+    """VERIFIED. POST /deploy?uuid= — confirmed both by hand and by the recursive
+    self-deploy, which queued and completed a redeploy of paas-api."""
     await _request("POST", "/deploy", params={"uuid": uuid})
