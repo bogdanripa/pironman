@@ -22,7 +22,7 @@ class UpdateCode(BaseModel):
     image: str
 
 
-@router.get("")
+@router.get("", operation_id="list_apps", summary="List all deployed apps")
 async def list_apps():
     async with pool().acquire() as c:
         rows = await c.fetch(
@@ -36,7 +36,7 @@ async def list_apps():
     ]
 
 
-@router.get("/{app_id}")
+@router.get("/{app_id}", operation_id="get_app", summary="Get one app with its crons and database URL")
 async def get_app(app_id: str):
     async with pool().acquire() as c:
         row = await c.fetchrow("SELECT * FROM apps WHERE id = $1", app_id)
@@ -57,7 +57,7 @@ async def get_app(app_id: str):
     return out
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, operation_id="create_app", summary="Create and deploy a new app from a docker image, optionally with a postgres or mongo database")
 async def create_app(body: CreateApp):
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
@@ -114,7 +114,7 @@ async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:
             pass
 
 
-@router.put("/{app_id}/code")
+@router.put("/{app_id}/code", operation_id="update_app_code", summary="Point an app at a new image tag and redeploy it")
 async def update_code(app_id: str, body: UpdateCode):
     async with pool().acquire() as c:
         row = await c.fetchrow(
@@ -140,7 +140,7 @@ async def update_code(app_id: str, body: UpdateCode):
     return {"id": app_id, "image": body.image}
 
 
-@router.delete("/{app_id}", status_code=204)
+@router.delete("/{app_id}", status_code=204, operation_id="delete_app", summary="Delete an app, its database and its crons")
 async def delete_app(app_id: str):
     async with pool().acquire() as c:
         row = await c.fetchrow(

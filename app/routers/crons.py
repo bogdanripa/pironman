@@ -35,7 +35,7 @@ async def _require_app(app_id: str) -> None:
             raise HTTPException(404, "no such app")
 
 
-@router.get("/{app_id}/crons")
+@router.get("/{app_id}/crons", operation_id="list_crons", summary="List an app's scheduled HTTP jobs")
 async def list_crons(app_id: str):
     await _require_app(app_id)
     async with pool().acquire() as c:
@@ -45,7 +45,7 @@ async def list_crons(app_id: str):
     return [dict(r) for r in rows]
 
 
-@router.post("/{app_id}/crons", status_code=201)
+@router.post("/{app_id}/crons", status_code=201, operation_id="create_cron", summary="Schedule a recurring HTTP call to an app")
 async def create_cron(app_id: str, body: CronIn):
     await _require_app(app_id)
     if not validate(body.schedule):
@@ -58,7 +58,7 @@ async def create_cron(app_id: str, body: CronIn):
     return dict(row)
 
 
-@router.put("/{app_id}/crons/{cron_id}")
+@router.put("/{app_id}/crons/{cron_id}", operation_id="update_cron", summary="Change a scheduled job")
 async def update_cron(app_id: str, cron_id: UUID, body: CronPatch):
     fields = body.model_dump(exclude_none=True)
     if not fields:
@@ -76,7 +76,7 @@ async def update_cron(app_id: str, cron_id: UUID, body: CronPatch):
     return dict(row)
 
 
-@router.delete("/{app_id}/crons/{cron_id}", status_code=204)
+@router.delete("/{app_id}/crons/{cron_id}", status_code=204, operation_id="delete_cron", summary="Remove a scheduled job")
 async def delete_cron(app_id: str, cron_id: UUID):
     async with pool().acquire() as c:
         res = await c.execute(

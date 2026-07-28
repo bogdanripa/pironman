@@ -14,7 +14,7 @@ class Script(BaseModel):
     timeout: int = 30
 
 
-@router.post("/{app_id}/db/query")
+@router.post("/{app_id}/db/query", operation_id="run_db_script", summary="Run raw SQL or a mongo script against an app's own database")
 async def run_query(app_id: str, body: Script):
     async with pool().acquire() as c:
         row = await c.fetchrow(
