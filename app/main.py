@@ -13,8 +13,10 @@ https://<id>-coolify.bogdanripa.com — there is no DNS, certificate or proxy st
 to perform.
 
 What you can do here: list what is deployed, create a new app from a docker
-image, redeploy an app onto a new image tag, delete an app, run SQL or mongosh
-scripts against an app's own database, and manage scheduled HTTP calls to an app.
+image, adopt an app that already exists in Coolify but was made by hand, redeploy
+an app onto a new image tag, delete an app, set shared and per-app environment
+variables, run SQL or mongosh scripts against an app's own database, and manage
+scheduled HTTP calls to an app.
 
 Three rules govern almost every mistake:
 

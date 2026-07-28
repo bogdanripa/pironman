@@ -48,6 +48,17 @@ class UpdateCode(BaseModel):
                     "linux/arm64.")
 
 
+class AdoptApp(BaseModel):
+    coolify_uuid: str = Field(
+        description="The Coolify application UUID of an app that already exists in "
+                    "Coolify but is not yet managed here. Read it from the Coolify "
+                    "app URL: .../application/<uuid>.")
+    image: str = Field(
+        description="The docker image this app currently runs, e.g. "
+                    "'ghcr.io/bogdanripa/paas-api:latest'. Recorded so list_apps "
+                    "and redeploys report the right image.")
+
+
 @router.get("", operation_id="apps_list",
             summary="List every app deployed on the Pi")
 async def list_apps():
@@ -173,6 +184,48 @@ async def create_app(body: CreateApp):
             "db_url": (await provision.compose_url(
                 body.db_engine, db_info["user"], db_info["password"],
                 db_info["database"])) if db_info else None}
+
+
+@router.post("/{app_id}/adopt", status_code=201, operation_id="apps_adopt",
+             summary="Register an existing Coolify app so this platform can manage it")
+async def adopt_app(app_id: str, body: AdoptApp):
+    """Bring an app that was created by hand in Coolify under management here,
+    without creating a duplicate. After adopting, the app shows up in list_apps,
+    redeploys through apps_update_code, and can carry environment variables and
+    scheduled jobs like any other.
+
+    This is how paas-api manages itself: the control plane was created in Coolify
+    by hand during bootstrap, so it has no registry row and cannot be redeployed
+    through its own API until it adopts itself once. Do that, add a deploy
+    workflow, and every push to main redeploys it recursively through this very
+    endpoint.
+
+    Adopting only writes a registry row — it does not touch the running app, its
+    environment or its data. The app is registered without a platform-managed
+    database (db_engine null): adopt is for apps that own their storage, such as
+    paas-api, which reaches the _paas database through PAAS_DB_* rather than a
+    DATABASE_URL this platform injects.
+    """
+    if not SLUG_RE.match(app_id):
+        raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
+
+    async with pool().acquire() as c:
+        if await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
+            raise HTTPException(409, "app already registered")
+
+    try:
+        await coolify.get_app(body.coolify_uuid)
+    except coolify.CoolifyError:
+        raise HTTPException(404, "no Coolify application with that uuid")
+
+    async with pool().acquire() as c:
+        await c.execute(
+            "INSERT INTO apps (id, image, coolify_uuid, db_engine) "
+            "VALUES ($1, $2, $3, NULL)",
+            app_id, body.image, body.coolify_uuid)
+
+    return {"id": app_id, "url": app_url(app_id), "image": body.image,
+            "coolify_uuid": body.coolify_uuid, "db_engine": None}
 
 
 async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:

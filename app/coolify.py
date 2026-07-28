@@ -59,6 +59,14 @@ async def delete_app(uuid: str) -> None:
     await _request("DELETE", f"/applications/{uuid}")
 
 
+async def get_app(uuid: str) -> dict:
+    """Read one application. Same /applications/{uuid} path as the VERIFIED
+    delete_app, so the shape is trustworthy. Raises CoolifyError (404) if the
+    uuid does not exist — used to reject adopting a dangling uuid."""
+    data = await _request("GET", f"/applications/{uuid}")
+    return data if isinstance(data, dict) else {}
+
+
 async def set_image(uuid: str, image: str) -> None:
     """UNVERIFIED shape."""
     name, _, tag = image.partition(":")

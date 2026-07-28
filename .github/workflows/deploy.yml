@@ -1,0 +1,52 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+
+# Recursive self-deploy: this builds the arm64 paas-api image, pushes it to
+# ghcr.io, then asks the *running* paas-api to redeploy itself through its own
+# apps_update_code endpoint. Names are explicit rather than derived from
+# github.event.repository.name, because for this app the three names differ:
+#   repo   = pironman
+#   image  = ghcr.io/bogdanripa/paas-api
+#   app id = api   (registered via apps_adopt; serves api-coolify.bogdanripa.com)
+#
+# Requires the PAAS_KEY repository secret (a dedicated API key for this platform)
+# and paas-api to have adopted itself once. See README "Self-management".
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: tag
+        run: echo "value=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - uses: docker/build-push-action@v6
+        with:
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/bogdanripa/paas-api:latest
+            ghcr.io/bogdanripa/paas-api:${{ steps.tag.outputs.value }}
+
+      - name: Redeploy paas-api through itself
+        run: |
+          curl -fsS -X PUT \
+            "https://api-coolify.bogdanripa.com/apps/api/code" \
+            -H "Authorization: Bearer ${{ secrets.PAAS_KEY }}" \
+            -H 'Content-Type: application/json' \
+            -d '{"image":"ghcr.io/bogdanripa/paas-api:${{ steps.tag.outputs.value }}"}'

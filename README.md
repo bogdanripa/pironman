@@ -50,7 +50,53 @@ endpoint that requires a key.
    docker exec -it <api-container> python -m app.cli create bootstrap
    ```
 
-4. From then on it manages its own redeploys via `PUT /apps/paas-api/code`.
+4. From then on it manages its own redeploys — see **Self-management** below.
+
+## Self-management (recursive deploys)
+
+paas-api is created by hand in Coolify during bootstrap, so it has no row in its
+own `apps` registry and cannot redeploy itself until it *adopts* itself once.
+After that, a normal deploy workflow in this repo redeploys the control plane
+through its own `apps_update_code` endpoint — paas-api deploying paas-api.
+
+The app's registry id is **`api`** (it serves `api-coolify.bogdanripa.com`, and
+`api` + the `-coolify.bogdanripa.com` suffix is that host). The repo is
+`pironman` and the image is `ghcr.io/bogdanripa/paas-api`, so all three names
+differ — the workflow in `.github/workflows/deploy.yml` spells them out
+explicitly rather than deriving them from the repo name.
+
+One-time setup, in order:
+
+1. Get the current code (this feature) running once by hand — build/push the
+   image and hit **Redeploy** in Coolify — so `apps_adopt` exists on the live
+   instance.
+2. Mint a dedicated key for CI and add it as the `PAAS_KEY` repository secret on
+   `bogdanripa/pironman`:
+
+   ```
+   docker exec -it <api-container> python -m app.cli create ci-paas-api
+   ```
+
+3. Adopt paas-api into its own registry (once):
+
+   ```
+   PUT /apps/api/adopt
+   {"coolify_uuid":"<uuid from the Coolify app URL>",
+    "image":"ghcr.io/bogdanripa/paas-api:latest"}
+   ```
+
+   or the `apps_adopt` MCP tool. It writes a registry row only — it does not
+   touch the running container. `db_engine` is null: paas-api reaches the `_paas`
+   database through `PAAS_DB_*`, not a platform-injected `DATABASE_URL`.
+
+From then on every push to `main` builds an arm64 image and redeploys the
+control plane through itself. The first workflow run before steps 2–3 are done
+still builds and pushes the image; only its redeploy curl fails (401/404) until
+the key and the registry row are in place.
+
+> A bad image can take paas-api down, and then its own API can't fix it. Recover
+> from the Coolify UI directly — **Rollback** to a previous deployment, or point
+> the tag back at a known-good `sha-…` and **Redeploy**.
 
 ## Host dispatcher
 
