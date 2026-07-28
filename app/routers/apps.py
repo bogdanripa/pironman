@@ -194,11 +194,33 @@ async def create_app(body: CreateApp):
     async with pool().acquire() as c:
         paas_key = await mint_key(c, f"ci-{body.id}", app_id=body.id)
 
-    return {"id": body.id, "url": app_url(body.id),
-            "db_url": (await provision.compose_url(
-                body.db_engine, db_info["user"], db_info["password"],
-                db_info["database"])) if db_info else None,
-            "paas_key": paas_key}
+    return {
+        "id": body.id,
+        "url": app_url(body.id),
+        "db_url": (await provision.compose_url(
+            body.db_engine, db_info["user"], db_info["password"],
+            db_info["database"])) if db_info else None,
+        "paas_key": paas_key,
+        # A runbook for the caller to drive the rest end to end, without a human
+        # and without building anything by hand.
+        "deploy": [
+            "The app exists but has no code pipeline yet. Set up CI now — do not "
+            "build an image locally or look for registry credentials.",
+            "1. Call apps_deploy_workflow for this app id to get the GitHub "
+            "Actions workflow file and where it goes.",
+            "2. Write that workflow verbatim to .github/workflows/deploy.yml in "
+            "the app's repo and commit it (use your GitHub tools).",
+            "3. Create a repository secret named PAAS_KEY set to this response's "
+            "paas_key. If you cannot create repo secrets with your tools, give "
+            "the value to the user to add once — it is scoped to this app only.",
+            "4. Push to main. CI builds the arm64 image, pushes it to ghcr.io, "
+            "and redeploys this app automatically.",
+            "First deploy without waiting on the secret: once CI has built and "
+            "pushed the image, call apps_update_code with that tag yourself to "
+            "get it live now; the PAAS_KEY secret is what makes later pushes "
+            "deploy hands-off.",
+        ],
+    }
 
 
 @router.post("/{app_id}/adopt", status_code=201, operation_id="apps_adopt",

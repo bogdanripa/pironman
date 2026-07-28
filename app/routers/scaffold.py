@@ -142,6 +142,24 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
     return {
         "app_id": app_id,
         "url": app_url(app_id),
+        "setup": [
+            "Drive this yourself with your GitHub tools; only the secret may need "
+            "a human. Do not build the image locally.",
+            "1. Write `workflow` verbatim to `workflow_path` in the app's repo "
+            "and commit it.",
+            "2. Create the repository secret in `required_secrets` (PAAS_KEY). "
+            "Its value is the app's deploy key — the `paas_key` apps_create "
+            "returned, or call apps_deploy_key to issue a fresh one. If you "
+            "cannot set repo secrets programmatically, ask the user to add it "
+            "once.",
+            "3. Make sure the app's Dockerfile satisfies "
+            "`dockerfile_requirements`.",
+            "4. Push to main. CI builds and pushes the arm64 image, then calls "
+            "apps_update_code to redeploy.",
+            "First deploy shortcut: if PAAS_KEY is not set yet, the build/push "
+            "still runs; once the image is in ghcr, call apps_update_code with "
+            "that tag yourself to get the app live now.",
+        ],
         "workflow_path": ".github/workflows/deploy.yml",
         "workflow": _workflow(app_id, repo),
         "required_secrets": [{

@@ -90,6 +90,10 @@ image by hand is only ever a first-time bootstrap step for the control plane
 itself, never the way to deploy an ordinary app.
 
 Creating the app itself is the one-off you do here, before its first CI run.
+apps_create and apps_deploy_workflow each return an ordered deploy runbook and
+the app's scoped PAAS_KEY — follow those steps to wire up CI and ship the app end
+to end yourself, only asking the user for the one step your tools can't do (e.g.
+adding the repository secret).
 
 The whole platform runs on one small machine at home. Deleting an app destroys
 its database and all its data with no undo, and running a database script is an
