@@ -9,7 +9,7 @@ still owns image pulls, the Traefik proxy and deploys.
 ```
 app/config.py      env + hostname helpers
 app/db.py          asyncpg pool against _paas
-app/auth.py        bearer key -> sha256 -> api_keys
+app/auth.py        bearer key -> sha256 -> api_keys; per-app deploy keys
 app/coolify.py     facade client (VERIFIED / UNVERIFIED marked per call)
 app/provision.py   wraps the host `pdb` script
 app/cronmatch.py   dependency-free 5-field cron matcher
@@ -78,12 +78,10 @@ One-time setup, in order:
    image and hit **Redeploy** in Coolify — so `apps_adopt` exists on the live
    instance.
 2. Add two repository secrets on `bogdanripa/pironman`:
-   - `PAAS_KEY` — a dedicated platform key for the redeploy call, minted with:
-
-     ```
-     docker exec -it <api-container> python -m app.cli create ci-paas-api
-     ```
-
+   - `PAAS_KEY` — this app's scoped deploy key. Issue it with the `apps_deploy_key`
+     tool (`POST /apps/api/deploy-key`); it can only redeploy `api`, nothing else.
+     (Admin keys — for the connector or bootstrap — still come from
+     `python -m app.cli create`, which mints unscoped keys.)
    - `GHCR_PAT` — a classic PAT with `write:packages`, so the workflow can push
      to the hand-created `paas-api` package (see above).
 
@@ -127,6 +125,19 @@ sudo touch /opt/paas/app/__init__.py
 3. `POST /apps/t2/db/query {"script":"SELECT 1"}`
 4. Add a cron for `* * * * *`, watch `/var/log/paas-cron.log`.
 5. `DELETE` both; confirm Coolify app, database and registry row are all gone.
+
+## Deploy keys
+
+Two kinds of API key, both stored only as sha256 in `api_keys`:
+
+- **Admin keys** (`python -m app.cli create`, `app_id` NULL) — full access. The
+  bootstrap key and the connector `?key=` are these.
+- **Deploy keys** (`app_id` set) — scoped to one app: they may only call
+  `PUT /apps/<id>/code` for that app, enforced centrally in `auth.require_key`.
+  `apps_create` returns one as `paas_key` the moment an app is created, and
+  `apps_deploy_key` (re)issues one (revoking the previous). This is the app's
+  `PAAS_KEY` CI secret — safe to hand out, since a leak can only redeploy that
+  one app to an image tag that already exists in the registry.
 
 ## Environment variables
 

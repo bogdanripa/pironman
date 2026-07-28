@@ -147,10 +147,11 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "required_secrets": [{
             "name": "PAAS_KEY",
             "where": "GitHub repository → Settings → Secrets and variables → Actions",
-            "value": "An API key for this platform. Ask the user to run "
-                     "`docker exec -it $(docker ps --format '{{.Names}}' | grep '^khmhpu') "
-                     "python -m app.cli create ci-" + repo + "` on the Pi. It is "
-                     "printed once and cannot be retrieved later.",
+            "value": "This app's deploy key, scoped so it can only redeploy this "
+                     "app. apps_create returned it as `paas_key` when the app was "
+                     "created; if you don't have it, call apps_deploy_key to issue "
+                     "a fresh one (that revokes the previous). Shown once — paste "
+                     "it into the PAAS_KEY secret.",
         }],
         "dockerfile_requirements": DOCKERFILE_RULES,
         "notes": notes,

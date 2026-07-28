@@ -23,6 +23,11 @@ CREATE TABLE IF NOT EXISTS app_env (
     updated_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (app_id, key)
 );
+
+-- api_keys predates this codebase. Add a per-app scope column in place: NULL is
+-- an unscoped admin key (bootstrap, the connector), a value is a deploy key that
+-- may only redeploy that one app (enforced in auth.require_key).
+ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS app_id text;
 """
 
 

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal
 
-from ..auth import require_key
+from ..auth import require_key, mint_key
 from ..db import pool
 from ..config import app_url, app_fqdn
 from .. import coolify, provision, envs
@@ -141,6 +141,11 @@ async def create_app(body: CreateApp):
     the registry yourself, and do not go hunting for registry credentials to do
     so — the pipeline is how apps are built and shipped here; a manual build is
     only ever a one-off bootstrap of the control plane itself.
+
+    The response includes **paas_key**: a deploy key scoped to this app (it can
+    only redeploy this app, nothing else). It is the value for the workflow's
+    PAAS_KEY repository secret, and it is shown only here — if lost, issue a fresh
+    one with apps_deploy_key. Give it to the user to paste into the repo secret.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
@@ -183,10 +188,17 @@ async def create_app(body: CreateApp):
         await _rollback(uuid, body.id, body.db_engine if db_info else None)
         raise
 
+    # Issue this app's deploy key now, so the CI workflow's PAAS_KEY secret is a
+    # copy-paste away. It is scoped to this app (can only redeploy it) and shown
+    # once — re-issue with apps_deploy_key if lost.
+    async with pool().acquire() as c:
+        paas_key = await mint_key(c, f"ci-{body.id}", app_id=body.id)
+
     return {"id": body.id, "url": app_url(body.id),
             "db_url": (await provision.compose_url(
                 body.db_engine, db_info["user"], db_info["password"],
-                db_info["database"])) if db_info else None}
+                db_info["database"])) if db_info else None,
+            "paas_key": paas_key}
 
 
 @router.post("/{app_id}/adopt", status_code=201, operation_id="apps_adopt",
@@ -229,6 +241,29 @@ async def adopt_app(app_id: str, body: AdoptApp):
 
     return {"id": app_id, "url": app_url(app_id), "image": body.image,
             "coolify_uuid": body.coolify_uuid, "db_engine": None}
+
+
+@router.post("/{app_id}/deploy-key", operation_id="apps_deploy_key",
+             summary="Issue (or reissue) this app's scoped deploy key")
+async def deploy_key(app_id: str):
+    """Mint a fresh deploy key for an app and return it. Use this when the key
+    from apps_create was lost, when rotating it, or for an app that predates
+    per-app keys (e.g. one brought in with apps_adopt).
+
+    The key is scoped: it can only redeploy this app (PUT /apps/<id>/code), so it
+    is safe to store as the app's PAAS_KEY repository secret. Issuing a new one
+    **revokes** any previous deploy key for this app, so update the repo secret
+    after calling this. Shown once.
+    """
+    async with pool().acquire() as c:
+        if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
+            raise HTTPException(404, "no such app")
+        # One active deploy key per app: drop the old before minting the new.
+        await c.execute("DELETE FROM api_keys WHERE app_id = $1", app_id)
+        paas_key = await mint_key(c, f"ci-{app_id}", app_id=app_id)
+    return {"app_id": app_id, "paas_key": paas_key,
+            "note": "Scoped to this app. Set it as the PAAS_KEY repo secret; "
+                    "any previous deploy key for this app is now revoked."}
 
 
 async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:
