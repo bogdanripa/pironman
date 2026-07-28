@@ -20,6 +20,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.middleware("http")
+async def promote_key(request, call_next):
+    """claude.ai custom connectors can't send an Authorization header, so allow
+    the api key as ?key= on /mcp and promote it into the header. The key ends up
+    in the connector URL and in edge logs — acceptable for a single-user control
+    plane, but do not hand this URL out."""
+    if request.url.path.startswith("/mcp") and "authorization" not in request.headers:
+        key = request.query_params.get("key")
+        if key:
+            request.scope["headers"] = list(request.scope["headers"]) + [
+                (b"authorization", f"Bearer {key}".encode())
+            ]
+    return await call_next(request)
+
+
 app.include_router(apps.router)
 app.include_router(query.router)
 app.include_router(crons.router)
