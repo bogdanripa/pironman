@@ -15,6 +15,7 @@ class CreateApp(BaseModel):
     id: str = Field(description="slug; becomes the hostname")
     image: str = Field(description="e.g. ghcr.io/bogdanripa/notes:latest")
     db_engine: Literal["postgres", "mongo"] | None = None
+    health_path: str = Field(default="/", description="path the healthcheck hits")
 
 
 class UpdateCode(BaseModel):
@@ -71,6 +72,8 @@ async def create_app(body: CreateApp):
     # invisible to this API but still holding the hostname. Always roll back.
     db_info = None
     try:
+        await coolify.set_healthcheck(uuid, body.health_path)
+
         if body.db_engine:
             db_info = await provision.create(body.id, body.db_engine)
             url = await provision.compose_url(

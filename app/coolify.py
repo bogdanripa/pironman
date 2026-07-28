@@ -80,6 +80,25 @@ async def set_env(uuid: str, key: str, value: str) -> None:
             raise
 
 
+async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
+    """Enable Coolify's healthcheck, which becomes a docker HEALTHCHECK on the
+    container. Sablier needs it to tell 'started' from 'ready' — without one,
+    the first request after a wake can hit a container that is still booting."""
+    await _request("PATCH", f"/applications/{uuid}", json={
+        "health_check_enabled": True,
+        "health_check_path": path,
+        "health_check_port": str(port),
+        "health_check_host": "localhost",
+        "health_check_method": "GET",
+        "health_check_scheme": "http",
+        "health_check_return_code": 200,
+        "health_check_interval": 10,
+        "health_check_timeout": 5,
+        "health_check_retries": 5,
+        "health_check_start_period": 10,
+    })
+
+
 async def deploy(uuid: str) -> None:
     """UNVERIFIED shape."""
     await _request("POST", "/deploy", params={"uuid": uuid})
