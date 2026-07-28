@@ -30,7 +30,11 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with write:packages. The paas-api package on ghcr was created by
+          # a manual push and is owned by the user account, not linked to this
+          # repo, so the auto-issued GITHUB_TOKEN gets 403 on push. A PAT that
+          # owns the bogdanripa/* namespace sidesteps the package-linkage step.
+          password: ${{ secrets.GHCR_PAT }}
 
       - id: tag
         run: echo "value=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
