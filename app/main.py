@@ -1,8 +1,8 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-from .db import init_pool, close_pool
-from .routers import apps, crons, query, scaffold
+from .db import init_pool, ensure_schema, close_pool
+from .routers import apps, crons, query, scaffold, env
 
 SERVER_DESCRIPTION = """\
 Deploy and manage web applications on a self-hosted Raspberry Pi 5.
@@ -31,6 +31,15 @@ injected into the container as the DATABASE_URL environment variable on every
 deploy and recomposed each time, so an app should read it from the environment
 rather than hardcoding anything.
 
+Apps also take environment variables in two scopes. **Shared** variables are set
+once and injected into every app — the place for account-wide secrets such as an
+OpenAI API key, since this is a single owner's box. **App-specific** variables
+apply to one app and override a shared variable of the same name. Setting or
+removing a variable redeploys the affected app(s) so it reaches the running
+container; a shared change therefore redeploys everything. Values are write-only:
+you can set and overwrite them but never read one back — listings show a masked
+preview only, so re-set a variable if you are unsure of its value.
+
 Deploying new code for an existing app is normally automated: a GitHub Action
 builds an arm64 image, pushes it to ghcr.io, then calls apps_update_code with the
 new tag. Creating the app itself is a one-off you do here. Do not write that
@@ -47,6 +56,7 @@ unguarded pipe into that database — confirm both with the user first.\
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_pool()
+    await ensure_schema()  # create env tables if missing — no manual SQL on the Pi
     yield
     await close_pool()
 
@@ -75,12 +85,15 @@ async def promote_key(request, call_next):
 
 
 # Router order controls how tools list at /mcp. operation_ids are prefixed by
-# group (apps_*, crons_*, db_*) so the flat MCP tool list reads as three
-# coherent groups: apps (lifecycle + deploy), schedules, database.
+# group (apps_*, crons_*, db_*, env_*) so the flat MCP tool list reads as
+# coherent groups: apps (lifecycle + deploy + per-app env), schedules,
+# database, and shared env.
 app.include_router(apps.router)
-app.include_router(scaffold.router)  # apps_deploy_workflow — part of the apps group
+app.include_router(scaffold.router)   # apps_deploy_workflow — part of the apps group
+app.include_router(env.app_router)    # apps_env_* — per-app env, part of the apps group
 app.include_router(crons.router)
 app.include_router(query.router)
+app.include_router(env.shared_router)  # env_* — shared, account-wide variables
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)

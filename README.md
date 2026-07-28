@@ -13,10 +13,15 @@ app/auth.py        bearer key -> sha256 -> api_keys
 app/coolify.py     facade client (VERIFIED / UNVERIFIED marked per call)
 app/provision.py   wraps the host `pdb` script
 app/cronmatch.py   dependency-free 5-field cron matcher
+app/envs.py        shared + per-app env vars: desired-set + Coolify sync
 app/cli.py         python -m app.cli create <label>
-app/routers/       apps, crons, query
+app/routers/       apps, crons, query, scaffold, env
 paas-cron-dispatch host-side dispatcher, runs every minute from crontab
 ```
+
+`db.py` creates the tables it owns (`shared_env`, `app_env`) on startup with
+`CREATE TABLE IF NOT EXISTS`, so adding these needs no manual SQL on the Pi —
+the next deploy of paas-api brings them into being.
 
 ## Bootstrap (manual, once)
 
@@ -67,10 +72,32 @@ sudo touch /opt/paas/app/__init__.py
 4. Add a cron for `* * * * *`, watch `/var/log/paas-cron.log`.
 5. `DELETE` both; confirm Coolify app, database and registry row are all gone.
 
+## Environment variables
+
+Two scopes, both stored in `_paas` and injected into the container on deploy:
+
+- **shared** (`shared_env`, tools `env_*`) — account-wide, applied to every app.
+  This is a single-owner box, so cross-cutting secrets like an OpenAI API key
+  live here rather than being pasted into each app.
+- **app-specific** (`app_env`, tools `apps_env_*`) — one app only, and overrides
+  a shared variable of the same name.
+
+An app's effective environment is *shared, overlaid by app-specific*, plus the
+platform-managed `DATABASE_URL` (reserved — it cannot be set as a variable).
+Setting or removing a variable pushes it to Coolify and redeploys the affected
+app(s) so it reaches the running container; a shared change redeploys every app.
+Pass `redeploy=false` to stage a batch and let the next code deploy apply it.
+
+Values are **write-only**: they are pushed to Coolify but never read back in
+plaintext through the API. Listings (`env_list`, `apps_env_list`, `get_app`)
+show a masked preview only, so a secret never lands in a tool result.
+
 ## Known-unverified
 
-`set_image`, `set_env` and `deploy` in `coolify.py` were not exercised against
-the live instance — only `create_app` and `delete_app` were. If a redeploy or
-env injection misbehaves, read `https://coolify.bogdanripa.com/docs` in a
-browser (it is session-authenticated; a bearer token will not fetch it) and
+`set_image`, `set_env`, `list_envs`, `delete_env` and `deploy` in `coolify.py`
+were not exercised against the live instance — only `create_app` and
+`delete_app` were. The environment-variable feature depends on the env calls, so
+the first real `env_set`/`apps_env_set` is where to confirm those shapes. If a
+redeploy or env injection misbehaves, read `https://coolify.bogdanripa.com/docs`
+in a browser (it is session-authenticated; a bearer token will not fetch it) and
 correct the body shapes there first.

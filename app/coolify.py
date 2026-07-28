@@ -80,6 +80,21 @@ async def set_env(uuid: str, key: str, value: str) -> None:
             raise
 
 
+async def list_envs(uuid: str) -> list[dict]:
+    """UNVERIFIED shape. Each item carries at least 'uuid', 'key' and 'value'."""
+    data = await _request("GET", f"/applications/{uuid}/envs")
+    return data if isinstance(data, list) else []
+
+
+async def delete_env(uuid: str, key: str) -> None:
+    """UNVERIFIED shape. Remove a variable by name; a no-op if it is not set.
+    Coolify keys deletes by the env's own uuid, so look it up first."""
+    for env in await list_envs(uuid):
+        if env.get("key") == key:
+            await _request("DELETE", f"/applications/{uuid}/envs/{env['uuid']}")
+            return
+
+
 async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
     """Enable Coolify's healthcheck, which becomes a docker HEALTHCHECK on the
     container. Sablier needs it to tell 'started' from 'ready' — without one,

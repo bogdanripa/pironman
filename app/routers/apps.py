@@ -5,7 +5,7 @@ from typing import Literal
 from ..auth import require_key
 from ..db import pool
 from ..config import app_url, app_fqdn
-from .. import coolify, provision
+from .. import coolify, provision, envs
 from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
@@ -87,11 +87,14 @@ async def get_app(app_id: str):
         crons = await c.fetch(
             "SELECT id, schedule, method, path, body, enabled FROM crons "
             "WHERE app_id = $1 ORDER BY created_at", app_id)
+        env = await c.fetch(
+            "SELECT key, value FROM app_env WHERE app_id = $1 ORDER BY key", app_id)
 
     out = {
         "id": row["id"], "url": app_url(row["id"]), "image": row["image"],
         "db_engine": row["db_engine"], "created_at": row["created_at"],
         "crons": [dict(c) for c in crons],
+        "env": [{"key": r["key"], "preview": envs.mask(r["value"])} for r in env],
     }
     if row["db_engine"]:
         out["db_url"] = await provision.compose_url(
@@ -140,10 +143,16 @@ async def create_app(body: CreateApp):
 
         if body.db_engine:
             db_info = await provision.create(body.id, body.db_engine)
-            url = await provision.compose_url(
-                body.db_engine, db_info["user"], db_info["password"],
-                db_info["database"])
-            await coolify.set_env(uuid, "DATABASE_URL", url)
+
+        # Inject the app's environment: any shared variables plus, when it has a
+        # database, a freshly composed DATABASE_URL. A brand-new app has no
+        # app-specific variables yet, so this is shared + DATABASE_URL.
+        async with pool().acquire() as c:
+            await envs.sync_env(
+                c, uuid, body.id, body.db_engine,
+                db_info["user"] if db_info else None,
+                db_info["password"] if db_info else None,
+                db_info["database"] if db_info else None)
 
         await coolify.deploy(uuid)
 
@@ -184,9 +193,10 @@ async def update_code(app_id: str, body: UpdateCode):
     """Deploy new code by pointing an existing app at a new docker image tag.
 
     This is the endpoint a CI pipeline calls after building and pushing an image.
-    The app keeps its URL, its database and all its scheduled jobs; DATABASE_URL
-    is recomposed and re-injected, so it stays correct even if the database
-    container has been rebuilt since the last deploy.
+    The app keeps its URL, its database, its scheduled jobs and its environment
+    variables; the full environment — shared variables, the app's own, and a
+    recomposed DATABASE_URL — is re-injected on every deploy, so it stays correct
+    even if the database container has been rebuilt since the last deploy.
 
     Use an immutable tag such as ':sha-a1b2c3d'. Re-pushing ':latest' and
     redeploying does not reliably pull the new image.
@@ -195,15 +205,13 @@ async def update_code(app_id: str, body: UpdateCode):
         row = await c.fetchrow(
             "SELECT coolify_uuid, db_engine, db_user, db_password, db_name "
             "FROM apps WHERE id = $1", app_id)
-    if not row:
-        raise HTTPException(404, "no such app")
+        if not row:
+            raise HTTPException(404, "no such app")
 
-    await coolify.set_image(row["coolify_uuid"], body.image)
-
-    if row["db_engine"]:
-        url = await provision.compose_url(
-            row["db_engine"], row["db_user"], row["db_password"], row["db_name"])
-        await coolify.set_env(row["coolify_uuid"], "DATABASE_URL", url)
+        await coolify.set_image(row["coolify_uuid"], body.image)
+        await envs.sync_env(
+            c, row["coolify_uuid"], app_id, row["db_engine"],
+            row["db_user"], row["db_password"], row["db_name"])
 
     await coolify.deploy(row["coolify_uuid"])
 
@@ -236,4 +244,5 @@ async def delete_app(app_id: str):
     if row["db_engine"]:
         await provision.drop(app_id, row["db_engine"])
     async with pool().acquire() as c:
+        await c.execute("DELETE FROM app_env WHERE app_id = $1", app_id)
         await c.execute("DELETE FROM apps WHERE id = $1", app_id)
