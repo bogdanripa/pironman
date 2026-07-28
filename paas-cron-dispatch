@@ -19,8 +19,10 @@ sys.path.insert(0, "/opt/paas")          # where app/cronmatch.py is mounted
 from app.cronmatch import due            # noqa: E402
 
 DOMAIN_SUFFIX = "-coolify.bogdanripa.com"
-SQL = ("SELECT c.app_id, c.schedule, c.method, c.path, "
-       "coalesce(c.body,'') FROM crons c WHERE c.enabled")
+SQL = ("SELECT coalesce(json_agg(json_build_object("
+       "'app_id', c.app_id, 'schedule', c.schedule, 'method', c.method, "
+       "'path', c.path, 'body', c.body))::text, '[]') "
+       "FROM crons c WHERE c.enabled")
 
 
 def pg_container() -> str:
@@ -34,33 +36,39 @@ def pg_container() -> str:
     raise SystemExit("no app postgres container")
 
 
-def rows() -> list[list[str]]:
+def rows() -> list[dict]:
     r = subprocess.run(
         ["docker", "exec", "-i", pg_container(),
-         "psql", "-U", "postgres", "-d", "_paas", "-tAF", "\x1f", "-c", SQL],
+         "psql", "-U", "postgres", "-d", "_paas", "-tAc", SQL],
         capture_output=True, text=True, check=True)
-    return [l.split("\x1f") for l in r.stdout.strip().splitlines() if l]
+    return json.loads(r.stdout.strip() or "[]")
 
 
 def fire(app_id: str, method: str, path: str, body: str) -> None:
-    url = f"https://{app_id}{DOMAIN_SUFFIX}{path}"
+    # Hit Traefik directly rather than going out to Cloudflare and back:
+    # same router, same middleware chain (so Sablier still wakes the app),
+    # but no egress, no bot rules, and it survives the tunnel being down.
+    host = f"{app_id}{DOMAIN_SUFFIX}"
+    url = f"http://127.0.0.1{path}"
     data = body.encode() if body else None
     req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Host", host)
+    req.add_header("User-Agent", "paas-cron/1.0")
     if data:
         req.add_header("Content-Type", "application/json")
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
-            print(f"{stamp} {method} {url} -> {resp.status}")
+            print(f"{stamp} {method} {host}{path} -> {resp.status}")
     except Exception as e:                                  # noqa: BLE001
-        print(f"{stamp} {method} {url} -> ERROR {e}")
+        print(f"{stamp} {method} {host}{path} -> ERROR {e}")
 
 
 def main() -> None:
     now = datetime.now()
-    for app_id, schedule, method, path, body in rows():
-        if due(schedule, now):
-            fire(app_id, method, path, body)
+    for c in rows():
+        if due(c["schedule"], now):
+            fire(c["app_id"], c["method"], c["path"], c["body"] or "")
 
 
 if __name__ == "__main__":
