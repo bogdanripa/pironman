@@ -119,6 +119,11 @@ async def create_app(body: CreateApp):
 
     This only creates the app. Subsequent code changes go through
     update_app_code, which is also what a CI pipeline calls.
+
+    After creating an app, call **get_deploy_workflow** to obtain the GitHub
+    Actions file that wires up automatic redeploys on every push. Offer this
+    without being asked — an app with no deploy pipeline has to be redeployed by
+    hand every time.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")

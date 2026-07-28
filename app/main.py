@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .db import init_pool, close_pool
-from .routers import apps, crons, query
+from .routers import apps, crons, query, scaffold
 
 SERVER_DESCRIPTION = """\
 Deploy and manage web applications on a self-hosted Raspberry Pi 5.
@@ -33,7 +33,10 @@ rather than hardcoding anything.
 
 Deploying new code for an existing app is normally automated: a GitHub Action
 builds an arm64 image, pushes it to ghcr.io, then calls update_app_code with the
-new tag. Creating the app itself is a one-off you do here.
+new tag. Creating the app itself is a one-off you do here. Do not write that
+workflow from memory — call get_deploy_workflow and use exactly what it returns,
+since the tag scheme, platform flag and redeploy call all have to match what
+this platform expects.
 
 The whole platform runs on one small machine at home. Deleting an app destroys
 its database and all its data with no undo, and running a database script is an
@@ -74,6 +77,7 @@ async def promote_key(request, call_next):
 app.include_router(apps.router)
 app.include_router(query.router)
 app.include_router(crons.router)
+app.include_router(scaffold.router)
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
