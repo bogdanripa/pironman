@@ -22,7 +22,7 @@ class Script(BaseModel):
                     "or large index builds.")
 
 
-@router.post("/{app_id}/db/query", operation_id="run_db_script",
+@router.post("/{app_id}/db/query", operation_id="db_run_script",
              summary="Run raw SQL or a mongosh script against one app's database")
 async def run_query(app_id: str, body: Script):
     """Execute a script directly against an app's database and return the raw

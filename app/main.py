@@ -32,9 +32,9 @@ deploy and recomposed each time, so an app should read it from the environment
 rather than hardcoding anything.
 
 Deploying new code for an existing app is normally automated: a GitHub Action
-builds an arm64 image, pushes it to ghcr.io, then calls update_app_code with the
+builds an arm64 image, pushes it to ghcr.io, then calls apps_update_code with the
 new tag. Creating the app itself is a one-off you do here. Do not write that
-workflow from memory — call get_deploy_workflow and use exactly what it returns,
+workflow from memory — call apps_deploy_workflow and use exactly what it returns,
 since the tag scheme, platform flag and redeploy call all have to match what
 this platform expects.
 
@@ -74,10 +74,13 @@ async def promote_key(request, call_next):
     return await call_next(request)
 
 
+# Router order controls how tools list at /mcp. operation_ids are prefixed by
+# group (apps_*, crons_*, db_*) so the flat MCP tool list reads as three
+# coherent groups: apps (lifecycle + deploy), schedules, database.
 app.include_router(apps.router)
-app.include_router(query.router)
+app.include_router(scaffold.router)  # apps_deploy_workflow — part of the apps group
 app.include_router(crons.router)
-app.include_router(scaffold.router)
+app.include_router(query.router)
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)

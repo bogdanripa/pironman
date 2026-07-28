@@ -54,7 +54,7 @@ async def _require_app(app_id: str) -> None:
             raise HTTPException(404, "no such app")
 
 
-@router.get("/{app_id}/crons", operation_id="list_crons",
+@router.get("/{app_id}/crons", operation_id="crons_list",
             summary="List an app's scheduled HTTP jobs")
 async def list_crons(app_id: str):
     """Every scheduled job attached to an app, with its cron expression, method,
@@ -71,7 +71,7 @@ async def list_crons(app_id: str):
     return [dict(r) for r in rows]
 
 
-@router.post("/{app_id}/crons", status_code=201, operation_id="create_cron",
+@router.post("/{app_id}/crons", status_code=201, operation_id="crons_create",
              summary="Schedule a recurring HTTP call to an app")
 async def create_cron(app_id: str, body: CronIn):
     """Schedule a recurring HTTP request to one of the app's own endpoints.
@@ -98,7 +98,7 @@ async def create_cron(app_id: str, body: CronIn):
     return dict(row)
 
 
-@router.put("/{app_id}/crons/{cron_id}", operation_id="update_cron",
+@router.put("/{app_id}/crons/{cron_id}", operation_id="crons_update",
             summary="Change a scheduled job's timing, target or enabled state")
 async def update_cron(app_id: str, cron_id: UUID, body: CronPatch):
     """Modify an existing scheduled job. Send only the fields you want changed;
@@ -125,7 +125,7 @@ async def update_cron(app_id: str, cron_id: UUID, body: CronPatch):
 
 
 @router.delete("/{app_id}/crons/{cron_id}", status_code=204,
-               operation_id="delete_cron",
+               operation_id="crons_delete",
                summary="Remove a scheduled job")
 async def delete_cron(app_id: str, cron_id: UUID):
     """Delete a scheduled job permanently.

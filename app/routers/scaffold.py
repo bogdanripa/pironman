@@ -5,7 +5,7 @@ from ..auth import require_key
 from ..db import pool
 from ..config import app_url, DOMAIN_SUFFIX
 
-router = APIRouter(prefix="/apps", tags=["scaffold"],
+router = APIRouter(prefix="/apps", tags=["apps"],
                    dependencies=[Depends(require_key)])
 
 
@@ -81,7 +81,7 @@ DOCKERFILE_RULES = dedent("""\
     """)
 
 
-@router.get("/{app_id}/deploy-workflow", operation_id="get_deploy_workflow",
+@router.get("/{app_id}/deploy-workflow", operation_id="apps_deploy_workflow",
             summary="Get the GitHub Actions workflow that redeploys this app on every push")
 async def deploy_workflow(app_id: str, repo_name: str | None = None):
     """Return everything needed to wire an app up to automatic deployment from
@@ -104,7 +104,7 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
     async with pool().acquire() as c:
         row = await c.fetchrow("SELECT id, db_engine FROM apps WHERE id = $1", app_id)
     if not row:
-        raise HTTPException(404, "no such app — create it first with create_app")
+        raise HTTPException(404, "no such app — create it first with apps_create")
 
     repo = repo_name or app_id
 
@@ -124,7 +124,7 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
             f"This app has a {row['db_engine']} database. Its connection string is "
             "injected as the DATABASE_URL environment variable on every deploy — "
             "read it from the environment, never hardcode it. Run migrations from "
-            "the app's own startup code or via run_db_script, not from the workflow.")
+            "the app's own startup code or via db_run_script, not from the workflow.")
 
     return {
         "app_id": app_id,

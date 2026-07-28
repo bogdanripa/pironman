@@ -48,7 +48,7 @@ class UpdateCode(BaseModel):
                     "linux/arm64.")
 
 
-@router.get("", operation_id="list_apps",
+@router.get("", operation_id="apps_list",
             summary="List every app deployed on the Pi")
 async def list_apps():
     """List all deployed apps with their image, database engine, public URL and
@@ -69,7 +69,7 @@ async def list_apps():
     ]
 
 
-@router.get("/{app_id}", operation_id="get_app",
+@router.get("/{app_id}", operation_id="apps_get",
             summary="Get one app's full configuration, including database credentials")
 async def get_app(app_id: str):
     """Full detail for a single app: current image, database engine, a
@@ -99,7 +99,7 @@ async def get_app(app_id: str):
     return out
 
 
-@router.post("", status_code=201, operation_id="create_app",
+@router.post("", status_code=201, operation_id="apps_create",
              summary="Create and deploy a new app from a docker image, optionally with a database")
 async def create_app(body: CreateApp):
     """Create a new app: registers it, enables a healthcheck, optionally
@@ -118,9 +118,9 @@ async def create_app(body: CreateApp):
     the hostname.
 
     This only creates the app. Subsequent code changes go through
-    update_app_code, which is also what a CI pipeline calls.
+    apps_update_code, which is also what a CI pipeline calls.
 
-    After creating an app, call **get_deploy_workflow** to obtain the GitHub
+    After creating an app, call **apps_deploy_workflow** to obtain the GitHub
     Actions file that wires up automatic redeploys on every push. Offer this
     without being asked — an app with no deploy pipeline has to be redeployed by
     hand every time.
@@ -178,7 +178,7 @@ async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:
             pass
 
 
-@router.put("/{app_id}/code", operation_id="update_app_code",
+@router.put("/{app_id}/code", operation_id="apps_update_code",
             summary="Point an app at a new image tag and redeploy it")
 async def update_code(app_id: str, body: UpdateCode):
     """Deploy new code by pointing an existing app at a new docker image tag.
@@ -213,7 +213,7 @@ async def update_code(app_id: str, body: UpdateCode):
     return {"id": app_id, "image": body.image}
 
 
-@router.delete("/{app_id}", status_code=204, operation_id="delete_app",
+@router.delete("/{app_id}", status_code=204, operation_id="apps_delete",
                summary="Permanently delete an app, its database and its schedules")
 async def delete_app(app_id: str):
     """Destroy an app completely: the container, its database **including all
