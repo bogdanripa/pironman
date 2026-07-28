@@ -131,13 +131,16 @@ async def create_app(body: CreateApp):
     whole operation is rolled back, so a half-created app never lingers holding
     the hostname.
 
-    This only creates the app. Subsequent code changes go through
-    apps_update_code, which is also what a CI pipeline calls.
+    This only creates the app. Subsequent code changes ship through CI, not by
+    building images by hand.
 
-    After creating an app, call **apps_deploy_workflow** to obtain the GitHub
-    Actions file that wires up automatic redeploys on every push. Offer this
-    without being asked — an app with no deploy pipeline has to be redeployed by
-    hand every time.
+    After creating an app, set up its deploy pipeline: call
+    **apps_deploy_workflow** to obtain the GitHub Actions file that builds the
+    arm64 image and redeploys on every push, and write it into the app's repo.
+    Offer this without being asked. Do NOT build the image locally and push it to
+    the registry yourself, and do not go hunting for registry credentials to do
+    so — the pipeline is how apps are built and shipped here; a manual build is
+    only ever a one-off bootstrap of the control plane itself.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
@@ -245,7 +248,12 @@ async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:
 async def update_code(app_id: str, body: UpdateCode):
     """Deploy new code by pointing an existing app at a new docker image tag.
 
-    This is the endpoint a CI pipeline calls after building and pushing an image.
+    This is the endpoint the GitHub Actions pipeline calls after it has built and
+    pushed an image. You normally do not call it yourself: to ship a change, push
+    to the app's repo and let CI build the image and call this. Call it directly
+    only to roll back to an image tag that already exists in the registry — never
+    as a way to deploy an image you built and pushed by hand.
+
     The app keeps its URL, its database, its scheduled jobs and its environment
     variables; the full environment — shared variables, the app's own, and a
     recomposed DATABASE_URL — is re-injected on every deploy, so it stays correct

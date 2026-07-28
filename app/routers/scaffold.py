@@ -88,6 +88,10 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
     GitHub: the complete workflow file, where to save it, which repository
     secret to create, and the constraints its Dockerfile must satisfy.
 
+    This is the one supported way to build and deploy an app. Never build the
+    image locally and push it to the registry by hand, and never go looking for
+    registry credentials to do so — that is not how apps ship here.
+
     Call this straight after creating an app, or whenever the user asks to "set
     up deploys", "add CI", or "make it deploy on push". Write the returned
     `workflow` content verbatim to the returned `workflow_path` in the app's own
