@@ -51,31 +51,58 @@ def _workflow(app_id: str, repo_name: str) -> str:
                 run: |
                   curl -fsS -X POST \\
                     "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh"
+
+              # /refresh only queues the deploy; poll the app until it actually
+              # answers so a crash-looping container fails the run instead of
+              # going green. 502/503/504/000 = proxy can't reach the container.
+              - name: Wait for the new version to be healthy
+                run: |
+                  url="https://{app_id}{DOMAIN_SUFFIX}"
+                  for i in $(seq 1 40); do
+                    code=$(curl -s -o /dev/null -w '%{{http_code}}' "$url" || echo 000)
+                    case "$code" in
+                      502|503|504|000) echo "waiting ($code)"; sleep 6 ;;
+                      *) echo "up (HTTP $code)"; exit 0 ;;
+                    esac
+                  done
+                  echo "app did not come up — check: apps_logs {app_id}"; exit 1
         """)
 
 
 DOCKERFILE_RULES = dedent("""\
-    The image must satisfy three things or the deploy will fail:
+    The image must satisfy these, or the container fails to start or fails its
+    healthcheck and is rolled back — while the deploy call still looks like it
+    succeeded, so verify with apps_logs after deploying:
 
     1. Built for linux/arm64 (the workflow handles this via the `platforms` key).
-    2. The server listens on 0.0.0.0:80 — not 3000, not 8080. Bind to 0.0.0.0,
-       not 127.0.0.1, or the proxy cannot reach it from outside the container.
-    3. A HEALTHCHECK instruction, so the platform can tell a started container
-       from a ready one. Needed for zero-downtime redeploys and required if the
-       app sleeps when idle. The base image must contain curl or wget for this
-       to work — scratch and distroless images cannot run one.
+    2. Listen on port 80 bound to :: (dual-stack) — NOT 0.0.0.0 alone, NOT
+       127.0.0.1. The healthcheck runs INSIDE the container against
+       http://localhost:80/, and `localhost` resolves to ::1 (IPv6) first; an
+       IPv4-only bind (0.0.0.0) gets connection-refused and the container is
+       rolled back even though it serves fine from outside. Bind :: (e.g.
+       app.listen(80, '::'), Uvicorn --host '::') and it accepts both stacks.
+    3. Run as root, or grant CAP_NET_BIND_SERVICE — binding port 80 is
+       privileged. A `USER node`-style line makes the app die at startup with
+       EACCES, which looks like any other "won't start". Drop the USER line.
+    4. A HEALTHCHECK instruction so the platform can tell a started container
+       from a ready one. The base image must contain curl or wget (Coolify tries
+       curl, then wget) — the plain slim/alpine, scratch and distroless images do
+       NOT ship curl, so install it.
 
-    Example:
+    Example (note the curl install and the :: bind):
 
         FROM node:22-slim
+        RUN apt-get update && apt-get install -y --no-install-recommends curl \\
+            && rm -rf /var/lib/apt/lists/*
         WORKDIR /srv
         COPY package*.json ./
         RUN npm ci --omit=dev
         COPY . .
         ENV PORT=80
         EXPOSE 80
+        # the server must listen on :: — an IPv4-only bind fails the healthcheck
         HEALTHCHECK --interval=10s --timeout=3s --start-period=10s \\
-          CMD curl -fsS http://localhost:80/health || exit 1
+          CMD curl -fsS http://localhost:80/ || exit 1
         CMD ["node", "server.js"]
     """)
 

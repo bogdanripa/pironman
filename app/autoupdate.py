@@ -89,6 +89,32 @@ async def remote_digest(ref: str) -> str | None:
     return out.strip().split("@", 1)[1]
 
 
+async def _container_name(uuid: str) -> str | None:
+    """The most-recent container for a Coolify app (its name contains the app
+    uuid). Includes stopped/crashed ones so a failed deploy is still inspectable."""
+    _, out = await _docker("ps", "-a", "--filter", f"name={uuid}",
+                           "--format", "{{.Names}}", timeout=30)
+    names = [n for n in out.splitlines() if n.strip()]
+    return names[0] if names else None
+
+
+async def app_logs(uuid: str, tail: int = 200) -> dict:
+    """Container status/health plus the last `tail` log lines, straight from the
+    Docker daemon — the thing to reach for when a deploy 'succeeds' but the app
+    serves 502."""
+    name = await _container_name(uuid)
+    if not name:
+        return {"container": None,
+                "status": "no container — the deploy failed or was rolled back",
+                "logs": ""}
+    _, status = await _docker(
+        "inspect", "--format",
+        "{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}",
+        name, timeout=30)
+    _, logs = await _docker("logs", "--tail", str(tail), name, timeout=60)
+    return {"container": name, "status": status.strip(), "logs": logs}
+
+
 async def check_and_update(conn, app) -> dict:
     """Pull the app's watched tag; if its digest differs from what is running,
     redeploy (re-injecting env like a normal deploy) and record the new digest.

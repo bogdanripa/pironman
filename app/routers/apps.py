@@ -53,6 +53,15 @@ class UpdateCode(BaseModel):
                     "linux/arm64.")
 
 
+class SetImage(BaseModel):
+    image: str = Field(
+        description="New image reference, e.g. 'ghcr.io/bogdanripa/notes:latest'. "
+                    "This becomes the base image the app runs AND the tag "
+                    "auto-update follows. Use it to move an app off a bootstrap "
+                    "placeholder onto its real image, or to change registries — "
+                    "not for routine deploys, which happen automatically on push.")
+
+
 class AutoUpdate(BaseModel):
     enabled: bool = Field(
         description="Turn auto-update on or off for this app. When on, the "
@@ -138,13 +147,24 @@ async def create_app(body: CreateApp):
     step, and the app is reachable over HTTPS within about 30 seconds. Requests
     made before the image finishes pulling may return 502 briefly.
 
-    Two constraints cause almost every failed first deploy, so check them before
-    calling: the image must be built for **linux/arm64**, and the container must
-    listen on **port 80**.
+    Give it your **real** image reference, e.g. ghcr.io/you/<app>:latest, even if
+    CI has not pushed it yet — the app registers and holds its hostname, and its
+    first real deploy lands when CI pushes and calls /refresh. Do NOT bootstrap
+    with a placeholder like nginx:alpine: auto-update follows the tag you register
+    here, so it would sit watching the placeholder forever. (If you already did,
+    apps_set_image fixes it without recreating.)
 
-    Fails with 409 if the id is already taken. If anything fails partway, the
-    whole operation is rolled back, so a half-created app never lingers holding
-    the hostname.
+    Getting the image right avoids almost every failed first deploy — see
+    dockerfile_requirements from apps_deploy_workflow: **linux/arm64**, listen on
+    **port 80 bound to `::`** (an IPv4-only 0.0.0.0 bind fails the in-container
+    healthcheck), **run as root**, and ship curl for the healthcheck.
+
+    This **queues** a deploy and returns; it does NOT wait for the container to
+    become healthy. The rollback-on-failure covers provisioning only — the
+    Coolify app, database and env — not the container's runtime: an image that
+    starts and then fails its healthcheck stays registered, holding the hostname
+    while serving 502. So after creating, **verify with apps_logs** (or by hitting
+    the URL). The id-taken case still fails fast with 409.
 
     This only creates the app. Subsequent code changes ship through CI, not by
     building images by hand.
@@ -302,6 +322,57 @@ async def deploy_key(app_id: str):
     return {"app_id": app_id, "paas_key": paas_key,
             "note": "Scoped to this app. Set it as the PAAS_KEY repo secret; "
                     "any previous deploy key for this app is now revoked."}
+
+
+@router.get("/{app_id}/logs", operation_id="apps_logs",
+            summary="Container status, health and recent logs for one app")
+async def app_logs(app_id: str, tail: int = 200):
+    """The app's container state, health, and its last `tail` log lines, read
+    straight from the Docker daemon.
+
+    Reach for this whenever a deploy 'succeeded' but the URL serves 502, or a
+    container won't stay up — create/redeploy only queue the deploy and do not
+    wait for the container to become healthy, so this is how you actually see
+    what happened (a crash, an EACCES on port 80, an IPv4-only bind failing the
+    healthcheck, a missing env var). `status` of 'no container' means the deploy
+    failed or was rolled back.
+    """
+    tail = max(1, min(tail, 2000))
+    async with pool().acquire() as c:
+        row = await c.fetchrow("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
+    if not row:
+        raise HTTPException(404, "no such app")
+    return {"id": app_id, **await autoupdate.app_logs(row["coolify_uuid"], tail)}
+
+
+@router.put("/{app_id}/image", operation_id="apps_set_image",
+            summary="Point an app at a different base image (and watch tag)")
+async def set_app_image(app_id: str, body: SetImage):
+    """Change the base image an app runs — e.g. move it off a bootstrap
+    placeholder onto its real repository, or switch registries — and redeploy.
+
+    This also repoints auto-update at the new tag and clears the recorded digest,
+    so the app tracks the right image from here on. It differs from routine
+    deploys, which are automatic (CI push -> /refresh), and from apps_update_code
+    (the authenticated CI redeploy path): use this to change *which* image the
+    app follows, not to roll out a new build of the same one.
+    """
+    async with pool().acquire() as c:
+        row = await c.fetchrow(
+            "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
+            "watch_tag FROM apps WHERE id = $1", app_id)
+        if not row:
+            raise HTTPException(404, "no such app")
+        await coolify.set_image(row["coolify_uuid"], body.image)
+        await envs.sync_env(c, row["coolify_uuid"], app_id, row["db_engine"],
+                            row["db_user"], row["db_password"], row["db_name"])
+        await coolify.deploy(row["coolify_uuid"])
+        # Keep auto-update following the new tag (only if it was already on).
+        watch = autoupdate.tag_of(body.image) if row["watch_tag"] is not None else None
+        await c.execute(
+            "UPDATE apps SET image = $1, watch_tag = $2, deployed_digest = NULL "
+            "WHERE id = $3", body.image, watch, app_id)
+    return {"id": app_id, "image": body.image, "watch_tag": watch}
 
 
 @router.put("/{app_id}/autoupdate", operation_id="apps_autoupdate",
