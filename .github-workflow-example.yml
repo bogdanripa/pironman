@@ -24,10 +24,9 @@ jobs:
           platforms: linux/arm64        # the Pi is aarch64 — without this the
           push: true                    # image builds amd64 and will not start
           tags: ghcr.io/bogdanripa/${{ github.event.repository.name }}:latest
-      - name: Redeploy
+      # No secret: the box watches :latest and redeploys when the image changes.
+      # This just triggers it now instead of waiting for the hourly poll.
+      - name: Trigger deploy
         run: |
-          curl -fsS -X PUT \
-            "https://api-coolify.bogdanripa.com/apps/${{ github.event.repository.name }}/code" \
-            -H "Authorization: Bearer ${{ secrets.PAAS_KEY }}" \
-            -H 'Content-Type: application/json' \
-            -d '{"image":"ghcr.io/bogdanripa/${{ github.event.repository.name }}:latest"}'
+          curl -fsS -X POST \
+            "https://api-coolify.bogdanripa.com/apps/${{ github.event.repository.name }}/refresh"
