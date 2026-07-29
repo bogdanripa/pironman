@@ -78,8 +78,10 @@ preview only, so re-set a variable if you are unsure of its value.
 
 Deploys go through CI, not through hand-built images. The right way to build and
 deploy an app is to wire its repository to GitHub Actions: each push to main
-builds the arm64 image, pushes it to ghcr.io, and calls apps_update_code to
-redeploy the new tag. Do NOT build an image locally and push it to the registry
+builds the arm64 image, pushes it to ghcr.io, and hits the platform's redeploy
+endpoint (PUT /apps/<id>/code) to roll out the new tag. That redeploy is CI's job
+— there is deliberately no tool here to deploy an app by hand. Do NOT build an
+image locally and push it to the registry
 yourself, and do not go looking for registry credentials to do so — that is the
 wrong path. It will not reliably match the arm64 platform and immutable-tag
 scheme this platform expects, it puts a push credential somewhere it should not
@@ -145,9 +147,14 @@ async def health():
 # descriptions from each endpoint's summary and docstring.
 from fastapi_mcp import FastApiMCP  # noqa: E402
 
+# apps_update_code (PUT /apps/{id}/code) stays a REST route — it is what the CI
+# workflow curls to redeploy — but it is NOT exposed as an MCP tool. Deploys go
+# through CI; giving the model a manual-deploy tool only invites it to skip the
+# pipeline. The route keeps serving; it just isn't in the tool list.
 _mcp = FastApiMCP(
     app,
     name="pironman",
     description=SERVER_DESCRIPTION,
+    exclude_operations=["apps_update_code"],
 )
 _mcp.mount_http()

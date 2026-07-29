@@ -212,13 +212,11 @@ async def create_app(body: CreateApp):
             "the app's repo and commit it (use your GitHub tools).",
             "3. Create a repository secret named PAAS_KEY set to this response's "
             "paas_key. If you cannot create repo secrets with your tools, give "
-            "the value to the user to add once — it is scoped to this app only.",
+            "the value to the user to add once — it is scoped to this app only. "
+            "This must be in place before the first push can deploy.",
             "4. Push to main. CI builds the arm64 image, pushes it to ghcr.io, "
-            "and redeploys this app automatically.",
-            "First deploy without waiting on the secret: once CI has built and "
-            "pushed the image, call apps_update_code with that tag yourself to "
-            "get it live now; the PAAS_KEY secret is what makes later pushes "
-            "deploy hands-off.",
+            "and redeploys this app automatically. Deploying is CI's job — there "
+            "is no tool to deploy by hand.",
         ],
     }
 
@@ -228,8 +226,8 @@ async def create_app(body: CreateApp):
 async def adopt_app(app_id: str, body: AdoptApp):
     """Bring an app that was created by hand in Coolify under management here,
     without creating a duplicate. After adopting, the app shows up in list_apps,
-    redeploys through apps_update_code, and can carry environment variables and
-    scheduled jobs like any other.
+    redeploys through CI like any other app, and can carry environment variables
+    and scheduled jobs.
 
     This is how paas-api manages itself: the control plane was created in Coolify
     by hand during bootstrap, so it has no registry row and cannot be redeployed
