@@ -11,11 +11,17 @@ router = APIRouter(prefix="/apps", tags=["database"],
 
 class Script(BaseModel):
     script: str = Field(
-        description="For a postgres app: raw SQL, multiple statements allowed, "
-                    "semicolon-separated. For a mongo app: a mongosh script, e.g. "
-                    "db.notes.find({}).limit(5). Runs as the app's own database "
-                    "user against its own database — no other app's data is "
-                    "reachable.")
+        description=(
+            "The script to run against this app's own database — as the app's own "
+            "user, against its own database, with no other app's data reachable. "
+            "The engine is fixed by the app, so send the matching dialect:\n"
+            "Postgres → raw SQL. Multiple statements allowed, semicolon-separated; "
+            "execution stops at the first error. Prefer explicit column lists over "
+            "SELECT *. e.g. \"CREATE TABLE notes (id serial PRIMARY KEY, body "
+            "text); INSERT INTO notes (body) VALUES ('hi');\"\n"
+            "Mongo → a mongosh script (JavaScript); the app's database is already "
+            "the selected `db`. e.g. \"db.notes.insertOne({body: 'hi'}); "
+            "db.notes.find().limit(5)\""))
     timeout: int = Field(
         default=30,
         description="Statement timeout in seconds. Raise it for long migrations "
@@ -26,7 +32,10 @@ class Script(BaseModel):
              summary="Run raw SQL or a mongosh script against one app's database")
 async def run_query(app_id: str, body: Script):
     """Execute a script directly against an app's database and return the raw
-    output.
+    output. The runner follows the app's engine — psql for a postgres app,
+    mongosh for a mongo app — so you send the matching dialect (see the script
+    field); you do not choose the runner. Check the app's db_engine first if you
+    are unsure which it is.
 
     Use it to inspect data, apply a schema migration, seed initial rows, or
     repair a bad record — anything you would otherwise do with a psql or mongosh
