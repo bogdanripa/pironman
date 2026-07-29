@@ -25,12 +25,17 @@ class CreateApp(BaseModel):
                     "The container MUST listen on port 80.")
     db_engine: Literal["postgres", "mongo"] | None = Field(
         default=None,
-        description="Omit for an app with no database. Set to 'postgres' or "
-                    "'mongo' to provision a dedicated database and user for this "
-                    "app; the connection string is injected into the container as "
-                    "the DATABASE_URL environment variable. Postgres is the "
-                    "better default — its JSONB type covers most document "
-                    "workloads and it has a simpler backup story.")
+        description="Whether to provision a dedicated database for this app, and "
+                    "which engine. Omit (null) for an app that needs no database. "
+                    "There is no default engine — pick from the app's data model, "
+                    "do not assume one: 'postgres' for relational data, "
+                    "transactions or SQL querying (its JSONB type also handles "
+                    "semi-structured data well); 'mongo' for document-oriented "
+                    "data with a flexible or evolving schema and nested "
+                    "documents. When it is not clear-cut, ask the user which they "
+                    "want rather than choosing for them. Whichever is chosen, its "
+                    "connection string is injected as the DATABASE_URL "
+                    "environment variable.")
     health_path: str = Field(
         default="/",
         description="Path the container healthcheck requests, e.g. '/health'. Must "
