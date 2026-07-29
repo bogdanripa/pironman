@@ -146,6 +146,28 @@ async def health():
 # shares this app's auth and lifespan. Tool names come from operation_id,
 # descriptions from each endpoint's summary and docstring.
 from fastapi_mcp import FastApiMCP  # noqa: E402
+import fastapi_mcp.server as _fastapi_mcp_server  # noqa: E402
+
+
+class _SSESessionManager(_fastapi_mcp_server.FastApiHttpSessionManager):
+    """Force the /mcp streamable-HTTP transport into SSE (text/event-stream).
+
+    fastapi-mcp defaults `json_response=True`, i.e. it answers a tool call with a
+    single `application/json` body. That body is valid MCP and travels through
+    Cloudflare/Traefik intact — but the claude.ai connector proxy rejects it with
+    "Invalid content from server"; it expects the response framed as SSE. Errors
+    happen to go out on a path the proxy accepts, which is why only successful
+    tool *results* failed. fastapi-mcp exposes no way to set json_response through
+    mount_http, so subclass the session manager it constructs and flip the
+    default. Pinned to fastapi-mcp==0.4.0, so this internal name is stable.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("json_response", False)
+        super().__init__(*args, **kwargs)
+
+
+_fastapi_mcp_server.FastApiHttpSessionManager = _SSESessionManager
 
 # apps_update_code (PUT /apps/{id}/code) stays a REST route — it is what the CI
 # workflow curls to redeploy — but it is NOT exposed as an MCP tool. Deploys go
