@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS app_env (
 -- an unscoped admin key (bootstrap, the connector), a value is a deploy key that
 -- may only redeploy that one app (enforced in auth.require_key).
 ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS app_id text;
+
+-- Auto-update: watch_tag is the registry tag to poll (NULL = opted out);
+-- deployed_digest is the image digest currently running, so a poll only
+-- redeploys when the tag actually moved. See app/autoupdate.py.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS watch_tag text;
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS deployed_digest text;
 """
 
 

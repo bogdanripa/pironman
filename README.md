@@ -14,8 +14,9 @@ app/coolify.py     facade client (VERIFIED / UNVERIFIED marked per call)
 app/provision.py   wraps the host `pdb` script
 app/cronmatch.py   dependency-free 5-field cron matcher
 app/envs.py        shared + per-app env vars: desired-set + Coolify sync
+app/autoupdate.py  watch an app's tag, redeploy when the image digest changes
 app/cli.py         python -m app.cli create <label>
-app/routers/       apps, crons, query, scaffold, env
+app/routers/       apps, crons, query, scaffold, env, refresh
 paas-cron-dispatch host-side dispatcher, runs every minute from crontab
 ```
 
@@ -125,6 +126,23 @@ sudo touch /opt/paas/app/__init__.py
 3. `POST /apps/t2/db/query {"script":"SELECT 1"}`
 4. Add a cron for `* * * * *`, watch `/var/log/paas-cron.log`.
 5. `DELETE` both; confirm Coolify app, database and registry row are all gone.
+
+## Auto-update (secretless deploys)
+
+Apps deploy with **no repository secret**. CI builds and pushes `:latest`; the
+box watches that tag and redeploys when the image digest changes — **hourly** (an
+in-process loop, first run an hour after start) and **immediately** when CI POSTs
+the app's unauthenticated `POST /apps/<id>/refresh` hook. Digest resolution goes
+through the host Docker daemon (`docker pull` + `inspect`), reusing its existing
+pull credentials, and a redeploy only fires when the digest actually moved — so
+`/refresh` is safe to leave unauthenticated: it takes no image, so a caller can
+at most trigger a check.
+
+New apps have auto-update on, watching the tag they were created with;
+`apps_autoupdate` toggles it (off to hold a manual rollback). `app/autoupdate.py`
+holds the routine. `apps_update_code` plus a scoped deploy key remain the
+*authenticated* path for explicit deploys/rollbacks — the control plane itself
+(`api`) still deploys that way and is opted out of auto-update.
 
 ## Deploy keys
 

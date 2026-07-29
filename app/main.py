@@ -1,9 +1,11 @@
+import asyncio
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool
-from .routers import apps, crons, query, scaffold, env
+from . import autoupdate
+from .routers import apps, crons, query, scaffold, env, refresh
 
 
 class PromoteKeyMiddleware:
@@ -76,26 +78,24 @@ container; a shared change therefore redeploys everything. Values are write-only
 you can set and overwrite them but never read one back — listings show a masked
 preview only, so re-set a variable if you are unsure of its value.
 
-Deploys go through CI, not through hand-built images. The right way to build and
-deploy an app is to wire its repository to GitHub Actions: each push to main
-builds the arm64 image, pushes it to ghcr.io, and hits the platform's redeploy
-endpoint (PUT /apps/<id>/code) to roll out the new tag. That redeploy is CI's job
-— there is deliberately no tool here to deploy an app by hand. Do NOT build an
-image locally and push it to the registry
-yourself, and do not go looking for registry credentials to do so — that is the
-wrong path. It will not reliably match the arm64 platform and immutable-tag
-scheme this platform expects, it puts a push credential somewhere it should not
-be, and it does not reproduce on the next change. To set this up, call
-apps_deploy_workflow and write exactly what it returns into the app's repo; to
-ship a change after that, commit and push and let the pipeline run. Building an
-image by hand is only ever a first-time bootstrap step for the control plane
-itself, never the way to deploy an ordinary app.
+Deploys go through CI, not through hand-built images, and they need no secret.
+The right way to build and deploy an app is to wire its repository to GitHub
+Actions: each push to main builds the arm64 image, pushes it to ghcr.io tagged
+:latest, and calls the app's unauthenticated /refresh hook. The box watches that
+tag and redeploys the new image — on the /refresh call, and hourly regardless —
+so there is deliberately no tool here to deploy an app by hand. Do NOT build an
+image locally and push it to the registry yourself, and do not go looking for
+registry or deploy credentials to do so — that is the wrong path, it will not
+match the arm64 platform this platform expects, and it does not reproduce. To
+set this up, call apps_deploy_workflow and write exactly what it returns into the
+app's repo; to ship a change after that, commit and push. Building an image by
+hand is only ever a first-time bootstrap step for the control plane itself.
 
 Creating the app itself is the one-off you do here, before its first CI run.
-apps_create and apps_deploy_workflow each return an ordered deploy runbook and
-the app's scoped PAAS_KEY — follow those steps to wire up CI and ship the app end
-to end yourself, only asking the user for the one step your tools can't do (e.g.
-adding the repository secret).
+apps_create and apps_deploy_workflow each return an ordered deploy runbook —
+follow it to wire up CI and ship the app end to end yourself, with no repository
+secret and no human step. New apps auto-update by default; apps_autoupdate turns
+it off (e.g. to hold a manual rollback).
 
 The whole platform runs on one small machine at home. Deleting an app destroys
 its database and all its data with no undo, and running a database script is an
@@ -103,11 +103,25 @@ unguarded pipe into that database — confirm both with the user first.\
 """
 
 
+async def _autoupdate_loop():
+    """Hourly: redeploy every opted-in app whose watched image tag has moved.
+    First run is an hour after startup, not on boot — this control plane
+    redeploys itself often, and there is no need to sweep on every restart."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await autoupdate.check_all()
+        except Exception:
+            pass  # a bad sweep must never take the control plane down
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_pool()
     await ensure_schema()  # create env tables if missing — no manual SQL on the Pi
+    task = asyncio.create_task(_autoupdate_loop())
     yield
+    task.cancel()
     await close_pool()
 
 
@@ -135,6 +149,7 @@ app.include_router(env.app_router)    # apps_env_* — per-app env, part of the 
 app.include_router(crons.router)
 app.include_router(query.router)
 app.include_router(env.shared_router)  # env_* — shared, account-wide variables
+app.include_router(refresh.router)     # POST /apps/{id}/refresh — unauth CI hook
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
@@ -183,7 +198,7 @@ _mcp = FastApiMCP(
     app,
     name="pironman",
     description=SERVER_DESCRIPTION,
-    exclude_operations=["apps_update_code"],
+    exclude_operations=["apps_update_code", "apps_refresh"],
 )
 
 # fastapi-mcp does `Server(name, description)`, and the low-level MCP Server takes

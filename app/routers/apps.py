@@ -5,7 +5,7 @@ from typing import Literal
 from ..auth import require_key, mint_key
 from ..db import pool
 from ..config import app_url, app_fqdn
-from .. import coolify, provision, envs
+from .. import coolify, provision, envs, autoupdate
 from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
@@ -51,6 +51,16 @@ class UpdateCode(BaseModel):
                     "tag over ':latest' — the platform pulls by tag, and pushing a "
                     "new ':latest' does not reliably force a fresh pull. Must be "
                     "linux/arm64.")
+
+
+class AutoUpdate(BaseModel):
+    enabled: bool = Field(
+        description="Turn auto-update on or off for this app. When on, the "
+                    "platform pulls the app's tag hourly (and on a CI /refresh "
+                    "call) and redeploys it whenever the image changes — so a "
+                    "push to that tag ships automatically, no deploy key needed. "
+                    "Turn it off to pin the app to its current image (e.g. after "
+                    "a manual rollback you want to keep).")
 
 
 class AdoptApp(BaseModel):
@@ -147,10 +157,11 @@ async def create_app(body: CreateApp):
     so — the pipeline is how apps are built and shipped here; a manual build is
     only ever a one-off bootstrap of the control plane itself.
 
-    The response includes **paas_key**: a deploy key scoped to this app (it can
-    only redeploy this app, nothing else). It is the value for the workflow's
-    PAAS_KEY repository secret, and it is shown only here — if lost, issue a fresh
-    one with apps_deploy_key. Give it to the user to paste into the repo secret.
+    The response also includes **paas_key**, a deploy key scoped to this app, for
+    the *authenticated* deploy path (PUT /apps/<id>/code) — e.g. a manual
+    rollback. The CI workflow does not need it: deploys are secretless, the box
+    auto-updates and CI just calls the app's /refresh hook. Shown once; re-issue
+    with apps_deploy_key.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
@@ -183,11 +194,15 @@ async def create_app(body: CreateApp):
         async with pool().acquire() as c:
             await c.execute(
                 "INSERT INTO apps (id, image, coolify_uuid, db_engine, "
-                "db_user, db_password, db_name) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                "db_user, db_password, db_name, watch_tag) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                 body.id, body.image, uuid, body.db_engine,
                 db_info["user"] if db_info else None,
                 db_info["password"] if db_info else None,
                 db_info["database"] if db_info else None,
+                # Auto-update on by default, watching whatever tag it was created
+                # with (usually :latest) — a push to that tag auto-deploys.
+                autoupdate.tag_of(body.image),
             )
     except Exception:
         await _rollback(uuid, body.id, body.db_engine if db_info else None)
@@ -209,19 +224,17 @@ async def create_app(body: CreateApp):
         # A runbook for the caller to drive the rest end to end, without a human
         # and without building anything by hand.
         "deploy": [
-            "The app exists but has no code pipeline yet. Set up CI now — do not "
-            "build an image locally or look for registry credentials.",
+            "The app exists but has no code pipeline yet. Set up CI now — no "
+            "secret and no human step needed. Do not build an image locally or "
+            "look for registry credentials.",
             "1. Call apps_deploy_workflow for this app id to get the GitHub "
             "Actions workflow file and where it goes.",
             "2. Write that workflow verbatim to .github/workflows/deploy.yml in "
             "the app's repo and commit it (use your GitHub tools).",
-            "3. Create a repository secret named PAAS_KEY set to this response's "
-            "paas_key. If you cannot create repo secrets with your tools, give "
-            "the value to the user to add once — it is scoped to this app only. "
-            "This must be in place before the first push can deploy.",
-            "4. Push to main. CI builds the arm64 image, pushes it to ghcr.io, "
-            "and redeploys this app automatically. Deploying is CI's job — there "
-            "is no tool to deploy by hand.",
+            "3. Push to main. CI builds and pushes the arm64 image and calls this "
+            "app's /refresh hook; the box redeploys the new image. This app "
+            "auto-updates, so no PAAS_KEY or deploy secret is required. Deploying "
+            "is CI's job — there is no tool to deploy by hand.",
         ],
     }
 
@@ -289,6 +302,30 @@ async def deploy_key(app_id: str):
     return {"app_id": app_id, "paas_key": paas_key,
             "note": "Scoped to this app. Set it as the PAAS_KEY repo secret; "
                     "any previous deploy key for this app is now revoked."}
+
+
+@router.put("/{app_id}/autoupdate", operation_id="apps_autoupdate",
+            summary="Turn hourly image auto-update on or off for an app")
+async def set_autoupdate(app_id: str, body: AutoUpdate):
+    """Enable or disable auto-update for one app.
+
+    On (the default for newly created apps): the platform watches the app's tag
+    and redeploys it whenever the registry image changes — hourly, and instantly
+    when the app's CI workflow calls its /refresh hook after a push. This is what
+    lets a deploy pipeline work with no PAAS_KEY secret.
+
+    Off: the app stays on whatever image it currently runs until you deploy it
+    explicitly. Use this to hold a manual rollback, or for an app you don't want
+    tracking a moving tag.
+    """
+    async with pool().acquire() as c:
+        row = await c.fetchrow("SELECT image FROM apps WHERE id = $1", app_id)
+        if not row:
+            raise HTTPException(404, "no such app")
+        watch = autoupdate.tag_of(row["image"]) if body.enabled else None
+        await c.execute("UPDATE apps SET watch_tag = $1 WHERE id = $2",
+                        watch, app_id)
+    return {"id": app_id, "autoupdate": body.enabled, "watch_tag": watch}
 
 
 async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:

@@ -45,13 +45,12 @@ def _workflow(app_id: str, repo_name: str) -> str:
                     ghcr.io/bogdanripa/{repo_name}:latest
                     ghcr.io/bogdanripa/{repo_name}:${{{{ steps.tag.outputs.value }}}}
 
-              - name: Redeploy on the Pi
+              # No secret: the box watches :latest and redeploys the new image.
+              # This just asks it to do so now instead of at the next hourly poll.
+              - name: Trigger deploy on the Pi
                 run: |
-                  curl -fsS -X PUT \\
-                    "https://api-coolify.bogdanripa.com/apps/{app_id}/code" \\
-                    -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
-                    -H 'Content-Type: application/json' \\
-                    -d '{{"image":"ghcr.io/bogdanripa/{repo_name}:${{{{ steps.tag.outputs.value }}}}"}}'
+                  curl -fsS -X POST \\
+                    "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh"
         """)
 
 
@@ -113,24 +112,25 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
     repo = repo_name or app_id
 
     notes = [
-        "Each push to main builds an arm64 image, pushes it to ghcr.io tagged "
-        "with the commit sha, and calls this platform to redeploy that exact tag.",
-        "The workflow deploys an immutable sha- tag rather than :latest, because "
-        "re-pushing :latest does not reliably force a fresh pull.",
-        "The app must already exist here before the first workflow run; CI only "
-        "ever updates an existing app.",
+        "Each push to main builds an arm64 image and pushes it to ghcr.io tagged "
+        "':latest' (and with the commit sha for traceability), then calls this "
+        "app's /refresh hook so the box redeploys the new image right away.",
+        "No PAAS_KEY, no deploy secret: the box auto-updates. It watches the "
+        "app's ':latest' tag — hourly, and immediately when /refresh is called — "
+        "and redeploys only when the image digest actually changes. The /refresh "
+        "call is unauthenticated on purpose; it takes no image, so a caller can "
+        "at most trigger that check.",
+        "The app must already exist here before the first workflow run (create it "
+        "with apps_create). New apps have auto-update on by default; toggle it "
+        "with apps_autoupdate.",
         "The push authenticates with the built-in GITHUB_TOKEN, which works "
         "because the package CI creates is automatically linked to this repo. "
         "The one case where it does NOT work: if the image was ever pushed by "
-        "hand first (a manual `docker push` during setup), the ghcr package "
-        "already exists owned by your account with no repo link, and CI then "
-        "fails at push with '403 Forbidden'. Fix it in the package's GitHub "
-        "settings → Manage Actions access → add this repo with the Write role; "
-        "or delete the hand-pushed package and let the first CI run create it. "
-        "Letting CI create the package from the start avoids this entirely.",
-        "If the package is private, the Pi needs a pull credential for it — it "
-        "has one, but a brand-new private package may need to be linked to its "
-        "repository in the package's GitHub settings before the Pi can pull.",
+        "hand first (a manual `docker push`), the ghcr package already exists "
+        "owned by your account with no repo link, and CI then fails at push with "
+        "'403 Forbidden'. Fix it in the package's GitHub settings → Manage "
+        "Actions access → add this repo with the Write role, or let CI create the "
+        "package from the start.",
     ]
     if row["db_engine"]:
         notes.append(
@@ -143,32 +143,19 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "app_id": app_id,
         "url": app_url(app_id),
         "setup": [
-            "Drive this yourself with your GitHub tools; only the secret may need "
-            "a human. Do not build the image locally.",
+            "Drive this end to end with your GitHub tools — no secret, no human "
+            "step. Do not build the image locally.",
             "1. Write `workflow` verbatim to `workflow_path` in the app's repo "
             "and commit it.",
-            "2. Create the repository secret in `required_secrets` (PAAS_KEY). "
-            "Its value is the app's deploy key — the `paas_key` apps_create "
-            "returned, or call apps_deploy_key to issue a fresh one. If you "
-            "cannot set repo secrets programmatically, ask the user to add it "
-            "once. It must be set before the first push can deploy.",
-            "3. Make sure the app's Dockerfile satisfies "
+            "2. Make sure the app's Dockerfile satisfies "
             "`dockerfile_requirements`.",
-            "4. Push to main. CI builds and pushes the arm64 image, then hits the "
-            "platform's redeploy endpoint to roll it out. Deploying is CI's job "
-            "— there is no tool to deploy an app by hand.",
+            "3. Push to main. CI builds and pushes the arm64 image and calls the "
+            "app's /refresh hook; the box redeploys the new image. Deploying is "
+            "CI's job — there is no tool to deploy an app by hand.",
         ],
         "workflow_path": ".github/workflows/deploy.yml",
         "workflow": _workflow(app_id, repo),
-        "required_secrets": [{
-            "name": "PAAS_KEY",
-            "where": "GitHub repository → Settings → Secrets and variables → Actions",
-            "value": "This app's deploy key, scoped so it can only redeploy this "
-                     "app. apps_create returned it as `paas_key` when the app was "
-                     "created; if you don't have it, call apps_deploy_key to issue "
-                     "a fresh one (that revokes the previous). Shown once — paste "
-                     "it into the PAAS_KEY secret.",
-        }],
+        "required_secrets": [],  # none — the box auto-updates, no deploy secret
         "dockerfile_requirements": DOCKERFILE_RULES,
         "notes": notes,
     }
