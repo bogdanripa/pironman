@@ -337,7 +337,7 @@ async def update_code(app_id: str, body: UpdateCode):
     return {"id": app_id, "image": body.image}
 
 
-@router.delete("/{app_id}", status_code=204, operation_id="apps_delete",
+@router.delete("/{app_id}", operation_id="apps_delete",
                summary="Permanently delete an app, its database and its schedules")
 async def delete_app(app_id: str):
     """Destroy an app completely: the container, its database **including all
@@ -361,4 +361,8 @@ async def delete_app(app_id: str):
         await provision.drop(app_id, row["db_engine"])
     async with pool().acquire() as c:
         await c.execute("DELETE FROM app_env WHERE app_id = $1", app_id)
+        await c.execute("DELETE FROM api_keys WHERE app_id = $1", app_id)
         await c.execute("DELETE FROM apps WHERE id = $1", app_id)
+    # Return a body, not 204: an MCP tool result with no content is rejected by
+    # the connector proxy as "Invalid content from server".
+    return {"id": app_id, "deleted": True}

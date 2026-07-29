@@ -124,7 +124,7 @@ async def update_cron(app_id: str, cron_id: UUID, body: CronPatch):
     return dict(row)
 
 
-@router.delete("/{app_id}/crons/{cron_id}", status_code=204,
+@router.delete("/{app_id}/crons/{cron_id}",
                operation_id="crons_delete",
                summary="Remove a scheduled job")
 async def delete_cron(app_id: str, cron_id: UUID):
@@ -138,3 +138,6 @@ async def delete_cron(app_id: str, cron_id: UUID):
             "DELETE FROM crons WHERE id = $1 AND app_id = $2", cron_id, app_id)
     if res.endswith("0"):
         raise HTTPException(404, "no such cron")
+    # Return a body, not 204: a content-less MCP tool result is rejected by the
+    # connector proxy as "Invalid content from server".
+    return {"id": str(cron_id), "deleted": True}
