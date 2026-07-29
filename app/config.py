@@ -15,6 +15,13 @@ COOLIFY_ENV_NAME    = os.environ.get("COOLIFY_ENV_NAME", "production")
 
 DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
 
+# ghcr read credential for the auto-updater's digest checks (docker pull of
+# private packages). Optional — without it auto-update still works for public
+# images. This is ONE server-side credential for the whole platform, not a
+# per-repo deploy secret, so it does not reintroduce per-app secrets.
+GHCR_USER  = os.environ.get("GHCR_USER", "")
+GHCR_TOKEN = os.environ.get("GHCR_TOKEN", "")
+
 def _pg_host() -> str:
     """Resolve the Postgres container name live. Coolify recreates database
     resources on routine config edits and the name changes each time, so a

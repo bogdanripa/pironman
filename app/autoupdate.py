@@ -18,7 +18,10 @@ when the tag's digest actually moved, which is what makes the unauthenticated
 import asyncio
 
 from . import coolify, envs
+from .config import GHCR_USER, GHCR_TOKEN
 from .db import pool
+
+_ghcr_logged_in = False
 
 # Everything check_and_update needs to compare digests and redeploy.
 APP_COLS = ("id, coolify_uuid, image, watch_tag, deployed_digest, "
@@ -54,11 +57,29 @@ async def _docker(*args: str, timeout: int = 600) -> tuple[int, str]:
     return proc.returncode, out.decode()
 
 
+async def ensure_ghcr_login() -> None:
+    """Log the container's docker CLI in to ghcr.io so digest-check pulls can
+    reach private packages. The daemon's own creds are not used by `docker pull`
+    (the CLI supplies auth), and this container has none by default. No-op when
+    GHCR_TOKEN is unset (public images still work) or after the first success."""
+    global _ghcr_logged_in
+    if _ghcr_logged_in or not GHCR_TOKEN:
+        return
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "login", "ghcr.io", "-u", GHCR_USER or "x-access-token",
+        "--password-stdin",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    await proc.communicate(GHCR_TOKEN.encode())
+    _ghcr_logged_in = proc.returncode == 0
+
+
 async def remote_digest(ref: str) -> str | None:
-    """Pull the tag fresh (using the daemon's registry creds) and return the
-    image digest (sha256:...), or None if the pull/inspect failed. The pull also
-    warms the local image so the Coolify redeploy that follows reliably gets the
-    new bits — which is why watching a moving tag like :latest works here."""
+    """Pull the tag fresh and return the image digest (sha256:...), or None if
+    the pull/inspect failed. The pull also warms the local image so the Coolify
+    redeploy that follows reliably gets the new bits — which is why watching a
+    moving tag like :latest works here."""
+    await ensure_ghcr_login()
     rc, _ = await _docker("pull", ref)
     if rc != 0:
         return None
