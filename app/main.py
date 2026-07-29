@@ -146,28 +146,34 @@ async def health():
 # shares this app's auth and lifespan. Tool names come from operation_id,
 # descriptions from each endpoint's summary and docstring.
 from fastapi_mcp import FastApiMCP  # noqa: E402
-import fastapi_mcp.server as _fastapi_mcp_server  # noqa: E402
 
+# fastapi-mcp 0.4.0 exposes no config for the MCP HTTP transport, and its
+# defaults do not work with the claude.ai connector proxy. Patch the SDK session
+# manager it builds under the hood:
+#   - stateless=True — the connector caches a session id, but this control plane
+#     redeploys ITSELF constantly and MCP sessions live in memory, so every
+#     redeploy kills them and every stateful call afterwards fails with "Invalid
+#     content from server". Stateless makes each tool call self-contained, so it
+#     survives redeploys and needs no session bookkeeping.
+#   - json_response=False — answer tool calls as SSE (text/event-stream), which
+#     the connector proxy expects rather than a single application/json body.
+# Wrapped in try/except so a fastapi-mcp/SDK rename can never crash startup (the
+# control plane must always boot); at worst the connector stays broken.
+try:
+    import fastapi_mcp.transport.http as _fmhttp  # noqa: E402
 
-class _SSESessionManager(_fastapi_mcp_server.FastApiHttpSessionManager):
-    """Force the /mcp streamable-HTTP transport into SSE (text/event-stream).
+    _BaseSessionManager = _fmhttp.StreamableHTTPSessionManager
 
-    fastapi-mcp defaults `json_response=True`, i.e. it answers a tool call with a
-    single `application/json` body. That body is valid MCP and travels through
-    Cloudflare/Traefik intact — but the claude.ai connector proxy rejects it with
-    "Invalid content from server"; it expects the response framed as SSE. Errors
-    happen to go out on a path the proxy accepts, which is why only successful
-    tool *results* failed. fastapi-mcp exposes no way to set json_response through
-    mount_http, so subclass the session manager it constructs and flip the
-    default. Pinned to fastapi-mcp==0.4.0, so this internal name is stable.
-    """
+    class _PatchedSessionManager(_BaseSessionManager):
+        def __init__(self, *args, **kwargs):
+            kwargs["stateless"] = True
+            kwargs["json_response"] = False
+            kwargs["event_store"] = None  # unused (and disallowed) when stateless
+            super().__init__(*args, **kwargs)
 
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("json_response", False)
-        super().__init__(*args, **kwargs)
-
-
-_fastapi_mcp_server.FastApiHttpSessionManager = _SSESessionManager
+    _fmhttp.StreamableHTTPSessionManager = _PatchedSessionManager
+except Exception:  # pragma: no cover - never block startup on a patch failure
+    pass
 
 # apps_update_code (PUT /apps/{id}/code) stays a REST route — it is what the CI
 # workflow curls to redeploy — but it is NOT exposed as an MCP tool. Deploys go
