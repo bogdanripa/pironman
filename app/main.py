@@ -179,4 +179,15 @@ _mcp = FastApiMCP(
     description=SERVER_DESCRIPTION,
     exclude_operations=["apps_update_code"],
 )
+
+# fastapi-mcp does `Server(name, description)`, and the low-level MCP Server takes
+# `version` as its second positional arg — so our whole description lands in
+# serverInfo.version as a 1500-char markdown blob. That is what the connector
+# proxy chokes on at the handshake. Put a real version back, and move the text to
+# `instructions`, which is where server-level guidance belongs (and where the
+# model actually reads it — in the version field it was simply wasted).
+if getattr(_mcp, "server", None) is not None:
+    _mcp.server.version = "0.1.0"
+    _mcp.server.instructions = SERVER_DESCRIPTION
+
 _mcp.mount_http()
