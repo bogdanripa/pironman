@@ -217,4 +217,27 @@ if getattr(_mcp, "server", None) is not None:
     _mcp.server.version = "0.1.0"
     _mcp.server.instructions = SERVER_DESCRIPTION
 
+# Tag each tool read-only / write / destructive. The claude.ai connector UI
+# groups tools by these annotations (read-only vs makes-changes vs destructive);
+# without them fastapi-mcp emits none and everything lands in one "Other tools"
+# bucket. Also helps the model gauge a tool's blast radius. Guarded so a types
+# rename can't block startup.
+try:
+    from mcp.types import ToolAnnotations  # noqa: E402
+
+    _READONLY = {"apps_list", "apps_get", "apps_logs", "apps_deploy_workflow",
+                 "apps_env_list", "crons_list", "env_list", "github_secrets_list"}
+    _DESTRUCTIVE = {"apps_delete", "apps_env_delete", "crons_delete",
+                    "db_run_script", "env_delete", "github_secret_delete"}
+    for _tool in getattr(_mcp, "tools", None) or []:
+        if _tool.name in _READONLY:
+            _tool.annotations = ToolAnnotations(readOnlyHint=True)
+        elif _tool.name in _DESTRUCTIVE:
+            _tool.annotations = ToolAnnotations(readOnlyHint=False,
+                                                destructiveHint=True)
+        else:  # create/set/update/adopt/… — changes state, not destructive
+            _tool.annotations = ToolAnnotations(readOnlyHint=False)
+except Exception:  # pragma: no cover - never block startup on annotations
+    pass
+
 _mcp.mount_http()
