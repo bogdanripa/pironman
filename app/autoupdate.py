@@ -18,14 +18,15 @@ when the tag's digest actually moved, which is what makes the unauthenticated
 import asyncio
 
 from . import coolify, envs
-from .config import GHCR_USER, GHCR_TOKEN
+from .config import GHCR_USER, GHCR_TOKEN, SABLIER_AUTO_ENROLL
 from .db import pool
 
 _ghcr_logged_in = False
 
-# Everything check_and_update needs to compare digests and redeploy.
+# Everything check_and_update needs to compare digests, redeploy, and enroll.
 APP_COLS = ("id, coolify_uuid, image, watch_tag, deployed_digest, "
-            "db_engine, db_user, db_password, db_name")
+            "db_engine, db_user, db_password, db_name, "
+            "sleep_when_idle, sablier_enrolled")
 
 
 def repo_of(image: str) -> str:
@@ -135,7 +136,26 @@ async def check_and_update(conn, app) -> dict:
     await conn.execute(
         "UPDATE apps SET image = $1, deployed_digest = $2 WHERE id = $3",
         ref, digest, app["id"])
+    await _maybe_enroll_sablier(conn, app)
     return {"id": app["id"], "updated": True, "image": ref, "digest": digest}
+
+
+async def _maybe_enroll_sablier(conn, app) -> None:
+    """Auto-enroll an app in Sablier scale-to-zero after a deploy, once, if the
+    feature is on and the app opts in. Gated by SABLIER_AUTO_ENROLL (off by
+    default) so a wrong SABLIER_URL can't break routing platform-wide before it's
+    verified on one app. Best-effort: a failure just leaves it for next time."""
+    if not SABLIER_AUTO_ENROLL or app["sablier_enrolled"] or not app["sleep_when_idle"]:
+        return
+    from . import sablier  # lazy: sablier imports this module
+    if sablier.excluded(app["id"]):
+        return
+    try:
+        await sablier.enroll(app["coolify_uuid"], app["id"])
+        await conn.execute(
+            "UPDATE apps SET sablier_enrolled = true WHERE id = $1", app["id"])
+    except Exception:
+        pass  # container may not be up yet; a later sweep retries
 
 
 async def check_all() -> list[dict]:

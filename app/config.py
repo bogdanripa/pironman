@@ -30,6 +30,21 @@ TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
 ALERT_5XX_THRESHOLD = int(os.environ.get("ALERT_5XX_THRESHOLD", "5"))
 
+# Sablier scale-to-zero enrollment (app/sablier.py). paas-api stamps the Sablier
+# Traefik-plugin middleware onto each app's Coolify custom labels so idle apps
+# sleep and the enrollment survives redeploys. SABLIER_URL is how Traefik reaches
+# the Sablier container; the rest are the plugin middleware's parameters.
+#   SABLIER_EXCLUDE — apps that must never sleep (the control plane itself).
+#   SABLIER_AUTO_ENROLL — when true, new/updated apps are enrolled automatically;
+#     keep it false until enrollment is verified on one app (apps_sablier).
+SABLIER_URL              = os.environ.get("SABLIER_URL", "http://sablier:10000")
+SABLIER_SESSION_DURATION = os.environ.get("SABLIER_SESSION_DURATION", "5m")
+SABLIER_STRATEGY         = os.environ.get("SABLIER_STRATEGY", "dynamic")  # or blocking
+SABLIER_EXCLUDE          = set(
+    x.strip() for x in os.environ.get("SABLIER_EXCLUDE", "api").split(",") if x.strip())
+SABLIER_AUTO_ENROLL      = os.environ.get("SABLIER_AUTO_ENROLL", "").lower() in (
+    "1", "true", "yes")
+
 # ghcr read credential for the auto-updater's digest checks (docker pull of
 # private packages). Optional — without it auto-update still works for public
 # images. This is ONE server-side credential for the whole platform, not a

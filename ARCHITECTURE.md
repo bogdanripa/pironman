@@ -250,18 +250,27 @@ then **the next deploy wipes it and the app silently stops sleeping** (stays
 timestamp, enrolling by container **name** breaks on every redeploy for the same
 reason.
 
-**Durable design (the intended end state):** enroll by a **stable group label**
-keyed on the app id — `sablier.enable=true`, `sablier.group=<app-id>` on the
-container, and a Sablier plugin middleware configured with `group=<app-id>` on
-the router — written into the app's **Coolify `custom_labels`** (which Coolify
-re-emits on every deploy) rather than an out-of-band file. `paas-api` should
-stamp this at create and on every deploy so scale-to-zero is automatic and
-survives auto-updates.
+**Durable design (implemented in `app/sablier.py`):** `paas-api` reads the app
+container's **current labels straight off the running container** (Coolify's
+complete generated set — nothing to reconstruct), adds `sablier.enable=true` +
+`sablier.group=<app-id>` and a Sablier plugin middleware keyed on the **stable
+app id** (not the volatile container name), prepends that middleware to every
+Traefik router chain, and writes the whole set back as Coolify **read-only custom
+labels** (`is_container_label_readonly_enabled`) so Coolify stops regenerating
+them and the enrollment survives every redeploy.
 
-- **Default: every app sleeps** when idle.
-- **`api` is hard-excluded** — it runs the ingester, auto-update sweep and alert
-  loop and must never sleep.
-- A per-app override lets any other app be pinned always-warm.
+- **Default: every app sleeps** when idle (`apps.sleep_when_idle`, default true).
+- **`api` is hard-excluded** (`SABLIER_EXCLUDE`) — it runs the ingester,
+  auto-update sweep and alert loop and must never sleep.
+- **`apps_sablier`** toggles it per app (reads base labels → enroll/unenroll →
+  redeploy). Requires the app to have deployed once (so its labels exist).
+- **`SABLIER_AUTO_ENROLL`** (default off) makes new/updated apps enroll
+  automatically after deploy, once verified. Config: `SABLIER_URL` (how Traefik
+  reaches Sablier), `SABLIER_SESSION_DURATION`, `SABLIER_STRATEGY`.
+
+> Verify enrollment on one app (`apps_sablier <app> true`) — confirm it sleeps
+> when idle and wakes on request — **before** flipping `SABLIER_AUTO_ENROLL` on,
+> since a wrong `SABLIER_URL` would break routing for every enrolled app.
 
 ---
 

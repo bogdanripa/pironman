@@ -78,6 +78,10 @@ If a Telegram bot is configured on the box, the platform also messages you when
 an app goes down, recovers, or starts throwing 5xx errors; alerts_test confirms
 that wiring.
 
+Apps scale to zero when idle (Sablier): they stop after a few idle minutes and
+start again on the next request. apps_sablier turns this on or off per app; the
+control plane itself never sleeps.
+
 Three rules govern almost every mistake:
 
 1. **Images must be built for linux/arm64.** The host is a Raspberry Pi. An

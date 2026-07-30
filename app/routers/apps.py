@@ -5,7 +5,7 @@ from typing import Literal
 from ..auth import require_key, mint_key
 from ..db import pool
 from ..config import app_url, app_fqdn
-from .. import coolify, provision, envs, autoupdate
+from .. import coolify, provision, envs, autoupdate, sablier
 from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
@@ -79,6 +79,15 @@ class AutoUpdate(BaseModel):
                     "push to that tag ships automatically, no deploy key needed. "
                     "Turn it off to pin the app to its current image (e.g. after "
                     "a manual rollback you want to keep).")
+
+
+class Sleep(BaseModel):
+    enabled: bool = Field(
+        description="Whether this app should scale to zero when idle. On (the "
+                    "default for every app except the control plane): Sablier "
+                    "stops the container after it is idle and starts it again on "
+                    "the next request. Off: the app stays running always. "
+                    "Toggling redeploys the app to apply the label change.")
 
 
 class AdoptApp(BaseModel):
@@ -473,6 +482,40 @@ async def set_autoupdate(app_id: str, body: AutoUpdate):
         await c.execute("UPDATE apps SET watch_tag = $1 WHERE id = $2",
                         watch, app_id)
     return {"id": app_id, "autoupdate": body.enabled, "watch_tag": watch}
+
+
+@router.put("/{app_id}/sleep", operation_id="apps_sablier",
+            summary="Turn idle scale-to-zero (Sablier) on or off for an app")
+async def set_sleep(app_id: str, body: Sleep):
+    """Enable or disable Sablier scale-to-zero for one app.
+
+    On (default for every app): the platform stamps the Sablier middleware into
+    the app's Coolify labels (read-only, so a redeploy can't strip it) and
+    redeploys once. The app then sleeps after it is idle and wakes on the next
+    request. Off: the enrollment is removed and the app runs continuously.
+
+    The control-plane app is excluded and cannot be made to sleep — it runs the
+    background loops and must stay up. Enabling requires the app to have a running
+    container already (deploy it once first) so its base labels can be read.
+    """
+    if sablier.excluded(app_id):
+        raise HTTPException(
+            400, f"{app_id} is the control plane and must never sleep")
+    async with pool().acquire() as c:
+        row = await c.fetchrow("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
+        if not row:
+            raise HTTPException(404, "no such app")
+        try:
+            if body.enabled:
+                await sablier.enroll(row["coolify_uuid"], app_id)
+            else:
+                await sablier.unenroll(row["coolify_uuid"], app_id)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        await c.execute(
+            "UPDATE apps SET sleep_when_idle = $1, sablier_enrolled = $1 "
+            "WHERE id = $2", body.enabled, app_id)
+    return {"id": app_id, "sleep_when_idle": body.enabled}
 
 
 async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:

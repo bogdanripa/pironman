@@ -35,6 +35,13 @@ ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS app_id text;
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS watch_tag text;
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS deployed_digest text;
 
+-- Sablier scale-to-zero (see app/sablier.py). sleep_when_idle: this app should
+-- sleep when idle (default on — all but the excluded control-plane app).
+-- sablier_enrolled: the Sablier labels are currently written to its Coolify
+-- config, so re-enrollment is a no-op and won't trigger a redeploy loop.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS sleep_when_idle boolean NOT NULL DEFAULT true;
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS sablier_enrolled boolean NOT NULL DEFAULT false;
+
 -- Analytics rollups from the Traefik access log (see app/analytics.py). visitor
 -- is a cookieless hash of salt+IP+UA (person, not per-app), so distinct visitor
 -- counts unique people across apps and filtering by app_id counts one app.

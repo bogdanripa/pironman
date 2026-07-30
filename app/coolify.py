@@ -4,6 +4,7 @@ Endpoints marked VERIFIED were exercised against the live 4.1.2 instance.
 The others are the documented shape but were not tested — if a deploy or env
 injection misbehaves, check these first against /docs in a browser.
 """
+import base64
 import httpx
 from .config import (
     COOLIFY_URL, COOLIFY_TOKEN, COOLIFY_PROJECT, COOLIFY_SERVER,
@@ -122,6 +123,19 @@ async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
         "health_check_timeout": 5,
         "health_check_retries": 5,
         "health_check_start_period": 10,
+    })
+
+
+async def set_custom_labels(uuid: str, labels: list[str], readonly: bool = True) -> None:
+    """Replace an app's container labels with `labels` verbatim (base64-encoded,
+    newline-joined, as Coolify stores them). readonly=True flips Coolify's
+    'readonly labels' flag so it stops regenerating them on deploy — which is what
+    makes an added middleware (e.g. Sablier) survive redeploys instead of being
+    wiped. UNVERIFIED shape; field names match Coolify 4.x."""
+    encoded = base64.b64encode("\n".join(labels).encode()).decode()
+    await _request("PATCH", f"/applications/{uuid}", json={
+        "custom_labels": encoded,
+        "is_container_label_readonly_enabled": readonly,
     })
 
 
