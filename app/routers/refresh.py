@@ -24,4 +24,10 @@ async def refresh(app_id: str):
             f"SELECT {autoupdate.APP_COLS} FROM apps WHERE id = $1", app_id)
         if not app:
             raise HTTPException(404, "no such app")
+        if not app["image"] or not app["coolify_uuid"]:
+            # Frontend-only: nothing to pull. Its CI uploads a bundle instead
+            # (PUT /apps/<id>/frontend), so this hook has nothing to do.
+            raise HTTPException(
+                400, "frontend-only app — there is no image to refresh; deploy it "
+                     "by uploading its bundle to PUT /apps/<id>/frontend")
         return await autoupdate.check_and_update(c, app)

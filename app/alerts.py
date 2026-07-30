@@ -28,7 +28,13 @@ async def check_once() -> dict:
         return {"skipped": "telegram not configured"}
 
     async with pool().acquire() as conn:
-        apps = await conn.fetch("SELECT id, coolify_uuid FROM apps ORDER BY id")
+        # coolify_uuid IS NOT NULL: frontend-only apps have no container of their
+        # own, so "not running" is their normal state — alerting on it would fire
+        # forever. Their traffic is served by the shared static host, which is
+        # itself an app and is monitored like any other.
+        apps = await conn.fetch(
+            "SELECT id, coolify_uuid FROM apps "
+            "WHERE coolify_uuid IS NOT NULL ORDER BY id")
         perf = await conn.fetch(
             "SELECT app_id, err_server FROM analytics_perf WHERE day = CURRENT_DATE")
         err_today = {r["app_id"]: r["err_server"] for r in perf}

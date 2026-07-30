@@ -239,7 +239,9 @@ function renderResources(data) {
     const errCls = (t.server_error_pct > 0) ? 'bad' : (t.error_pct > 5 ? 'warn' : '');
     return '<tr>' +
       `<td>${esc(a.id)}</td>` +
-      `<td><span class="dot ${a.running ? 'up' : 'down'}"></span>${a.running ? 'running' : 'stopped'}</td>` +
+      `<td>${a.running === null
+              ? '<span class="muted">static</span>'
+              : `<span class="dot ${a.running ? 'up' : 'down'}"></span>${a.running ? 'running' : 'stopped'}`}</td>` +
       `<td class="n">${a.cpu_pct != null ? a.cpu_pct + '%' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${a.mem_mb != null ? a.mem_mb.toLocaleString() + ' MB' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${fmtMb(a.disk_rw_mb)}</td>` +

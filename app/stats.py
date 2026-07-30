@@ -169,8 +169,8 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
     (slightly slower) database-size probe for a faster CPU/RAM-only view."""
     async with pool().acquire() as conn:
         apps = await conn.fetch(
-            "SELECT id, coolify_uuid, db_engine, db_user, db_password, db_name "
-            "FROM apps ORDER BY id")
+            "SELECT id, coolify_uuid, db_engine, db_user, db_password, db_name, "
+            "has_frontend FROM apps ORDER BY id")
         perf = await _perf_map(conn, perf_days)
         latency = await _latency_map(conn, perf_days)
     for aid, lat in latency.items():
@@ -196,9 +196,15 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
         cname = next((n for n in names if uuid and uuid in n), None)
         s = stats.get(cname, {})
         d = disk.get(cname, {})
+        has_backend = bool(app["coolify_uuid"])
         return {
             "id": app["id"],
-            "running": cname is not None,
+            # A frontend-only app has no container of its own, so "running" is not
+            # a meaningful state for it — its assets are served by the static host.
+            "kind": ("both" if has_backend and app["has_frontend"]
+                     else "frontend" if app["has_frontend"]
+                     else "backend"),
+            "running": (cname is not None) if has_backend else None,
             "cpu_pct": s.get("cpu_pct"),
             "mem_mb": s.get("mem_mb"),
             "mem_pct": s.get("mem_pct"),

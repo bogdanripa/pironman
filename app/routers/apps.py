@@ -5,7 +5,7 @@ from typing import Literal
 from ..auth import require_key, mint_key
 from ..db import pool
 from ..config import app_url, app_fqdn
-from .. import coolify, provision, envs, autoupdate, sablier
+from .. import coolify, provision, envs, autoupdate, sablier, frontends
 from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
@@ -17,12 +17,17 @@ class CreateApp(BaseModel):
                     "^[a-z][a-z0-9-]{1,30}$. This becomes the hostname: the app "
                     "will be served at https://<id>-coolify.bogdanripa.com. "
                     "Cannot be changed later.")
-    image: str = Field(
+    image: str | None = Field(
+        default=None,
         description="Pullable docker image reference including tag, e.g. "
-                    "'ghcr.io/bogdanripa/notes:latest' or 'nginx:alpine'. MUST be "
-                    "built for linux/arm64 — the host is a Raspberry Pi 5, and an "
-                    "amd64 image will pull successfully and then fail to start. "
-                    "The container MUST listen on port 80.")
+                    "'ghcr.io/bogdanripa/notes:latest'. MUST be built for "
+                    "linux/arm64 — the host is a Raspberry Pi 5, and an amd64 "
+                    "image will pull successfully and then fail to start. The "
+                    "container MUST listen on port 80. "
+                    "Omit it for a **frontend-only** app (a static site or SPA with "
+                    "no server of its own): no container is created, and the app "
+                    "serves the bundle its CI uploads. An app can gain a backend "
+                    "later with apps_set_image.")
     db_engine: Literal["postgres", "mongo"] | None = Field(
         default=None,
         description="Whether to provision a dedicated database for this app, and "
@@ -156,10 +161,18 @@ async def get_app(app_id: str):
 
 
 @router.post("", status_code=201, operation_id="apps_create",
-             summary="Create and deploy a new app from a docker image, optionally with a database")
+             summary="Create a new app — a backend image, a static frontend, or both")
 async def create_app(body: CreateApp):
     """Create a new app: registers it, enables a healthcheck, optionally
     provisions a database, injects DATABASE_URL, and deploys it.
+
+    An app can be a **backend** (pass `image`), a **frontend-only** static site or
+    SPA (omit `image` — no container is created and its CI uploads a bundle
+    instead), or **both** (create with an image, then have CI also upload a
+    frontend; they share the one hostname and requests resolve automatically —
+    real files are served, browser navigations get index.html so SPA routes work,
+    and everything else goes to the backend). A frontend-only app cannot have a
+    database, since there is no container to inject DATABASE_URL into.
 
     The public URL is assigned automatically — there is no DNS or certificate
     step, and the app is reachable over HTTPS within about 30 seconds. Requests
@@ -203,10 +216,42 @@ async def create_app(body: CreateApp):
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
+    if body.db_engine and not body.image:
+        raise HTTPException(
+            422, "a frontend-only app (no image) cannot have a database — its "
+                 "DATABASE_URL would have no container to be injected into")
 
     async with pool().acquire() as c:
         if await c.fetchval("SELECT 1 FROM apps WHERE id = $1", body.id):
             raise HTTPException(409, "app already exists")
+
+    # Frontend-only: nothing to run, so no Coolify application, no healthcheck and
+    # no deploy — just a registered id holding its hostname, ready for its CI to
+    # upload a bundle. Its traffic is served by the shared static host.
+    if not body.image:
+        async with pool().acquire() as c:
+            await c.execute(
+                "INSERT INTO apps (id, image, coolify_uuid, sleep_when_idle) "
+                "VALUES ($1, NULL, NULL, false)", body.id)
+            key = await mint_key(c, f"deploy:{body.id}", app_id=body.id)
+        return {
+            "id": body.id,
+            "url": app_url(body.id),
+            "kind": "frontend-only",
+            "paas_key": key,
+            "deploy": [
+                "This app has no container — it serves a static bundle from the "
+                "shared frontend host.",
+                "1. Call apps_deploy_workflow and use its `optional_frontend_job` "
+                "as the app's whole workflow (skip the backend `deploy` job).",
+                "2. Add the paas_key above as the repo's PAAS_KEY secret — the "
+                "frontend upload is authenticated (unlike backend deploys).",
+                "3. Push to main. CI builds the static assets, zips them and "
+                "uploads them; the site is live in about a second.",
+                "Add a backend later with apps_set_image — the two then share this "
+                "hostname automatically.",
+            ],
+        }
 
     uuid = await coolify.create_app(body.image, app_fqdn(body.id))
 
@@ -360,6 +405,12 @@ async def app_logs(app_id: str, tail: int = 200):
         row = await c.fetchrow("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
+    if not row["coolify_uuid"]:
+        return {"id": app_id, "container": None,
+                "status": "frontend-only — this app has no container, so there "
+                          "are no logs. Its static bundle is served by the shared "
+                          "frontend host.",
+                "logs": ""}
     return {"id": app_id, **await autoupdate.app_logs(row["coolify_uuid"], tail)}
 
 
@@ -374,6 +425,11 @@ async def set_app_image(app_id: str, body: SetImage):
     deploys, which are automatic (CI push -> /refresh), and from apps_update_code
     (the authenticated CI redeploy path): use this to change *which* image the
     app follows, not to roll out a new build of the same one.
+
+    Called on a **frontend-only** app (one created with no image), this gives it a
+    backend for the first time: the container is created and deployed, and from
+    then on it serves both — its frontend bundle plus this backend on the same
+    hostname.
     """
     async with pool().acquire() as c:
         row = await c.fetchrow(
@@ -381,12 +437,31 @@ async def set_app_image(app_id: str, body: SetImage):
             "watch_tag FROM apps WHERE id = $1", app_id)
         if not row:
             raise HTTPException(404, "no such app")
+
+        # Frontend-only app gaining a backend: there is no Coolify application
+        # yet, so create one (and its healthcheck) before pointing it anywhere.
+        gained_backend = not row["coolify_uuid"]
+        if gained_backend:
+            uuid = await coolify.create_app(body.image, app_fqdn(app_id))
+            try:
+                await coolify.set_healthcheck(uuid, "/")
+            except Exception:
+                pass  # a missing healthcheck must not strand a created app
+            await c.execute(
+                "UPDATE apps SET coolify_uuid = $1, sleep_when_idle = true "
+                "WHERE id = $2", uuid, app_id)
+            row = await c.fetchrow(
+                "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
+                "watch_tag FROM apps WHERE id = $1", app_id)
+
         await coolify.set_image(row["coolify_uuid"], body.image)
         await envs.sync_env(c, row["coolify_uuid"], app_id, row["db_engine"],
                             row["db_user"], row["db_password"], row["db_name"])
         await coolify.deploy(row["coolify_uuid"])
-        # Keep auto-update following the new tag (only if it was already on).
-        watch = autoupdate.tag_of(body.image) if row["watch_tag"] is not None else None
+        # Keep auto-update following the new tag (only if it was already on) — and
+        # turn it on for a backend that has just been added, matching apps_create.
+        watch = (autoupdate.tag_of(body.image)
+                 if (gained_backend or row["watch_tag"] is not None) else None)
         await c.execute(
             "UPDATE apps SET image = $1, watch_tag = $2, deployed_digest = NULL "
             "WHERE id = $3", body.image, watch, app_id)
@@ -412,6 +487,11 @@ async def attach_db(app_id: str, body: AttachDb):
         raise HTTPException(
             409, f"app already has a {row['db_engine']} database — "
                  "detach it first with apps_detach_db")
+    if not row["coolify_uuid"]:
+        raise HTTPException(
+            400, "this is a frontend-only app: it has no container for "
+                 "DATABASE_URL to be injected into. Give it a backend first with "
+                 "apps_set_image.")
 
     db_info = await provision.create(app_id, body.db_engine)
     async with pool().acquire() as c:
@@ -505,6 +585,11 @@ async def set_sleep(app_id: str, body: Sleep):
         row = await c.fetchrow("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
         if not row:
             raise HTTPException(404, "no such app")
+        if not row["coolify_uuid"]:
+            raise HTTPException(
+                400, "this is a frontend-only app: it has no container to sleep. "
+                     "Its assets are served by the shared frontend host, which "
+                     "stays warm.")
         try:
             if body.enabled:
                 await sablier.enroll(row["coolify_uuid"], app_id)
@@ -588,9 +673,11 @@ async def delete_app(app_id: str):
     if not row:
         raise HTTPException(404, "no such app")
 
-    await coolify.delete_app(row["coolify_uuid"])
+    if row["coolify_uuid"]:  # NULL for a frontend-only app — nothing to delete
+        await coolify.delete_app(row["coolify_uuid"])
     if row["db_engine"]:
         await provision.drop(app_id, row["db_engine"])
+    frontends.remove(app_id)  # its static bundle, if any
     async with pool().acquire() as c:
         await c.execute("DELETE FROM app_env WHERE app_id = $1", app_id)
         await c.execute("DELETE FROM api_keys WHERE app_id = $1", app_id)
