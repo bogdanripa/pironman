@@ -21,6 +21,7 @@ windows never double-count.
 """
 import hashlib
 import json
+from datetime import date
 
 from . import autoupdate
 from .config import ANALYTICS_PROXY, ANALYTICS_SALT, DOMAIN_SUFFIX
@@ -68,9 +69,13 @@ def _parse_line(line: str) -> dict | None:
     start = (e.get("StartUTC") or "").strip()
     if len(start) < 10:
         return None
+    try:
+        day = date.fromisoformat(start[:10])  # date column wants a date, not str
+    except ValueError:
+        return None
 
     return {"app_id": app_id, "visitor": _visitor(ip, ua),
-            "day": start[:10], "start": start}
+            "day": day, "start": start}
 
 
 async def _read_since(cursor: str | None) -> str:
@@ -78,8 +83,14 @@ async def _read_since(cursor: str | None) -> str:
     window we still need. `--since` takes a container-log timestamp; we pass the
     cursor (an RFC3339 StartUTC) so Docker hands back only recent lines, then the
     caller drops any at/before the cursor by StartUTC. First run bootstraps a day.
+
+    Docker gets a plain whole-second RFC3339 stamp (2026-07-30T14:31:17Z), not the
+    cursor's nanosecond precision, which some Docker versions reject on --since.
+    Dropping the sub-second part only widens the window slightly; the exact,
+    full-precision `start <= cursor` check in ingest_once drops the boundary line
+    already counted, so nothing is double-counted.
     """
-    since = cursor if cursor else "24h"
+    since = (cursor[:19] + "Z") if cursor else "24h"
     _, out = await autoupdate._docker(
         "logs", "--since", since, ANALYTICS_PROXY, timeout=120)
     return out
