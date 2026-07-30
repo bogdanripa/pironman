@@ -22,6 +22,11 @@ DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
 GHCR_USER  = os.environ.get("GHCR_USER", "")
 GHCR_TOKEN = os.environ.get("GHCR_TOKEN", "")
 
+# GitHub API token for the github_secret_* tools (repository Actions secrets).
+# Needs `repo` scope (classic PAT) or a fine-grained token with Secrets: write.
+# Falls back to GHCR_TOKEN, which only works if that PAT also carries repo scope.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or GHCR_TOKEN
+
 def _pg_host() -> str:
     """Resolve the Postgres container name live. Coolify recreates database
     resources on routine config edits and the name changes each time, so a

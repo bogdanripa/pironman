@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool
 from . import autoupdate
-from .routers import apps, crons, query, scaffold, env, refresh
+from .routers import apps, crons, query, scaffold, env, refresh, ghsecrets
 
 
 class PromoteKeyMiddleware:
@@ -52,7 +52,8 @@ What you can do here: list what is deployed, create a new app from a docker
 image, adopt an app that already exists in Coolify but was made by hand, change
 an app's image, read an app's container logs and status, delete an app, set
 shared and per-app environment variables, run SQL or mongosh scripts against an
-app's own database, and manage scheduled HTTP calls to an app.
+app's own database, manage scheduled HTTP calls to an app, and create, list or
+delete a GitHub repository's Actions secrets.
 
 Three rules govern almost every mistake:
 
@@ -154,6 +155,7 @@ app.include_router(crons.router)
 app.include_router(query.router)
 app.include_router(env.shared_router)  # env_* — shared, account-wide variables
 app.include_router(refresh.router)     # POST /apps/{id}/refresh — unauth CI hook
+app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secrets
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
