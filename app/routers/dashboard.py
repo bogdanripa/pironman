@@ -65,6 +65,8 @@ _PAGE = """<!doctype html>
   .legend i { display:inline-block; width:11px; height:11px; border-radius:3px;
               margin-right:5px; vertical-align:-1px; }
   .muted { color:var(--mut); }
+  .link { color:var(--accent); cursor:pointer; font-size:13px; }
+  .link:hover { text-decoration:underline; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
          margin-right:6px; vertical-align:1px; }
   .up { background:var(--accent2); } .down { background:#e5484d; }
@@ -275,23 +277,36 @@ async function loadAgents(days) {
   try { renderAgents(await api('/analytics/agents?' + appQ() + 'days=' + days + '&limit=20')); }
   catch (e) { $('agents').innerHTML = '<span class="muted">Unavailable: ' + esc(e.message) + '</span>'; }
 }
-function renderRecent(data) {
-  const rows = data.requests || [];
+let _recent = [], _recentShown = 10;
+const _RECENT_STEP = 20;
+function renderRecent() {
+  const rows = _recent;
+  if (!rows.length) { $('recent').innerHTML = '<span class="muted">No recent requests in the proxy buffer.</span>'; return; }
   const sc = s => (s >= 500) ? 'bad' : (s >= 400 ? 'warn' : '');
-  $('recent').innerHTML = rows.length ? (
+  const shown = rows.slice(0, _recentShown);
+  const table =
     '<div style="overflow-x:auto"><table><tr><th>Time (UTC)</th><th>App</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>' +
-    rows.map(r =>
+    shown.map(r =>
       `<tr><td class="muted">${esc((r.time || '').slice(0, 19).replace('T', ' '))}</td>` +
       `<td>${esc(r.app || '')}</td>` +
       `<td>${esc(r.method || '')}</td>` +
       `<td style="max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.path || '')}</td>` +
       `<td class="n ${sc(r.status)}">${r.status ?? ''}</td></tr>`).join('') +
-    '</table></div>'
-  ) : '<span class="muted">No recent requests in the proxy buffer.</span>';
+    '</table></div>';
+  const remaining = rows.length - shown.length;
+  const more = remaining > 0
+    ? `<div style="margin-top:12px"><a class="link" onclick="moreRecent(event)">Load more (${remaining} more)</a></div>`
+    : '';
+  $('recent').innerHTML = table + more;
 }
+window.moreRecent = e => { if (e) e.preventDefault(); _recentShown += _RECENT_STEP; renderRecent(); };
 async function loadRecent() {
-  try { renderRecent(await api('/analytics/recent?' + appQ() + 'limit=40')); }
-  catch (e) { $('recent').innerHTML = '<span class="muted">Unavailable: ' + esc(e.message) + '</span>'; }
+  _recentShown = 10;
+  try {
+    const d = await api('/analytics/recent?' + appQ() + 'limit=200');
+    _recent = d.requests || [];
+    renderRecent();
+  } catch (e) { $('recent').innerHTML = '<span class="muted">Unavailable: ' + esc(e.message) + '</span>'; }
 }
 async function loadResources(days) {
   try {
