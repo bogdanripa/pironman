@@ -2,6 +2,13 @@
 # 80 bound to :: (dual-stack) and running as root — the platform's own rules.
 FROM python:3.12-slim
 
+# curl is not optional: Coolify's healthcheck runs inside the container and tries
+# curl (then wget), and python:*-slim ships neither. Without it every deploy fails
+# its healthcheck and gets rolled back even though the server is fine.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir fastapi==0.115.6 "uvicorn[standard]==0.34.0" httpx==0.28.1
 
 WORKDIR /srv
@@ -12,6 +19,6 @@ VOLUME ["/srv/frontends"]
 EXPOSE 80
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 \
-    CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:80/_health')"
+    CMD curl -fsS http://localhost:80/_health || exit 1
 
 CMD ["uvicorn", "server:app", "--host", "::", "--port", "80"]
