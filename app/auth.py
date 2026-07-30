@@ -34,19 +34,21 @@ async def require_key(request: Request, authorization: str = Header(None)) -> st
     if not row:
         raise HTTPException(401, "invalid api key")
 
-    # A per-app deploy key (app_id set) is least-privilege: it may only redeploy
-    # its own app via PUT /apps/<id>/code, nothing else. Unscoped keys (app_id
-    # NULL) are admin keys and pass through. Enforced here, centrally, so no
-    # endpoint can forget the check.
+    # A per-app deploy key (app_id set) is least-privilege: it may only ship its
+    # own app — redeploy the backend (PUT /apps/<id>/code) or upload that app's
+    # frontend bundle (PUT /apps/<id>/frontend) — and nothing else, on no other
+    # app. Unscoped keys (app_id NULL) are admin keys and pass through. Enforced
+    # here, centrally, so no endpoint can forget the check.
+    _DEPLOY_ROUTES = ("/apps/{app_id}/code", "/apps/{app_id}/frontend")
     if row["app_id"] is not None:
         route = request.scope.get("route")
         route_path = getattr(route, "path", "")
         target = request.path_params.get("app_id")
         if not (request.method == "PUT"
-                and route_path == "/apps/{app_id}/code"
+                and route_path in _DEPLOY_ROUTES
                 and target == row["app_id"]):
             raise HTTPException(
-                403, "this key is scoped to a single app and can only redeploy "
-                     "it (PUT /apps/<id>/code)")
+                403, "this key is scoped to a single app and can only deploy it "
+                     "(PUT /apps/<id>/code or /apps/<id>/frontend)")
 
     return row["label"] or str(row["id"])

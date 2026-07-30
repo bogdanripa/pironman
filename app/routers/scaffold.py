@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from textwrap import dedent
+from textwrap import dedent, indent
 
 from ..auth import require_key
 from ..db import pool
@@ -7,6 +7,42 @@ from ..config import app_url, DOMAIN_SUFFIX
 
 router = APIRouter(prefix="/apps", tags=["apps"],
                    dependencies=[Depends(require_key)])
+
+
+def _frontend_job(app_id: str) -> str:
+    """The optional frontend half of the workflow: build static assets, zip them,
+    upload. Separate job so an app can have a frontend, a backend, or both — and
+    so a frontend deploy doesn't wait on an image build. Indented two spaces so it
+    drops straight in under the workflow's `jobs:` key."""
+    return indent(dedent(f"""\
+        frontend:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '22'
+
+            # Adjust to your project (working-directory, build command, and the
+            # output dir — 'dist' for Vite, 'build' for CRA/Next export).
+            - run: npm ci
+            - run: npm run build
+
+            # Zip the CONTENTS of the build output: index.html must be at the
+            # zip's root.
+            - name: Package the bundle
+              run: cd dist && zip -qr ../site.zip .
+
+            # Needs the app's scoped deploy key (PAAS_KEY). Unlike the backend's
+            # /refresh hook this uploads real content, so it is authenticated.
+            # Get one with apps_deploy_key and add it as a repository secret.
+            - name: Upload the frontend
+              run: |
+                curl -fsS -X PUT \\
+                  -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
+                  --data-binary @site.zip \\
+                  "https://api-coolify.bogdanripa.com/apps/{app_id}/frontend"
+        """), "  ")
 
 
 def _workflow(app_id: str, repo_name: str) -> str:
@@ -185,4 +221,29 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "required_secrets": [],  # none — the box auto-updates, no deploy secret
         "dockerfile_requirements": DOCKERFILE_RULES,
         "notes": notes,
+        "optional_frontend_job": _frontend_job(app_id),
+        "frontend_notes": [
+            "An app can have a backend (docker image), a static frontend (a zip of "
+            "built assets), or both. The workflow above is the backend half; append "
+            "`optional_frontend_job` under `jobs:` to also ship a frontend. Skip the "
+            "`deploy` job entirely for a frontend-only app.",
+            "Frontends are served by a shared static host behind the CDN — there is "
+            "no container, no image and no cold start for them, and a deploy is just "
+            "an upload (about a second).",
+            "With both, they share one hostname and requests resolve automatically: "
+            "a real file is served, a browser navigation gets index.html (so SPA "
+            "deep links work), and everything else goes to the backend. Call your "
+            "API from the frontend with a relative path — same origin, so no CORS "
+            "and no API base URL to configure.",
+            "Putting the backend under '/api' is a good convention and what we "
+            "suggest for a new app, but nothing enforces it — any path the frontend "
+            "doesn't have a file for reaches the backend.",
+            "The exception is a browser navigation the backend must answer — an "
+            "OAuth callback, a download link, a server-rendered page. Those look "
+            "like page loads, so declare them with apps_backend_routes (e.g. "
+            "['/auth']) and they'll go straight to the backend.",
+            "The frontend upload needs the app's scoped deploy key as the PAAS_KEY "
+            "repository secret (apps_deploy_key issues one). Only the backend "
+            "deploy is secretless.",
+        ],
     }

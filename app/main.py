@@ -7,7 +7,7 @@ from .db import init_pool, ensure_schema, close_pool
 from . import autoupdate, analytics, alerts
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
                       analytics as analytics_router, dashboard, stats,
-                      alerts as alerts_router)
+                      alerts as alerts_router, frontend)
 
 
 class PromoteKeyMiddleware:
@@ -216,6 +216,7 @@ app.include_router(analytics_router.router)  # analytics_* — cross-app visitor
 app.include_router(dashboard.router)   # GET /analytics/dashboard — HTML page (keyless)
 app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health snapshot
 app.include_router(alerts_router.router)  # alerts_test — Telegram alert wiring check
+app.include_router(frontend.router)    # apps_frontend_deploy / apps_backend_routes
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
@@ -264,7 +265,9 @@ _mcp = FastApiMCP(
     app,
     name="pironman",
     description=SERVER_DESCRIPTION,
-    exclude_operations=["apps_update_code", "apps_refresh"],
+    # apps_frontend_deploy takes a raw zip body — a CI call, not something a model
+    # can meaningfully construct, so it stays REST-only like apps_update_code.
+    exclude_operations=["apps_update_code", "apps_refresh", "apps_frontend_deploy"],
 )
 
 # fastapi-mcp does `Server(name, description)`, and the low-level MCP Server takes

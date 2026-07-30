@@ -274,6 +274,62 @@ them and the enrollment survives every redeploy.
 
 ---
 
+## 9b. Frontends (static bundles + shared host)
+
+An app can be a **backend** (docker image), a **static frontend** (a zip of built
+assets), or **both** — they share one hostname.
+
+Frontends are not containers. A CI job builds the assets, zips them and `PUT`s
+them to `/apps/<id>/frontend`; `paas-api` unpacks the zip into a shared volume
+(atomic staging + directory swap, so no half-written site) and the **shared static
+host** (`web/`, an always-warm app, Sablier-excluded) serves them. A frontend
+deploy is ~1 second and restarts nothing.
+
+**Request resolution is static-first, with no path convention required:**
+
+1. a path the app explicitly declared as backend-owned → backend
+2. a real file in the bundle → serve it (hashed assets `immutable`, `index.html`
+   `no-cache`)
+3. **GET + `Accept: text/html`** (browser navigation) → `index.html`
+4. anything else → backend (its own status codes preserved)
+
+Step 3 makes SPA deep links work with zero config, and deliberately does **not**
+consult the backend — so a page load never wakes a sleeping backend or pays a cold
+start. Step 4 is where `fetch`/XHR goes, so an API 404 stays a 404 instead of
+becoming `index.html`.
+
+Step 1 is the escape hatch (`apps_backend_routes`, stored in
+`apps.backend_routes`, normally empty) for the cases the heuristic can't know:
+**OAuth callbacks, download links, server-rendered pages** — browser navigations
+that the backend must answer. `/api` is *suggested* for new apps, never enforced.
+
+Because it is same-origin, the frontend calls its API with a relative path: no
+CORS, no API base URL, no cookie-domain juggling.
+
+**Waking a sleeping backend:** the static host proxies **back through Traefik**
+with `Host: <app-id>.internal` (an internal-only router carrying the Sablier
+middleware) rather than straight to the container — a direct container connection
+would bypass Sablier and fail against a sleeping app. Using the public host would
+loop, since that host's catch-all points at the static host.
+
+**CDN caching** is defended in layers, because a mis-cached API response is the
+one failure that really hurts:
+- **whitelist** at Cloudflare — cache only immutable asset paths, bypass
+  everything else (a blacklist fails open; a whitelist fails closed);
+- the static host sends **`Cache-Control: no-store, private`** on every proxied
+  response, so a bad rule still can't cache an API reply;
+- non-GET methods and `Set-Cookie` responses are never cached anyway;
+- never enable Cloudflare **"Cache Everything"** — it overrides origin headers and
+  is the classic cause of leaked API responses.
+
+Verify with `CF-Cache-Status`: `DYNAMIC`/`BYPASS` on API paths, `HIT` on assets.
+
+**Auth asymmetry, on purpose:** the backend's `/refresh` hook is unauthenticated
+because it takes no caller content (it only makes the box pull an image the
+registry controls). A frontend upload *is* caller-supplied content served on the
+app's domain, so it requires the app's **scoped deploy key** (`PAAS_KEY`) — which
+can only touch that one app.
+
 ## 10. Analytics & observability
 
 All cross-app analytics come from the **one place every app's traffic already
