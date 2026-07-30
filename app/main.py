@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from .db import init_pool, ensure_schema, close_pool
 from . import autoupdate, analytics
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
-                      analytics as analytics_router)
+                      analytics as analytics_router, dashboard)
 
 
 class PromoteKeyMiddleware:
@@ -184,6 +184,7 @@ app.include_router(env.shared_router)  # env_* — shared, account-wide variable
 app.include_router(refresh.router)     # POST /apps/{id}/refresh — unauth CI hook
 app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secrets
 app.include_router(analytics_router.router)  # analytics_* — cross-app visitor stats
+app.include_router(dashboard.router)   # GET /analytics/dashboard — HTML page (keyless)
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
