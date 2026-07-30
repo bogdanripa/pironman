@@ -109,6 +109,54 @@ def deploy_bundle(app_id: str, data: bytes) -> dict:
     return {"files": written}
 
 
+def deploy_files(app_id: str, files: dict[str, str]) -> dict:
+    """Publish a small site from inline text files ({path: content}).
+
+    The zip path is for CI shipping a real build; this is for a site small enough
+    to write out directly — a landing page, a redirect stub, a status page — with
+    no build step or repository involved. Same atomic staging and swap as
+    deploy_bundle, so a request mid-write never sees a partial site.
+    """
+    if not files:
+        raise FrontendError("no files given")
+    if len(files) > MAX_FILES:
+        raise FrontendError(f"too many files ({len(files)} > {MAX_FILES})")
+    total = sum(len(c.encode()) for c in files.values())
+    if total > MAX_BYTES:
+        raise FrontendError("files too large (over 200 MB)")
+
+    target = FRONTEND_ROOT / app_id
+    staging = FRONTEND_ROOT / f".{app_id}.new"
+    old = FRONTEND_ROOT / f".{app_id}.old"
+
+    cleaned: dict[str, str] = {}
+    for path, content in files.items():
+        rel = path.replace("\\", "/").lstrip("/")
+        if not rel or ".." in Path(rel).parts:
+            raise FrontendError(f"unsafe path: {path}")
+        cleaned[rel] = content
+    if "index.html" not in cleaned:
+        raise FrontendError("files must include an index.html at the root")
+
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    for rel, content in cleaned.items():
+        dest = staging / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+
+    manifest = target / ".pironman.json"
+    if manifest.is_file():
+        shutil.copy2(manifest, staging / ".pironman.json")
+
+    shutil.rmtree(old, ignore_errors=True)
+    if target.exists():
+        target.rename(old)
+    staging.rename(target)
+    shutil.rmtree(old, ignore_errors=True)
+    return {"files": len(cleaned)}
+
+
 def write_manifest(app_id: str, has_backend: bool, backend_routes: list[str]) -> None:
     """Config the static host reads: whether to proxy at all, and which paths the
     app claims outright."""

@@ -73,6 +73,42 @@ async def deploy_frontend(app_id: str, request: Request):
     return {"id": app_id, "deployed": True, "url": app_url(app_id), **res, **cfg}
 
 
+class FrontendFiles(BaseModel):
+    files: dict[str, str] = Field(
+        description="The site's files as {path: text content}, e.g. "
+                    "{'index.html': '<!doctype html>…', 'style.css': 'body{…}'}. "
+                    "Paths are relative to the site root and must include an "
+                    "index.html. Text only — for images or a compiled build, ship "
+                    "a zip through the app's CI instead.")
+
+
+@router.put("/{app_id}/frontend-files", operation_id="apps_frontend_write",
+            summary="Publish a small static site from inline files")
+async def write_frontend(app_id: str, body: FrontendFiles):
+    """Publish a static site by writing its files directly — no build, no
+    repository, no CI.
+
+    For a landing page, a status page or a redirect stub this is the whole
+    deploy: the files are written and served in about a second, and the app is
+    live at its URL. For a real application (a compiled SPA, anything with
+    images), have the app's CI upload a zip instead — see apps_deploy_workflow.
+
+    Replaces the whole site: files not included here are removed. Include
+    index.html; it is what a browser navigation resolves to, so SPA-style deep
+    links work automatically.
+    """
+    async with pool().acquire() as c:
+        if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
+            raise HTTPException(404, "no such app")
+        try:
+            res = frontends.deploy_files(app_id, body.files)
+        except frontends.FrontendError as e:
+            raise HTTPException(400, str(e))
+        await c.execute("UPDATE apps SET has_frontend = true WHERE id = $1", app_id)
+        cfg = await _sync_manifest(c, app_id)
+    return {"id": app_id, "deployed": True, "url": app_url(app_id), **res, **cfg}
+
+
 @router.put("/{app_id}/backend-routes", operation_id="apps_backend_routes",
             summary="Declare which paths the backend owns (escape hatch)")
 async def set_backend_routes(app_id: str, body: BackendRoutes):
