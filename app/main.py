@@ -50,7 +50,8 @@ to perform.
 
 What you can do here: list what is deployed, create a new app from a docker
 image, adopt an app that already exists in Coolify but was made by hand, change
-an app's image, read an app's container logs and status, delete an app, set
+an app's image, attach or drop an app's database, read an app's container logs
+and status, delete an app, set
 shared and per-app environment variables, run SQL or mongosh scripts against an
 app's own database, manage scheduled HTTP calls to an app, and create, list or
 delete a GitHub repository's Actions secrets.
@@ -72,7 +73,9 @@ Three rules govern almost every mistake:
 Databases are per-app and provisioned on request. The connection string is
 injected into the container as the DATABASE_URL environment variable on every
 deploy and recomposed each time, so an app should read it from the environment
-rather than hardcoding anything.
+rather than hardcoding anything. A database can be attached to an app after
+creation (apps_attach_db) or dropped from it (apps_detach_db — this destroys the
+data), not only at create time.
 
 Apps also take environment variables in two scopes. **Shared** variables are set
 once and injected into every app — the place for account-wide secrets such as an
@@ -227,8 +230,9 @@ try:
 
     _READONLY = {"apps_list", "apps_get", "apps_logs", "apps_deploy_workflow",
                  "apps_env_list", "crons_list", "env_list", "github_secrets_list"}
-    _DESTRUCTIVE = {"apps_delete", "apps_env_delete", "crons_delete",
-                    "db_run_script", "env_delete", "github_secret_delete"}
+    _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
+                    "crons_delete", "db_run_script", "env_delete",
+                    "github_secret_delete"}
     for _tool in getattr(_mcp, "tools", None) or []:
         if _tool.name in _READONLY:
             _tool.annotations = ToolAnnotations(readOnlyHint=True)

@@ -62,6 +62,15 @@ class SetImage(BaseModel):
                     "not for routine deploys, which happen automatically on push.")
 
 
+class AttachDb(BaseModel):
+    db_engine: Literal["postgres", "mongo"] = Field(
+        description="Which database to provision and attach — 'postgres' or "
+                    "'mongo'. Choose by the app's data model (postgres for "
+                    "relational/SQL/JSONB, mongo for flexible documents); ask the "
+                    "user when it isn't clear-cut. The connection string is "
+                    "injected as DATABASE_URL and the app is redeployed.")
+
+
 class AutoUpdate(BaseModel):
     enabled: bool = Field(
         description="Turn auto-update on or off for this app. When on, the "
@@ -373,6 +382,73 @@ async def set_app_image(app_id: str, body: SetImage):
             "UPDATE apps SET image = $1, watch_tag = $2, deployed_digest = NULL "
             "WHERE id = $3", body.image, watch, app_id)
     return {"id": app_id, "image": body.image, "watch_tag": watch}
+
+
+@router.post("/{app_id}/db", status_code=201, operation_id="apps_attach_db",
+             summary="Provision and attach a database to an app that has none")
+async def attach_db(app_id: str, body: AttachDb):
+    """Add a database to an existing app that doesn't have one: provisions a
+    dedicated database and user, injects DATABASE_URL, and redeploys. Returns the
+    connection string.
+
+    Fails with 409 if the app already has a database — detach it first with
+    apps_detach_db. The app should read DATABASE_URL from its environment.
+    """
+    async with pool().acquire() as c:
+        row = await c.fetchrow(
+            "SELECT coolify_uuid, db_engine FROM apps WHERE id = $1", app_id)
+    if not row:
+        raise HTTPException(404, "no such app")
+    if row["db_engine"]:
+        raise HTTPException(
+            409, f"app already has a {row['db_engine']} database — "
+                 "detach it first with apps_detach_db")
+
+    db_info = await provision.create(app_id, body.db_engine)
+    async with pool().acquire() as c:
+        await c.execute(
+            "UPDATE apps SET db_engine=$1, db_user=$2, db_password=$3, "
+            "db_name=$4 WHERE id=$5",
+            body.db_engine, db_info["user"], db_info["password"],
+            db_info["database"], app_id)
+        await envs.sync_env(c, row["coolify_uuid"], app_id, body.db_engine,
+                            db_info["user"], db_info["password"],
+                            db_info["database"])
+    await coolify.deploy(row["coolify_uuid"])
+    return {"id": app_id, "db_engine": body.db_engine,
+            "db_url": await provision.compose_url(
+                body.db_engine, db_info["user"], db_info["password"],
+                db_info["database"])}
+
+
+@router.delete("/{app_id}/db", operation_id="apps_detach_db",
+               summary="Drop and detach an app's database (destroys its data)")
+async def detach_db(app_id: str):
+    """Remove an app's database: **drops the database and all its data**, clears
+    DATABASE_URL, and redeploys.
+
+    This is irreversible with no undo — confirm with the user first and say
+    explicitly that the data will be destroyed. Fails with 400 if the app has no
+    database. The app keeps running, just without a database.
+    """
+    async with pool().acquire() as c:
+        row = await c.fetchrow(
+            "SELECT coolify_uuid, db_engine FROM apps WHERE id = $1", app_id)
+    if not row:
+        raise HTTPException(404, "no such app")
+    if not row["db_engine"]:
+        raise HTTPException(400, "app has no database")
+
+    await provision.drop(app_id, row["db_engine"])
+    await coolify.delete_env(row["coolify_uuid"], "DATABASE_URL")
+    async with pool().acquire() as c:
+        await c.execute(
+            "UPDATE apps SET db_engine=NULL, db_user=NULL, db_password=NULL, "
+            "db_name=NULL WHERE id=$1", app_id)
+        await envs.sync_env(c, row["coolify_uuid"], app_id,
+                            None, None, None, None)
+    await coolify.deploy(row["coolify_uuid"])
+    return {"id": app_id, "detached": True}
 
 
 @router.put("/{app_id}/autoupdate", operation_id="apps_autoupdate",
