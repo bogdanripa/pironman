@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS analytics_visits (
 );
 CREATE INDEX IF NOT EXISTS analytics_visits_app_day ON analytics_visits (app_id, day);
 CREATE INDEX IF NOT EXISTS analytics_visits_day ON analytics_visits (day);
+-- is_bot: a coarse humans-vs-bots split derived from the user-agent at ingest
+-- (the raw UA is never stored, only hashed into visitor), added in place.
+ALTER TABLE IF EXISTS analytics_visits
+    ADD COLUMN IF NOT EXISTS is_bot boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS analytics_first_seen (
     app_id    text NOT NULL,
     visitor   text NOT NULL,
@@ -54,6 +58,31 @@ CREATE TABLE IF NOT EXISTS analytics_first_seen (
     PRIMARY KEY (app_id, visitor)
 );
 CREATE TABLE IF NOT EXISTS analytics_state (k text PRIMARY KEY, v text);
+
+-- Alert bookkeeping (app/alerts.py): last-seen running state (with a small
+-- consecutive-failure debounce so a rolling redeploy is not flagged as an
+-- outage) and the last 5xx count observed, so only *new* server errors alert.
+CREATE TABLE IF NOT EXISTS alert_state (
+    app_id       text PRIMARY KEY,
+    fail_count   int         NOT NULL DEFAULT 0,
+    alerted_down boolean     NOT NULL DEFAULT false,
+    err_day      date,
+    err_server   bigint      NOT NULL DEFAULT 0,
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- Per-app/day request counts by raw user-agent string, so the actual agents
+-- (browsers, crawlers, scripts) can be listed, not just the humans/bots split.
+-- ua is truncated to 512 chars at ingest.
+CREATE TABLE IF NOT EXISTS analytics_agents (
+    app_id text    NOT NULL,
+    day    date    NOT NULL,
+    ua     text    NOT NULL,
+    is_bot boolean NOT NULL DEFAULT false,
+    hits   int     NOT NULL DEFAULT 0,
+    PRIMARY KEY (app_id, day, ua)
+);
+CREATE INDEX IF NOT EXISTS analytics_agents_app_day ON analytics_agents (app_id, day);
 
 -- Per-app/day request health, also folded from the Traefik access log: request
 -- volume, 4xx/5xx counts and summed response time (additive, so it rolls up
@@ -66,6 +95,18 @@ CREATE TABLE IF NOT EXISTS analytics_perf (
     err_server int    NOT NULL DEFAULT 0,
     dur_ms_sum bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (app_id, day)
+);
+
+-- Latency histogram: one row per (app, day, bucket), counting requests whose
+-- response time fell in that bucket (bucket edges in app/analytics.py). Counts
+-- are additive, so p50/p95 can be estimated over any window without storing raw
+-- per-request samples.
+CREATE TABLE IF NOT EXISTS analytics_latency (
+    app_id text     NOT NULL,
+    day    date     NOT NULL,
+    bucket smallint NOT NULL,
+    count  int      NOT NULL DEFAULT 0,
+    PRIMARY KEY (app_id, day, bucket)
 );
 """
 

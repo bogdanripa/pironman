@@ -4,9 +4,10 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool
-from . import autoupdate, analytics
+from . import autoupdate, analytics, alerts
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
-                      analytics as analytics_router, dashboard, stats)
+                      analytics as analytics_router, dashboard, stats,
+                      alerts as alerts_router)
 
 
 class PromoteKeyMiddleware:
@@ -65,8 +66,17 @@ Analytics are automatic: every app is measured at the shared edge proxy, so a
 new app starts producing numbers as soon as it serves traffic, with nothing to
 add to the app itself. A visitor is a cookieless salted hash of IP + user-agent,
 counted as one person across apps. Use analytics_overview for headline numbers
-(and a per-app breakdown when no app is given), analytics_timeseries for a daily
-line chart, and analytics_cohorts for retention.
+(unique visitors, DAU/WAU/MAU, a humans-vs-bots split, and a per-app breakdown
+when no app is given), analytics_timeseries for a daily line chart,
+analytics_cohorts for retention, analytics_agents for the top user-agents, and
+analytics_recent for a live tail of the most recent HTTP requests. apps_stats
+gives the live infra view (running state, CPU/RAM, disk, DB size, and request
+error rate / latency percentiles). A human-facing dashboard of all of this is
+served at /analytics/dashboard.
+
+If a Telegram bot is configured on the box, the platform also messages you when
+an app goes down, recovers, or starts throwing 5xx errors; alerts_test confirms
+that wiring.
 
 Three rules govern almost every mistake:
 
@@ -147,12 +157,25 @@ async def _analytics_loop():
         await asyncio.sleep(120)
 
 
+async def _alerts_loop():
+    """Check every app for down/recovered/5xx transitions and notify Telegram.
+    No-op when Telegram is not configured. Runs after ingestion cadence so the
+    5xx counts it reads are fresh; failures are swallowed."""
+    while True:
+        await asyncio.sleep(150)
+        try:
+            await alerts.check_once()
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_pool()
     await ensure_schema()  # create env tables if missing — no manual SQL on the Pi
     tasks = [asyncio.create_task(_autoupdate_loop()),
-             asyncio.create_task(_analytics_loop())]
+             asyncio.create_task(_analytics_loop()),
+             asyncio.create_task(_alerts_loop())]
     yield
     for t in tasks:
         t.cancel()
@@ -188,6 +211,7 @@ app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secret
 app.include_router(analytics_router.router)  # analytics_* — cross-app visitor stats
 app.include_router(dashboard.router)   # GET /analytics/dashboard — HTML page (keyless)
 app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health snapshot
+app.include_router(alerts_router.router)  # alerts_test — Telegram alert wiring check
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
@@ -260,7 +284,7 @@ try:
     _READONLY = {"apps_list", "apps_get", "apps_logs", "apps_deploy_workflow",
                  "apps_env_list", "crons_list", "env_list", "github_secrets_list",
                  "analytics_overview", "analytics_timeseries", "analytics_cohorts",
-                 "apps_stats"}
+                 "analytics_agents", "analytics_recent", "apps_stats"}
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
                     "crons_delete", "db_run_script", "env_delete",
                     "github_secret_delete"}

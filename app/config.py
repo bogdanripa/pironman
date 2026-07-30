@@ -22,6 +22,14 @@ DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
 ANALYTICS_PROXY = os.environ.get("ANALYTICS_PROXY", "coolify-proxy")
 ANALYTICS_SALT  = os.environ.get("ANALYTICS_SALT", "pironman-analytics-v1")
 
+# Telegram alerting (app/alerts.py). Both must be set for alerts to fire; unset,
+# the monitor loop is a no-op. TELEGRAM_BOT_TOKEN from @BotFather; TELEGRAM_CHAT_ID
+# is the chat/DM to notify. ALERT_5XX_THRESHOLD is how many new 5xx responses in a
+# monitor interval trip a server-error alert.
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+ALERT_5XX_THRESHOLD = int(os.environ.get("ALERT_5XX_THRESHOLD", "5"))
+
 # ghcr read credential for the auto-updater's digest checks (docker pull of
 # private packages). Optional — without it auto-update still works for public
 # images. This is ONE server-side credential for the whole platform, not a

@@ -104,6 +104,14 @@ _PAGE = """<!doctype html>
       </div>
       <div id="chart"></div>
     </div>
+    <div class="panel">
+      <h2>Last HTTP calls <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· live tail</span></h2>
+      <div id="recent"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="panel">
+      <h2>Traffic sources <span id="botsline" class="muted" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="agents"><span class="muted">Loading…</span></div>
+    </div>
     <div class="panel" id="perAppPanel" style="display:none">
       <h2>By app</h2>
       <div id="perApp"></div>
@@ -213,14 +221,17 @@ function renderResources(data) {
   const apps = data.apps || [], h = data.host || {};
   if (h.mem_total_mb) {
     const usedPct = Math.round(100 * (h.mem_used_by_containers_mb || 0) / h.mem_total_mb);
-    $('hostline').textContent =
-      `· host: ${h.ncpu ?? '?'} CPU · ` +
-      `${(h.mem_used_by_containers_mb || 0).toLocaleString()} / ${h.mem_total_mb.toLocaleString()} MB RAM used by containers (${usedPct}%)`;
+    let line = `· host: ${h.ncpu ?? '?'} CPU · ` +
+      `${(h.mem_used_by_containers_mb || 0).toLocaleString()} / ${h.mem_total_mb.toLocaleString()} MB RAM in containers (${usedPct}%)`;
+    if (h.disk_total_gb) line += ` · disk ${h.disk_used_gb} / ${h.disk_total_gb} GB (${h.disk_used_pct}%)`;
+    $('hostline').textContent = line;
   }
   const win = data.traffic_window_days;
+  const ms = v => v != null ? v + '' : '<span class="muted">—</span>';
   let head = '<table><tr><th>App</th><th>Status</th><th class="n">CPU</th>' +
-    '<th class="n">RAM</th><th class="n">DB size</th>' +
-    `<th class="n">Req ${win}d</th><th class="n">Err %</th><th class="n">Avg ms</th></tr>`;
+    '<th class="n">RAM</th><th class="n">Disk</th><th class="n">DB size</th>' +
+    `<th class="n">Req ${win}d</th><th class="n">Err %</th>` +
+    '<th class="n">p50 ms</th><th class="n">p95 ms</th></tr>';
   const rows = apps.map(a => {
     const t = a.traffic || {};
     const errCls = (t.server_error_pct > 0) ? 'bad' : (t.error_pct > 5 ? 'warn' : '');
@@ -229,16 +240,58 @@ function renderResources(data) {
       `<td><span class="dot ${a.running ? 'up' : 'down'}"></span>${a.running ? 'running' : 'stopped'}</td>` +
       `<td class="n">${a.cpu_pct != null ? a.cpu_pct + '%' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${a.mem_mb != null ? a.mem_mb.toLocaleString() + ' MB' : '<span class="muted">—</span>'}</td>` +
+      `<td class="n">${fmtMb(a.disk_rw_mb)}</td>` +
       `<td class="n">${a.db_engine ? fmtMb(a.db_size_mb) : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${(t.requests || 0).toLocaleString()}</td>` +
       `<td class="n ${errCls}">${(t.error_pct || 0)}%</td>` +
-      `<td class="n">${t.avg_ms != null ? t.avg_ms : '<span class="muted">—</span>'}</td>` +
+      `<td class="n">${ms(t.p50_ms)}</td>` +
+      `<td class="n">${ms(t.p95_ms)}</td>` +
       '</tr>';
   }).join('');
   $('resources').innerHTML =
     '<div style="overflow-x:auto">' + head +
     (apps.length ? rows : '<tr><td colspan="8" class="muted">No apps.</td></tr>') +
     '</table></div>';
+}
+function renderBots(byAgent) {
+  if (!byAgent) { $('botsline').textContent = ''; return; }
+  const h = byAgent.human || {}, b = byAgent.bot || {};
+  $('botsline').textContent =
+    `· ${(h.visitors || 0).toLocaleString()} human vs ${(b.visitors || 0).toLocaleString()} bot visitors` +
+    ` (${(h.hits || 0).toLocaleString()} / ${(b.hits || 0).toLocaleString()} hits)`;
+}
+function renderAgents(data) {
+  const rows = data.agents || [];
+  $('agents').innerHTML = rows.length ? (
+    '<div style="overflow-x:auto"><table><tr><th>User agent</th><th>Type</th><th class="n">Hits</th></tr>' +
+    rows.map(a =>
+      `<tr><td style="max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.ua)}</td>` +
+      `<td>${a.is_bot ? '🤖 bot' : '🙂 human'}</td>` +
+      `<td class="n">${(a.hits || 0).toLocaleString()}</td></tr>`).join('') +
+    '</table></div>'
+  ) : '<span class="muted">No user-agents recorded yet.</span>';
+}
+async function loadAgents(days) {
+  try { renderAgents(await api('/analytics/agents?' + appQ() + 'days=' + days + '&limit=20')); }
+  catch (e) { $('agents').innerHTML = '<span class="muted">Unavailable: ' + esc(e.message) + '</span>'; }
+}
+function renderRecent(data) {
+  const rows = data.requests || [];
+  const sc = s => (s >= 500) ? 'bad' : (s >= 400 ? 'warn' : '');
+  $('recent').innerHTML = rows.length ? (
+    '<div style="overflow-x:auto"><table><tr><th>Time (UTC)</th><th>App</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>' +
+    rows.map(r =>
+      `<tr><td class="muted">${esc((r.time || '').slice(0, 19).replace('T', ' '))}</td>` +
+      `<td>${esc(r.app || '')}</td>` +
+      `<td>${esc(r.method || '')}</td>` +
+      `<td style="max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.path || '')}</td>` +
+      `<td class="n ${sc(r.status)}">${r.status ?? ''}</td></tr>`).join('') +
+    '</table></div>'
+  ) : '<span class="muted">No recent requests in the proxy buffer.</span>';
+}
+async function loadRecent() {
+  try { renderRecent(await api('/analytics/recent?' + appQ() + 'limit=40')); }
+  catch (e) { $('recent').innerHTML = '<span class="muted">Unavailable: ' + esc(e.message) + '</span>'; }
 }
 async function loadResources(days) {
   try {
@@ -268,11 +321,14 @@ async function refresh() {
     ]);
     renderCards(o);
     renderChart(ts.series);
+    renderBots(o.by_agent);
     renderPerApp($('app').value ? null : (o.per_app || []));
     renderCohorts(co);
     $('msg').style.display = 'none';
     $('content').style.display = '';
-    loadResources(days);  // independent, slower probe — fills in after the rest
+    loadResources(days);  // independent, slower probes — fill in after the rest
+    loadAgents(days);
+    loadRecent();
   } catch (e) {
     $('content').style.display = 'none';
     $('msg').className = 'err';

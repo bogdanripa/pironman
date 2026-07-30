@@ -38,6 +38,32 @@ async def timeseries(
     return await analytics.timeseries(app_id, days)
 
 
+@router.get("/agents", operation_id="analytics_agents",
+            summary="Top user-agents (browsers/crawlers/scripts) with bot flag")
+async def agents(
+    app_id: str | None = Query(None, description="Scope to one app; omit for all apps"),
+    days: int = Query(30, ge=1, le=365, description="Window in days"),
+    limit: int = Query(20, ge=1, le=200, description="How many user-agents to return"),
+):
+    """The most-seen user-agent strings over the window, each with its total hits
+    and whether it's classified as a bot. This is the detail behind the
+    humans-vs-bots number in analytics_overview — use it to see exactly which
+    crawlers or clients are hitting an app."""
+    return await analytics.top_agents(app_id, days, limit)
+
+
+@router.get("/recent", operation_id="analytics_recent",
+            summary="The most recent individual HTTP requests (live tail)")
+async def recent(
+    app_id: str | None = Query(None, description="Scope to one app; omit for all apps"),
+    limit: int = Query(50, ge=1, le=200, description="How many recent requests"),
+):
+    """A live tail of the most recent requests across apps — time, app, method,
+    path and status, newest first. Read straight from the edge proxy log, so it's
+    a rolling buffer of what just happened, not durable history."""
+    return await analytics.recent_requests(app_id, limit)
+
+
 @router.get("/cohorts", operation_id="analytics_cohorts",
             summary="Weekly retention cohorts (returning visitors over time)")
 async def cohorts(

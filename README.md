@@ -190,10 +190,38 @@ unique counts and global cohorts are meaningful. Ingestion is idempotent via a
 double-count. Code is in `app/analytics.py`; tuning knobs are `ANALYTICS_PROXY`
 and `ANALYTICS_SALT` (keep the salt stable — changing it resets identity).
 
-Three read-only MCP tools, each `app_id`-optional (omit for the whole platform):
-`analytics_overview` (unique visitors, hits, DAU/WAU/MAU, and a per-app breakdown
-when global), `analytics_timeseries` (daily visitors/hits), `analytics_cohorts`
-(weekly retention).
+Read-only MCP tools, each `app_id`-optional (omit for the whole platform):
+`analytics_overview` (unique visitors, hits, DAU/WAU/MAU, humans-vs-bots split,
+per-app breakdown when global), `analytics_timeseries` (daily visitors/hits),
+`analytics_cohorts` (weekly retention), `analytics_agents` (top user-agents with
+bot flag), `analytics_recent` (live tail of recent HTTP requests). A human-facing
+dashboard of all of it is served at `/analytics/dashboard?key=<PAAS_KEY>`.
+
+The ingester also fills request-health rollups (`analytics_perf`, per-app 4xx/5xx
+and summed latency) and a latency histogram (`analytics_latency`) from the same
+log, which feed the resource view below.
+
+### Live resources (`apps_stats`)
+
+`apps_stats` returns, per app in one call: running state, live CPU/RAM (from a
+single `docker stats`), writable-layer disk, database size (Postgres
+`pg_database_size` / Mongo `storageSize` via `docker exec`), and 7-day request
+health (volume, error rate, p50/p95 latency). It also returns host totals — CPU
+count, RAM, and disk used/free — for headroom. Same numbers power the dashboard's
+Resources panel.
+
+> **RAM shows 0?** Docker can only report per-container memory if the kernel
+> memory cgroup controller is enabled. On Raspberry Pi OS it is off by default —
+> add `cgroup_enable=memory cgroup_memory=1` to the single line in
+> `/boot/firmware/cmdline.txt` and reboot. CPU works without it.
+
+### Telegram alerts (optional)
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and the box messages you when an
+app goes down, recovers, or throws new 5xx errors (`app/alerts.py`, a background
+loop). A short consecutive-failure debounce keeps rolling redeploys from looking
+like outages. `alerts_test` sends a test message to confirm delivery. Unset, the
+loop is a no-op.
 
 **One-time host setup** — Traefik must actually write the access log, and keep
 the two headers the visitor id needs (real client IP comes from Cloudflare in

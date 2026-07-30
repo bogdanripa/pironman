@@ -21,6 +21,7 @@ windows never double-count.
 """
 import hashlib
 import json
+import re
 from datetime import date
 
 from . import autoupdate
@@ -28,6 +29,35 @@ from .config import ANALYTICS_PROXY, ANALYTICS_SALT, DOMAIN_SUFFIX
 from .db import pool
 
 _CURSOR_KEY = "accesslog_cursor"
+
+# Upper edges (ms) of the latency histogram buckets; a request lands in the first
+# bucket whose edge it does not exceed, and anything slower goes in the overflow
+# bucket (index == len(LATENCY_BUCKETS_MS)). Additive counts per (app, day,
+# bucket) let p50/p95 be estimated over any window — see stats._latency_map.
+LATENCY_BUCKETS_MS = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+
+
+def _bucket(dur_ms: float) -> int:
+    for i, edge in enumerate(LATENCY_BUCKETS_MS):
+        if dur_ms <= edge:
+            return i
+    return len(LATENCY_BUCKETS_MS)  # overflow: slower than the last edge
+
+
+# Coarse "is this a non-human client?" test on the user-agent. Not exhaustive —
+# it catches the common crawlers, monitors and scripting clients (and treats an
+# empty UA as a bot, since browsers always send one) so the humans-vs-bots split
+# is directionally right, not a security control.
+_BOT_RE = re.compile(
+    r"bot|crawl|spider|slurp|curl|wget|python-|java/|go-http|okhttp|libwww|"
+    r"httpclient|headless|phantom|lighthouse|monitor|uptime|pingdom|statuscake|"
+    r"semrush|ahrefs|mj12|dotbot|facebookexternalhit|embedly|preview|scan|"
+    r"fetch|feed|rss|http_request|axios|node-fetch|postman",
+    re.IGNORECASE)
+
+
+def _is_bot(ua: str) -> bool:
+    return (not ua) or bool(_BOT_RE.search(ua))
 
 
 def _visitor(ip: str, ua: str) -> str:
@@ -77,7 +107,8 @@ def _parse_line(line: str) -> dict | None:
     status = e.get("DownstreamStatus")
     dur = e.get("Duration")  # Traefik reports request time in nanoseconds
     return {"app_id": app_id, "visitor": _visitor(ip, ua),
-            "day": day, "start": start,
+            "day": day, "start": start, "is_bot": _is_bot(ua),
+            "ua": (ua or "(none)")[:512],  # stored for the top-agents breakdown
             "status": int(status) if isinstance(status, (int, float)) else None,
             "dur_ms": (dur / 1e6) if isinstance(dur, (int, float)) else None}
 
@@ -112,8 +143,11 @@ async def ingest_once() -> dict:
 
         # Aggregate the batch in memory so each (app, visitor, day) is one upsert.
         visits: dict[tuple[str, str, str], int] = {}
+        bot: dict[tuple[str, str, str], bool] = {}  # (app, visitor, day) -> is_bot
         first: dict[tuple[str, str], str] = {}
         perf: dict[tuple[str, str], list] = {}  # (app, day) -> [req, 4xx, 5xx, ms]
+        lat: dict[tuple[str, str, int], int] = {}  # (app, day, bucket) -> count
+        agents: dict[tuple[str, str, str], list] = {}  # (app, day, ua) -> [hits, bot]
         newest = cursor or ""
         seen = 0
         for line in raw.splitlines():
@@ -127,6 +161,7 @@ async def ingest_once() -> dict:
                 newest = rec["start"]
             k = (rec["app_id"], rec["visitor"], rec["day"])
             visits[k] = visits.get(k, 0) + 1
+            bot[k] = rec["is_bot"]
             fk = (rec["app_id"], rec["visitor"])
             if fk not in first or rec["day"] < first[fk]:
                 first[fk] = rec["day"]
@@ -140,14 +175,20 @@ async def ingest_once() -> dict:
                 pr[2] += 1
             if rec["dur_ms"] is not None:
                 pr[3] += rec["dur_ms"]
+                lk = (rec["app_id"], rec["day"], _bucket(rec["dur_ms"]))
+                lat[lk] = lat.get(lk, 0) + 1
+
+            ak = (rec["app_id"], rec["day"], rec["ua"])
+            ar = agents.setdefault(ak, [0, rec["is_bot"]])
+            ar[0] += 1
 
         if visits:
             await conn.executemany(
-                "INSERT INTO analytics_visits (app_id, visitor, day, hits) "
-                "VALUES ($1, $2, $3, $4) "
+                "INSERT INTO analytics_visits (app_id, visitor, day, hits, is_bot) "
+                "VALUES ($1, $2, $3, $4, $5) "
                 "ON CONFLICT (app_id, visitor, day) "
                 "DO UPDATE SET hits = analytics_visits.hits + EXCLUDED.hits",
-                [(a, v, d, h) for (a, v, d), h in visits.items()])
+                [(a, v, d, h, bot[(a, v, d)]) for (a, v, d), h in visits.items()])
             await conn.executemany(
                 "INSERT INTO analytics_first_seen (app_id, visitor, first_day) "
                 "VALUES ($1, $2, $3) "
@@ -166,6 +207,16 @@ async def ingest_once() -> dict:
                 "dur_ms_sum = analytics_perf.dur_ms_sum + EXCLUDED.dur_ms_sum",
                 [(a, d, v[0], v[1], v[2], round(v[3]))
                  for (a, d), v in perf.items()])
+            await conn.executemany(
+                "INSERT INTO analytics_latency (app_id, day, bucket, count) "
+                "VALUES ($1, $2, $3, $4) ON CONFLICT (app_id, day, bucket) "
+                "DO UPDATE SET count = analytics_latency.count + EXCLUDED.count",
+                [(a, d, b, c) for (a, d, b), c in lat.items()])
+            await conn.executemany(
+                "INSERT INTO analytics_agents (app_id, day, ua, is_bot, hits) "
+                "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (app_id, day, ua) "
+                "DO UPDATE SET hits = analytics_agents.hits + EXCLUDED.hits",
+                [(a, d, ua, v[1], v[0]) for (a, d, ua), v in agents.items()])
 
         if newest and newest != cursor:
             await conn.execute(
@@ -178,8 +229,9 @@ async def ingest_once() -> dict:
 
 async def overview(app_id: str | None = None, days: int = 30) -> dict:
     """Headline numbers: unique visitors + hits over the window, plus DAU/WAU/MAU
-    (distinct visitors in the last 1 / 7 / 30 days). With no app_id, also returns
-    a per-app breakdown so you can see every app at a glance."""
+    (distinct visitors in the last 1 / 7 / 30 days) and a humans-vs-bots split.
+    With no app_id, also returns a per-app breakdown so you can see every app at a
+    glance."""
     # One app filters on app_id ($1) and windows on $2; global windows on $1.
     app_clause = " AND app_id = $1" if app_id else ""
     win = "$2" if app_id else "$1"
@@ -206,6 +258,16 @@ async def overview(app_id: str | None = None, days: int = 30) -> dict:
             "wau": await distinct(7),
             "mau": await distinct(30),
         }
+        agent_rows = await conn.fetch(
+            "SELECT is_bot, COUNT(DISTINCT visitor) AS visitors, SUM(hits) AS hits "
+            "FROM analytics_visits "
+            f"WHERE day > CURRENT_DATE - {win}::int" + app_clause +
+            " GROUP BY is_bot", *args)
+        by = {False: {"visitors": 0, "hits": 0}, True: {"visitors": 0, "hits": 0}}
+        for r in agent_rows:
+            by[r["is_bot"]] = {"visitors": r["visitors"], "hits": r["hits"] or 0}
+        result["by_agent"] = {"human": by[False], "bot": by[True]}
+
         if not app_id:
             rows = await conn.fetch(
                 "SELECT app_id, COUNT(DISTINCT visitor) AS visitors, "
@@ -240,6 +302,57 @@ async def timeseries(app_id: str | None = None, days: int = 30) -> dict:
                 {"day": r["day"].isoformat(), "unique_visitors": r["visitors"],
                  "hits": r["hits"]} for r in rows],
         }
+
+
+async def top_agents(app_id: str | None = None, days: int = 30,
+                     limit: int = 20) -> dict:
+    """The most-seen user-agent strings over the window, with hit counts and the
+    bot flag — so you can see exactly which browsers, crawlers and scripts are
+    hitting an app, not just the humans-vs-bots summary."""
+    async with pool().acquire() as conn:
+        if app_id:
+            rows = await conn.fetch(
+                "SELECT ua, bool_or(is_bot) AS is_bot, SUM(hits) AS hits "
+                "FROM analytics_agents "
+                "WHERE app_id = $1 AND day > CURRENT_DATE - $2::int "
+                "GROUP BY ua ORDER BY hits DESC LIMIT $3", app_id, days, limit)
+        else:
+            rows = await conn.fetch(
+                "SELECT ua, bool_or(is_bot) AS is_bot, SUM(hits) AS hits "
+                "FROM analytics_agents WHERE day > CURRENT_DATE - $1::int "
+                "GROUP BY ua ORDER BY hits DESC LIMIT $2", days, limit)
+    return {"scope": app_id or "all apps", "window_days": days,
+            "agents": [{"ua": r["ua"], "is_bot": r["is_bot"], "hits": r["hits"]}
+                       for r in rows]}
+
+
+async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
+    """The most recent individual HTTP requests, newest first, read live from the
+    edge proxy log (not the rollups): time, app, method, path and status. A tail,
+    not history — only what is still in the proxy's log buffer."""
+    limit = max(1, min(limit, 200))
+    _, out = await autoupdate._docker(
+        "logs", "--tail", str(limit * 8 + 200), ANALYTICS_PROXY, timeout=60)
+    items = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        host = (e.get("RequestHost") or "").strip().lower()
+        if not host.endswith(DOMAIN_SUFFIX):
+            continue
+        aid = host[: -len(DOMAIN_SUFFIX)]
+        if not aid or "." in aid or (app_id and aid != app_id):
+            continue
+        items.append({"time": e.get("StartUTC"), "app": aid,
+                      "method": e.get("RequestMethod"),
+                      "path": e.get("RequestPath"),
+                      "status": e.get("DownstreamStatus")})
+    return {"scope": app_id or "all apps", "requests": items[-limit:][::-1]}
 
 
 async def cohorts(app_id: str | None = None, weeks: int = 8) -> dict:
