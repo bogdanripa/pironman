@@ -31,6 +31,8 @@ def _translate(e: "github_api.GitHubError"):
         raise HTTPException(
             403, "the platform's GitHub token lacks access — it needs `repo` "
                  "scope (classic) or a fine-grained token with Secrets: write")
+    if "-> 422" in msg:  # usually an invalid secret name
+        raise HTTPException(422, f"GitHub rejected the request: {msg}")
     raise HTTPException(502, msg)
 
 
@@ -53,7 +55,14 @@ async def secret_set(owner: str, repo: str, name: str, body: SecretValue):
     """Create or overwrite an Actions secret. The value is encrypted with the
     repo's public key before upload. Same call for create and update — an
     existing secret of that name is replaced. The value passes through this call,
-    so avoid echoing it back to the user afterwards."""
+    so avoid echoing it back to the user afterwards.
+
+    GitHub secret names are case-insensitive and stored in UPPERCASE, so the name
+    is uppercased to match (github_secret_set('foo') -> FOO), keeping set, list
+    and delete consistent. Names must be alphanumeric/underscore and not start
+    with a digit or 'GITHUB_'.
+    """
+    name = name.upper()
     try:
         await github_api.set_secret(owner, repo, name, body.value)
     except github_api.GitHubError as e:
@@ -64,8 +73,9 @@ async def secret_set(owner: str, repo: str, name: str, body: SecretValue):
 @router.delete("/{owner}/{repo}/secrets/{name}", operation_id="github_secret_delete",
                summary="Delete a repository's GitHub Actions secret")
 async def secret_delete(owner: str, repo: str, name: str):
-    """Delete an Actions secret. Irreversible, but a secret is just re-set with
-    github_secret_set if needed."""
+    """Delete an Actions secret (name uppercased to match GitHub's storage).
+    Irreversible, but a secret is just re-set with github_secret_set if needed."""
+    name = name.upper()
     try:
         await github_api.delete_secret(owner, repo, name)
     except github_api.GitHubError as e:
