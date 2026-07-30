@@ -2,6 +2,11 @@ name: deploy
 on:
   push:
     branches: [main]
+    # web/ has its own workflow (deploy-web.yml) and docs don't change the image,
+    # so skip the slow emulated arm64 build when only those change.
+    paths-ignore:
+      - 'web/**'
+      - '**.md'
 
 # Recursive self-deploy: this builds the arm64 paas-api image, pushes it to
 # ghcr.io, then asks the *running* paas-api to redeploy itself through its own

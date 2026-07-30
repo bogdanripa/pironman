@@ -239,6 +239,32 @@ the proxy — a few seconds of edge downtime):
 Until that is enabled the tools simply report zeros — the rollup tables and loop
 are already live, so numbers start accruing the moment the proxy logs.
 
+## Frontends (the `web` static host)
+
+An app can ship a backend (docker image), a static frontend (a zip of built
+assets), or both on one hostname. Frontends are served by **one shared container**
+built from `web/` in this repo — see ARCHITECTURE.md §9b for the request
+resolution rules and the caching model.
+
+`web/` has its own workflow (`.github/workflows/deploy-web.yml`, path-filtered so
+it doesn't rebuild `paas-api`) publishing `ghcr.io/bogdanripa/pironman-web`.
+
+**One-time setup on the box** — the static host and `paas-api` must share the
+bundle directory, which is the only part Coolify has to be told about:
+
+1. Create the app: image `ghcr.io/bogdanripa/pironman-web:latest`, id `web`.
+2. Mount the **same host directory** at `/srv/frontends` in **both** `web` and
+   `api` (Coolify → app → Storages). `paas-api` unpacks uploads there; the static
+   host serves from there.
+3. Keep `web` **always warm** — add it to `SABLIER_EXCLUDE` alongside `api`. A
+   sleeping frontend host would put a cold start on every app's first paint.
+4. Point each frontend app's Traefik route at `web`, and give each linked backend
+   its internal router (`Host: <app-id>.internal`) so the static host can proxy to
+   it through Sablier.
+
+Until that exists, `apps_frontend_deploy` still accepts and stores bundles — they
+simply aren't served yet.
+
 ## Known-unverified
 
 `create_app`, `delete_app`, `set_image`, `deploy` and `get_app` in `coolify.py`
