@@ -15,6 +15,13 @@ COOLIFY_ENV_NAME    = os.environ.get("COOLIFY_ENV_NAME", "production")
 
 DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
 
+# Analytics: paas-api tails the shared Traefik access log to build cross-app
+# visitor stats (see app/analytics.py). ANALYTICS_PROXY is the docker container
+# name of the edge proxy whose logs are read; ANALYTICS_SALT keys the cookieless
+# visitor hash (change it and past visitors count as new — treat it as stable).
+ANALYTICS_PROXY = os.environ.get("ANALYTICS_PROXY", "coolify-proxy")
+ANALYTICS_SALT  = os.environ.get("ANALYTICS_SALT", "pironman-analytics-v1")
+
 # ghcr read credential for the auto-updater's digest checks (docker pull of
 # private packages). Optional — without it auto-update still works for public
 # images. This is ONE server-side credential for the whole platform, not a

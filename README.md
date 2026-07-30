@@ -177,6 +177,40 @@ Values are **write-only**: they are pushed to Coolify but never read back in
 plaintext through the API. Listings (`env_list`, `apps_env_list`, `get_app`)
 show a masked preview only, so a secret never lands in a tool result.
 
+## Analytics
+
+Cross-app traffic stats with **nothing to instrument per app**. paas-api tails
+the shared Traefik access log (the `coolify-proxy` container, over the mounted
+docker socket) on a 120s loop, turns each request into a cookieless visitor id —
+`sha256(salt | ip | user-agent)`, no cookie, no raw IP stored — and rolls it up
+into `analytics_visits` / `analytics_first_seen`. The app_id is deliberately
+*not* in the hash, so one person hitting two apps is one visitor: cross-app
+unique counts and global cohorts are meaningful. Ingestion is idempotent via a
+`StartUTC` cursor in `analytics_state`, so overlapping log windows never
+double-count. Code is in `app/analytics.py`; tuning knobs are `ANALYTICS_PROXY`
+and `ANALYTICS_SALT` (keep the salt stable — changing it resets identity).
+
+Three read-only MCP tools, each `app_id`-optional (omit for the whole platform):
+`analytics_overview` (unique visitors, hits, DAU/WAU/MAU, and a per-app breakdown
+when global), `analytics_timeseries` (daily visitors/hits), `analytics_cohorts`
+(weekly retention).
+
+**One-time host setup** — Traefik must actually write the access log, and keep
+the two headers the visitor id needs (real client IP comes from Cloudflare in
+`Cf-Connecting-Ip`; `User-Agent` sharpens the hash). Add these flags to the
+`coolify-proxy` command (Coolify → Server → Proxy → Configuration, then restart
+the proxy — a few seconds of edge downtime):
+
+```
+--accesslog=true
+--accesslog.format=json
+--accesslog.fields.headers.names.User-Agent=keep
+--accesslog.fields.headers.names.Cf-Connecting-Ip=keep
+```
+
+Until that is enabled the tools simply report zeros — the rollup tables and loop
+are already live, so numbers start accruing the moment the proxy logs.
+
 ## Known-unverified
 
 `create_app`, `delete_app`, `set_image`, `deploy` and `get_app` in `coolify.py`

@@ -4,8 +4,9 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool
-from . import autoupdate
-from .routers import apps, crons, query, scaffold, env, refresh, ghsecrets
+from . import autoupdate, analytics
+from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
+                      analytics as analytics_router)
 
 
 class PromoteKeyMiddleware:
@@ -53,8 +54,17 @@ image, adopt an app that already exists in Coolify but was made by hand, change
 an app's image, attach or drop an app's database, read an app's container logs
 and status, delete an app, set
 shared and per-app environment variables, run SQL or mongosh scripts against an
-app's own database, manage scheduled HTTP calls to an app, and create, list or
-delete a GitHub repository's Actions secrets.
+app's own database, manage scheduled HTTP calls to an app, create, list or
+delete a GitHub repository's Actions secrets, and read traffic analytics —
+unique visitors, DAU/WAU/MAU, daily trends and weekly retention cohorts — for
+one app or across the whole platform.
+
+Analytics are automatic: every app is measured at the shared edge proxy, so a
+new app starts producing numbers as soon as it serves traffic, with nothing to
+add to the app itself. A visitor is a cookieless salted hash of IP + user-agent,
+counted as one person across apps. Use analytics_overview for headline numbers
+(and a per-app breakdown when no app is given), analytics_timeseries for a daily
+line chart, and analytics_cohorts for retention.
 
 Three rules govern almost every mistake:
 
@@ -123,13 +133,27 @@ async def _autoupdate_loop():
             pass  # a bad sweep must never take the control plane down
 
 
+async def _analytics_loop():
+    """Fold new Traefik access-log lines into the analytics rollups on a short
+    timer. Idempotent (StartUTC cursor), so a missed or overlapping tick is
+    harmless; a failure is swallowed so it can never take the control plane down."""
+    while True:
+        try:
+            await analytics.ingest_once()
+        except Exception:
+            pass
+        await asyncio.sleep(120)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_pool()
     await ensure_schema()  # create env tables if missing — no manual SQL on the Pi
-    task = asyncio.create_task(_autoupdate_loop())
+    tasks = [asyncio.create_task(_autoupdate_loop()),
+             asyncio.create_task(_analytics_loop())]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
     await close_pool()
 
 
@@ -159,6 +183,7 @@ app.include_router(query.router)
 app.include_router(env.shared_router)  # env_* — shared, account-wide variables
 app.include_router(refresh.router)     # POST /apps/{id}/refresh — unauth CI hook
 app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secrets
+app.include_router(analytics_router.router)  # analytics_* — cross-app visitor stats
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
@@ -229,7 +254,8 @@ try:
     from mcp.types import ToolAnnotations  # noqa: E402
 
     _READONLY = {"apps_list", "apps_get", "apps_logs", "apps_deploy_workflow",
-                 "apps_env_list", "crons_list", "env_list", "github_secrets_list"}
+                 "apps_env_list", "crons_list", "env_list", "github_secrets_list",
+                 "analytics_overview", "analytics_timeseries", "analytics_cohorts"}
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
                     "crons_delete", "db_run_script", "env_delete",
                     "github_secret_delete"}

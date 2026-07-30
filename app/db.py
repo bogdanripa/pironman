@@ -34,6 +34,26 @@ ALTER TABLE IF EXISTS api_keys ADD COLUMN IF NOT EXISTS app_id text;
 -- redeploys when the tag actually moved. See app/autoupdate.py.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS watch_tag text;
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS deployed_digest text;
+
+-- Analytics rollups from the Traefik access log (see app/analytics.py). visitor
+-- is a cookieless hash of salt+IP+UA (person, not per-app), so distinct visitor
+-- counts unique people across apps and filtering by app_id counts one app.
+CREATE TABLE IF NOT EXISTS analytics_visits (
+    app_id  text NOT NULL,
+    visitor text NOT NULL,
+    day     date NOT NULL,
+    hits    int  NOT NULL DEFAULT 0,
+    PRIMARY KEY (app_id, visitor, day)
+);
+CREATE INDEX IF NOT EXISTS analytics_visits_app_day ON analytics_visits (app_id, day);
+CREATE INDEX IF NOT EXISTS analytics_visits_day ON analytics_visits (day);
+CREATE TABLE IF NOT EXISTS analytics_first_seen (
+    app_id    text NOT NULL,
+    visitor   text NOT NULL,
+    first_day date NOT NULL,
+    PRIMARY KEY (app_id, visitor)
+);
+CREATE TABLE IF NOT EXISTS analytics_state (k text PRIMARY KEY, v text);
 """
 
 
