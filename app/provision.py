@@ -55,6 +55,54 @@ async def compose_url(engine: str, user: str, password: str, database: str) -> s
     )
 
 
+async def db_size(engine: str, database: str, user: str, password: str,
+                  timeout: int = 15) -> int | None:
+    """On-disk size of one app's database, in bytes (None if it can't be read).
+
+    Same `docker exec` path as run_script, but asks the engine for its own size:
+    Postgres pg_database_size(), Mongo db.stats().storageSize. Read-only.
+    """
+    host = await current_host(engine)
+    if engine == "postgres":
+        cmd = [
+            "docker", "exec", "-i", "-e", f"PGPASSWORD={password}", host,
+            "psql", "-U", user, "-d", database, "-tAc",
+            "SELECT pg_database_size(current_database())",
+        ]
+    else:
+        cmd = [
+            "docker", "exec", "-i", host, "mongosh", "--quiet",
+            "-u", user, "-p", password, "--authenticationDatabase", database,
+            database, "--eval", "JSON.stringify(db.stats())",
+        ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(b""), timeout + 10)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+    if proc.returncode != 0:
+        return None
+
+    text = out.decode().strip()
+    if engine == "postgres":
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+        return None
+    # Mongo: the eval prints the JSON string; storageSize is the on-disk figure.
+    try:
+        stats = json.loads(text.splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    val = stats.get("storageSize") or stats.get("dataSize")
+    return int(val) if val is not None else None
+
+
 async def run_script(engine: str, database: str, user: str, password: str,
                      script: str, timeout: int = 30) -> str:
     """Raw SQL / Mongo script against one app's database. Deliberately

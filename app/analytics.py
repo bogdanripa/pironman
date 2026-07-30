@@ -74,8 +74,12 @@ def _parse_line(line: str) -> dict | None:
     except ValueError:
         return None
 
+    status = e.get("DownstreamStatus")
+    dur = e.get("Duration")  # Traefik reports request time in nanoseconds
     return {"app_id": app_id, "visitor": _visitor(ip, ua),
-            "day": day, "start": start}
+            "day": day, "start": start,
+            "status": int(status) if isinstance(status, (int, float)) else None,
+            "dur_ms": (dur / 1e6) if isinstance(dur, (int, float)) else None}
 
 
 async def _read_since(cursor: str | None) -> str:
@@ -109,6 +113,7 @@ async def ingest_once() -> dict:
         # Aggregate the batch in memory so each (app, visitor, day) is one upsert.
         visits: dict[tuple[str, str, str], int] = {}
         first: dict[tuple[str, str], str] = {}
+        perf: dict[tuple[str, str], list] = {}  # (app, day) -> [req, 4xx, 5xx, ms]
         newest = cursor or ""
         seen = 0
         for line in raw.splitlines():
@@ -126,6 +131,16 @@ async def ingest_once() -> dict:
             if fk not in first or rec["day"] < first[fk]:
                 first[fk] = rec["day"]
 
+            pr = perf.setdefault((rec["app_id"], rec["day"]), [0, 0, 0, 0.0])
+            pr[0] += 1
+            st = rec["status"]
+            if st is not None and 400 <= st < 500:
+                pr[1] += 1
+            elif st is not None and st >= 500:
+                pr[2] += 1
+            if rec["dur_ms"] is not None:
+                pr[3] += rec["dur_ms"]
+
         if visits:
             await conn.executemany(
                 "INSERT INTO analytics_visits (app_id, visitor, day, hits) "
@@ -140,6 +155,17 @@ async def ingest_once() -> dict:
                 "DO UPDATE SET first_day = LEAST(analytics_first_seen.first_day, "
                 "EXCLUDED.first_day)",
                 [(a, v, d) for (a, v), d in first.items()])
+            await conn.executemany(
+                "INSERT INTO analytics_perf "
+                "(app_id, day, requests, err_client, err_server, dur_ms_sum) "
+                "VALUES ($1, $2, $3, $4, $5, $6) "
+                "ON CONFLICT (app_id, day) DO UPDATE SET "
+                "requests   = analytics_perf.requests   + EXCLUDED.requests, "
+                "err_client = analytics_perf.err_client + EXCLUDED.err_client, "
+                "err_server = analytics_perf.err_server + EXCLUDED.err_server, "
+                "dur_ms_sum = analytics_perf.dur_ms_sum + EXCLUDED.dur_ms_sum",
+                [(a, d, v[0], v[1], v[2], round(v[3]))
+                 for (a, d), v in perf.items()])
 
         if newest and newest != cursor:
             await conn.execute(

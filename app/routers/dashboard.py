@@ -65,6 +65,12 @@ _PAGE = """<!doctype html>
   .legend i { display:inline-block; width:11px; height:11px; border-radius:3px;
               margin-right:5px; vertical-align:-1px; }
   .muted { color:var(--mut); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         margin-right:6px; vertical-align:1px; }
+  .up { background:var(--accent2); } .down { background:#e5484d; }
+  .warn { color:#e5a13a; } .bad { color:#e5484d; }
+  .bar { height:6px; border-radius:3px; background:var(--bar); overflow:hidden; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
   svg { width:100%; height:220px; display:block; }
   .err { background:#3a1d1d; border:1px solid #6b2b2b; color:#ffb4b4;
          padding:14px 16px; border-radius:10px; }
@@ -86,6 +92,10 @@ _PAGE = """<!doctype html>
   <div id="msg" class="muted">Loading…</div>
   <div id="content" style="display:none">
     <div class="cards" id="cards"></div>
+    <div class="panel">
+      <h2>Resources <span id="hostline" class="muted" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="resources"><span class="muted">Loading live stats…</span></div>
+    </div>
     <div class="panel">
       <h2>Daily traffic</h2>
       <div class="legend">
@@ -195,6 +205,50 @@ function renderCohorts(data) {
   el.innerHTML = `<div style="overflow-x:auto"><table class="cohort">${head}${rows}</table></div>`;
 }
 
+function fmtMb(v) {
+  if (v == null) return '<span class="muted">—</span>';
+  return v >= 1024 ? (v / 1024).toFixed(2) + ' GB' : v.toLocaleString() + ' MB';
+}
+function renderResources(data) {
+  const apps = data.apps || [], h = data.host || {};
+  if (h.mem_total_mb) {
+    const usedPct = Math.round(100 * (h.mem_used_by_containers_mb || 0) / h.mem_total_mb);
+    $('hostline').textContent =
+      `· host: ${h.ncpu ?? '?'} CPU · ` +
+      `${(h.mem_used_by_containers_mb || 0).toLocaleString()} / ${h.mem_total_mb.toLocaleString()} MB RAM used by containers (${usedPct}%)`;
+  }
+  const win = data.traffic_window_days;
+  let head = '<table><tr><th>App</th><th>Status</th><th class="n">CPU</th>' +
+    '<th class="n">RAM</th><th class="n">DB size</th>' +
+    `<th class="n">Req ${win}d</th><th class="n">Err %</th><th class="n">Avg ms</th></tr>`;
+  const rows = apps.map(a => {
+    const t = a.traffic || {};
+    const errCls = (t.server_error_pct > 0) ? 'bad' : (t.error_pct > 5 ? 'warn' : '');
+    return '<tr>' +
+      `<td>${esc(a.id)}</td>` +
+      `<td><span class="dot ${a.running ? 'up' : 'down'}"></span>${a.running ? 'running' : 'stopped'}</td>` +
+      `<td class="n">${a.cpu_pct != null ? a.cpu_pct + '%' : '<span class="muted">—</span>'}</td>` +
+      `<td class="n">${a.mem_mb != null ? a.mem_mb.toLocaleString() + ' MB' : '<span class="muted">—</span>'}</td>` +
+      `<td class="n">${a.db_engine ? fmtMb(a.db_size_mb) : '<span class="muted">—</span>'}</td>` +
+      `<td class="n">${(t.requests || 0).toLocaleString()}</td>` +
+      `<td class="n ${errCls}">${(t.error_pct || 0)}%</td>` +
+      `<td class="n">${t.avg_ms != null ? t.avg_ms : '<span class="muted">—</span>'}</td>` +
+      '</tr>';
+  }).join('');
+  $('resources').innerHTML =
+    '<div style="overflow-x:auto">' + head +
+    (apps.length ? rows : '<tr><td colspan="8" class="muted">No apps.</td></tr>') +
+    '</table></div>';
+}
+async function loadResources(days) {
+  try {
+    const d = await api('/stats/apps?traffic_days=' + days);
+    renderResources(d);
+  } catch (e) {
+    $('resources').innerHTML = '<span class="muted">Stats unavailable: ' + esc(e.message) + '</span>';
+  }
+}
+
 async function loadApps() {
   const o = await api('/analytics/overview?days=30');
   const sel = $('app');
@@ -218,6 +272,7 @@ async function refresh() {
     renderCohorts(co);
     $('msg').style.display = 'none';
     $('content').style.display = '';
+    loadResources(days);  // independent, slower probe — fills in after the rest
   } catch (e) {
     $('content').style.display = 'none';
     $('msg').className = 'err';

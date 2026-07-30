@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from .db import init_pool, ensure_schema, close_pool
 from . import autoupdate, analytics
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
-                      analytics as analytics_router, dashboard)
+                      analytics as analytics_router, dashboard, stats)
 
 
 class PromoteKeyMiddleware:
@@ -52,7 +52,9 @@ to perform.
 What you can do here: list what is deployed, create a new app from a docker
 image, adopt an app that already exists in Coolify but was made by hand, change
 an app's image, attach or drop an app's database, read an app's container logs
-and status, delete an app, set
+and status, see live resource use (whether each app is running, its CPU/RAM
+right now, its database size and recent request health) via apps_stats, delete an
+app, set
 shared and per-app environment variables, run SQL or mongosh scripts against an
 app's own database, manage scheduled HTTP calls to an app, create, list or
 delete a GitHub repository's Actions secrets, and read traffic analytics —
@@ -185,6 +187,7 @@ app.include_router(refresh.router)     # POST /apps/{id}/refresh — unauth CI h
 app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secrets
 app.include_router(analytics_router.router)  # analytics_* — cross-app visitor stats
 app.include_router(dashboard.router)   # GET /analytics/dashboard — HTML page (keyless)
+app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health snapshot
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
@@ -256,7 +259,8 @@ try:
 
     _READONLY = {"apps_list", "apps_get", "apps_logs", "apps_deploy_workflow",
                  "apps_env_list", "crons_list", "env_list", "github_secrets_list",
-                 "analytics_overview", "analytics_timeseries", "analytics_cohorts"}
+                 "analytics_overview", "analytics_timeseries", "analytics_cohorts",
+                 "apps_stats"}
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
                     "crons_delete", "db_run_script", "env_delete",
                     "github_secret_delete"}

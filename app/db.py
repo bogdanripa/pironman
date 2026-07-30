@@ -54,6 +54,19 @@ CREATE TABLE IF NOT EXISTS analytics_first_seen (
     PRIMARY KEY (app_id, visitor)
 );
 CREATE TABLE IF NOT EXISTS analytics_state (k text PRIMARY KEY, v text);
+
+-- Per-app/day request health, also folded from the Traefik access log: request
+-- volume, 4xx/5xx counts and summed response time (additive, so it rolls up
+-- incrementally). Averages/error rates are derived at query time.
+CREATE TABLE IF NOT EXISTS analytics_perf (
+    app_id     text   NOT NULL,
+    day        date   NOT NULL,
+    requests   int    NOT NULL DEFAULT 0,
+    err_client int    NOT NULL DEFAULT 0,
+    err_server int    NOT NULL DEFAULT 0,
+    dur_ms_sum bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (app_id, day)
+);
 """
 
 
