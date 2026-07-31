@@ -121,46 +121,6 @@ async def enroll(uuid: str, app_id: str) -> None:
     await coolify.deploy(uuid)
 
 
-async def host_uptime_seconds() -> float | None:
-    """The HOST's uptime. /proc/uptime is not namespaced, so a container reads the
-    machine's, which is how we tell a reboot from an ordinary restart of this
-    container (which happens on every self-deploy)."""
-    try:
-        with open("/proc/uptime") as f:
-            return float(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-async def stop_sleeping_apps(conn) -> dict:
-    """Stop every enrolled, sleep-enabled app that is currently running.
-
-    Called once after a host reboot. Docker's restart policy brings containers
-    back when the daemon starts — including ones Sablier had stopped — so a box
-    that reboots overnight wakes every app and holds that memory until each idles
-    out again. Apps that scale to zero should come back asleep and start on
-    demand, which is the whole point of enrolling them.
-
-    Only apps we know Sablier is managing (sablier_enrolled) are touched, so an
-    app that would have no way to be woken again is never stopped.
-    """
-    rows = await conn.fetch(
-        "SELECT id, coolify_uuid FROM apps "
-        "WHERE sleep_when_idle = true AND sablier_enrolled = true "
-        "AND coolify_uuid IS NOT NULL ORDER BY id")
-    stopped = []
-    for row in rows:
-        if excluded(row["id"]):
-            continue
-        name = await autoupdate._container_name(row["coolify_uuid"])
-        if not name:
-            continue  # already down
-        rc, _ = await autoupdate._docker("stop", name, timeout=60)
-        if rc == 0:
-            stopped.append(row["id"])
-    return {"stopped": stopped}
-
-
 async def unenroll(uuid: str, app_id: str) -> None:
     """Remove the app's Sablier enrollment and redeploy. Leaves the labels
     read-only (Coolify keeps managing the rest verbatim)."""

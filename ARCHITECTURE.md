@@ -274,22 +274,12 @@ them and the enrollment survives every redeploy.
 
 **On host reboot:** Docker's default `restart: always` starts containers again
 when the daemon comes up — including ones Sablier had stopped — so a reboot would
-otherwise leave every app awake and holding memory until each idled out again.
-Two things prevent that:
-
-1. **`--restart=unless-stopped`**, appended to an app's docker run options when it
-   is enrolled (`coolify.ensure_restart_policy`). Docker then leaves a
-   deliberately-stopped container alone across a daemon restart. The existing
-   options are read and appended to, never replaced, since an app may carry mounts
-   it cannot lose. This is the real fix.
-2. A **re-settle at startup** as a backstop, for apps enrolled before this existed
-   or where the policy could not be set: if the **host** has been up less than
-10 minutes (read from `/proc/uptime`, which is not namespaced, so a container
-sees the machine's uptime), it stops every enrolled sleep-enabled app. The uptime
-check is what distinguishes a real reboot from this control plane merely
-redeploying itself, which happens constantly — stopping sleeping apps then would
-cold-start whatever someone was browsing. Only apps with `sablier_enrolled` are
-touched, so nothing is stopped that has no way to be woken.
+otherwise wake every sleeping app. Enrolling an app therefore appends
+`--restart=unless-stopped` to its docker run options
+(`coolify.ensure_restart_policy`), which tells Docker to leave a deliberately
+stopped container alone. Existing options are read and appended to, never
+replaced, since an app may carry mounts it cannot lose. Apps that scale to zero
+come back from a reboot **asleep**, and start on their first request.
 
 - **Default: every app sleeps** when idle (`apps.sleep_when_idle`, default true).
 - **`api` is hard-excluded** (`SABLIER_EXCLUDE`) — it runs the ingester,
