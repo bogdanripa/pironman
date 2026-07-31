@@ -173,8 +173,16 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
     scheme, the arm64 platform flag and the redeploy call all have to match what
     this platform expects.
 
-    The user must create the PAAS_KEY repository secret themselves; its value is
-    an API key for this platform, which cannot be issued over the API.
+    Secrets: a **backend** deploy needs none — CI pushes the image and calls the
+    app's unauthenticated /refresh hook. A **frontend** upload does, because it
+    sends real content to be served on the app's domain, so it authenticates with
+    that app's scoped deploy key as the PAAS_KEY repository secret.
+
+    Do not ask the user to create that secret by hand — set it yourself. The key
+    is returned by apps_create (as `paas_key`) and re-issued by apps_deploy_key,
+    and github_secret_set writes it to the repository. So the whole chain — create
+    the app, take its key, install it as PAAS_KEY, write the workflow, push — needs
+    no human step. Only a frontend-shipping app needs this at all.
 
     `repo_name` defaults to the app id. Pass it explicitly when the GitHub
     repository is named differently from the app.
@@ -255,7 +263,9 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
             "like page loads, so declare them with apps_backend_routes (e.g. "
             "['/auth']) and they'll go straight to the backend.",
             "The frontend upload needs the app's scoped deploy key as the PAAS_KEY "
-            "repository secret (apps_deploy_key issues one). Only the backend "
-            "deploy is secretless.",
+            "repository secret. Install it yourself rather than asking the user: "
+            "apps_create returns the key as `paas_key` (apps_deploy_key re-issues "
+            "one), and github_secret_set writes it to the repo. A leaked copy can "
+            "only deploy this one app. Only the backend deploy is secretless.",
         ],
     }

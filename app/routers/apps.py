@@ -259,11 +259,13 @@ async def create_app(body: CreateApp):
     so — the pipeline is how apps are built and shipped here; a manual build is
     only ever a one-off bootstrap of the control plane itself.
 
-    The response also includes **paas_key**, a deploy key scoped to this app, for
-    the *authenticated* deploy path (PUT /apps/<id>/code) — e.g. a manual
-    rollback. The CI workflow does not need it: deploys are secretless, the box
-    auto-updates and CI just calls the app's /refresh hook. Shown once; re-issue
-    with apps_deploy_key.
+    The response also includes **paas_key**, a deploy key scoped to this app. A
+    backend-only CI workflow does not need it — those deploys are secretless, the
+    box auto-updates and CI just calls the app's /refresh hook. It IS needed if
+    the app ships a frontend, whose upload is authenticated: install it as the
+    repo's PAAS_KEY secret with github_secret_set rather than asking the user to
+    paste it. It also authorises the manual deploy path (PUT /apps/<id>/code), e.g.
+    a rollback. Shown once; re-issue with apps_deploy_key.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
