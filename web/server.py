@@ -182,15 +182,24 @@ async def _wake(aid: str) -> bool:
     running containers, so a stopped app has no router and its Sablier middleware
     is not reachable either. Calling Sablier directly closes that gap, and the
     blocking strategy means the caller just waits instead of being shown a page.
+
+    Asked for by **group**, not by name: enrollment tags the container
+    `sablier.group=<app-id>` (a stable id), while its actual name is the Coolify
+    uuid plus a deploy timestamp and changes every release. `names=` is tried as a
+    fallback only in case a container was enrolled by name by hand.
     """
-    params = {"names": aid, "session_duration": SABLIER_SESSION_DURATION,
-              "timeout": f"{int(WAKE_TIMEOUT)}s"}
+    base = {"session_duration": SABLIER_SESSION_DURATION,
+            "timeout": f"{int(WAKE_TIMEOUT)}s"}
     try:
         async with httpx.AsyncClient(timeout=WAKE_TIMEOUT + 10) as c:
-            r = await c.get(f"{SABLIER_URL}/api/strategies/blocking", params=params)
-            return r.status_code == 200
+            for key in ("group", "names"):
+                r = await c.get(f"{SABLIER_URL}/api/strategies/blocking",
+                                params={key: aid, **base})
+                if r.status_code == 200:
+                    return True
     except httpx.HTTPError:
         return False
+    return False
 
 
 def _is_down(r: httpx.Response) -> bool:

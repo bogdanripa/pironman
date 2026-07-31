@@ -51,7 +51,7 @@ from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
 
 STATE = {"up": False, "wakes": 0, "sablier_ok": True, "seen_host": None,
-         "seen_xfh": None}
+         "seen_xfh": None, "asked_by": None}
 
 proxy = FastAPI()
 
@@ -90,12 +90,19 @@ sablier = FastAPI()
 
 
 @sablier.get("/api/strategies/blocking")
-async def blocking(names: str = "", session_duration: str = "", timeout: str = ""):
+async def blocking(group: str = "", names: str = "", session_duration: str = "",
+                   timeout: str = ""):
+    """Real Sablier answers by group OR by name. Ours enrols by group — the
+    container's name carries a deploy timestamp — so a wake asked for by name
+    finds nothing, which is a 500 in practice."""
     STATE["wakes"] += 1
+    STATE["asked_by"] = "group" if group else "names" if names else None
+    if not group:
+        return JSONResponse({"error": "no such instance"}, status_code=500)
     if not STATE["sablier_ok"]:
         return JSONResponse({"error": "nope"}, status_code=500)
     STATE["up"] = True
-    return {"instances": [{"name": names, "status": "ready"}]}
+    return {"instances": [{"name": group, "status": "ready"}]}
 
 
 def serve(app, port):
@@ -142,6 +149,8 @@ async def main():
         check("asleep backend is woken and the request succeeds",
               r.status_code == 200 and r.json().get("backend"), r.text[:80])
         check("Sablier was called exactly once", STATE["wakes"] == 1, STATE["wakes"])
+        check("the wake asks by group, not container name",
+              STATE["asked_by"] == "group", STATE["asked_by"])
 
         print("\n[backend asleep, browser navigation]")
         STATE["up"] = False; STATE["wakes"] = 0
