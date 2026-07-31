@@ -35,7 +35,8 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
+                               Response, StreamingResponse)
 
 import redirects as redirect_rules
 
@@ -83,23 +84,48 @@ def _safe_file(aid: str, path: str) -> Path | None:
 
 
 async def _proxy(request: Request, aid: str) -> Response:
-    """Forward to the app's backend through Traefik so Sablier can wake it."""
+    """Forward to the app's backend through Traefik so Sablier can wake it.
+
+    Streams rather than buffering. Buffering looks fine for JSON and quietly
+    breaks anything long-lived: an SSE endpoint (the MCP transport is one) never
+    completes, so the caller waits until the timeout instead of receiving events,
+    and a large download is held in memory before a byte reaches the client.
+
+    The response is read as a stream and handed straight through, so the client
+    sees bytes as the backend produces them. `timeout=None` on the read applies
+    only to the body — connecting still fails fast if the backend is unreachable.
+    """
     url = httpx.URL(PROXY).join(request.url.path).copy_with(query=request.url.query.encode())
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     headers["Host"] = f"{aid}.internal"
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, read=None), follow_redirects=False)
+    req = client.build_request(request.method, url, headers=headers,
+                               content=await request.body())
     try:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as c:
-            r = await c.request(request.method, url, headers=headers,
-                                content=await request.body())
+        r = await client.send(req, stream=True)
     except httpx.HTTPError as e:
+        await client.aclose()
         return JSONResponse({"error": f"backend unreachable: {e}"}, status_code=502)
 
     out = dict(r.headers)
+    # Hop-by-hop headers describe the backend connection, not this one. Leaving
+    # content-length in place would contradict a streamed body.
     for h in ("content-encoding", "content-length", "transfer-encoding", "connection"):
         out.pop(h, None)
     # Never let a proxied (potentially per-user) response be cached at the edge.
     out["cache-control"] = NO_STORE
-    return Response(content=r.content, status_code=r.status_code, headers=out)
+
+    async def body():
+        try:
+            async for chunk in r.aiter_raw():
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+    return StreamingResponse(body(), status_code=r.status_code, headers=out)
 
 
 def _serve(f: Path, url_path: str) -> FileResponse:
@@ -177,7 +203,9 @@ async def resolve(request: Request, _path: str = ""):
     # 5. Only if the backend also says "no such thing", and the caller is a
     #    browser navigating, is this a client-side route after all — serve the
     #    entrypoint. Requests that wanted data (fetch/XHR, Accept: application/
-    #    json) keep the backend's real 404 instead of being handed HTML.
+    #    json) keep the backend's real 404 instead of being handed HTML. Status
+    #    is known as soon as the backend's headers arrive, so this costs nothing
+    #    for a streamed response.
     if resp.status_code == 404 and "text/html" in request.headers.get("accept", ""):
         index = _index_of(aid)
         if index:
