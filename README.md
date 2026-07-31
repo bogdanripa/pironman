@@ -252,10 +252,16 @@ it doesn't rebuild `paas-api`) publishing `ghcr.io/bogdanripa/pironman-web`.
 **One-time setup on the box** — the static host and `paas-api` must share the
 bundle directory, which is the only part Coolify has to be told about:
 
-1. Create the app: image `ghcr.io/bogdanripa/pironman-web:latest`, id `web`.
+1. Create the app: image `ghcr.io/bogdanripa/pironman-web:latest`, id `web`,
+   health path **`/_health`** (its `/` returns 404 for an unrecognised Host, so a
+   `/` healthcheck fails and the deploy is rolled back).
 2. Mount the **same host directory** at `/srv/frontends` in **both** `web` and
-   `api` (Coolify → app → Storages). `paas-api` unpacks uploads there; the static
-   host serves from there.
+   `api` (Coolify → app → Storages): `/data/pironman/frontends → /srv/frontends`.
+   `paas-api` unpacks uploads there; the static host serves from there. The two
+   SOURCE paths must match **exactly** — mounting `/data/pironman` on one and
+   `/data/pironman/frontends` on the other puts the bundle one level too deep and
+   every site answers `{"error":"no frontend for this host"}`. Verify with:
+   `docker inspect <container> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'`
 3. Keep `web` **always warm** — add it to `SABLIER_EXCLUDE` alongside `api`. A
    sleeping frontend host would put a cold start on every app's first paint.
 4. Point each frontend app's Traefik route at `web`, and give each linked backend
