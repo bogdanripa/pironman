@@ -87,22 +87,23 @@ Apps scale to zero when idle (Sablier): they stop after a few idle minutes and
 start again on the next request. apps_update turns this on or off per app; the
 control plane itself never sleeps.
 
-You never name a docker image here. An app's backend is identified by the GitHub
-repository that builds it (backend_repo); which image that produces, and when it
-ships, is the pipeline's business.
+**You never tell the platform what an app is made of.** Creating an app
+registers an id and hands it a hostname; nothing runs yet. What it becomes is
+decided by its pipeline: it is a frontend once CI uploads a bundle, a backend
+once CI deploys an image (which creates its container), or both. Information
+flows from GitHub to the platform, never the other way, so there is no image and
+no repository to name at creation.
 
 **Choose the app's shape first.** An app has up to three parts — a static
 frontend, a backend container, and a database — and picking the right combination
 matters more than any other decision here:
 
-- **Frontend only** (create it with NO backend_repo): a static site, an SPA, a
-  browser game, a landing page. There is no container at all, so nothing to keep
-  running, no cold start, and the assets are CDN-cacheable. Ship it by uploading
-  built files.
-- **Backend only** (create it with a backend_repo): an API, an MCP server, a
-  worker — anything with no browser UI of its own.
-- **Both** (create with a backend_repo, then upload a frontend — or create
-  frontend-only and add a backend later with apps_update): the usual web app. They share one
+- **Frontend only**: a static site, an SPA, a browser game, a landing page. No
+  container at all, so nothing to keep running, no cold start, and the assets are
+  CDN-cacheable. Its CI uploads built files.
+- **Backend only**: an API, an MCP server, a worker — anything with no browser UI
+  of its own. Its CI builds and deploys an image.
+- **Both**: the usual web app — its CI does both. They share one
   hostname, so the frontend calls its API with a relative path — no CORS, no API
   base URL to configure.
 

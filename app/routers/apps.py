@@ -4,7 +4,7 @@ from typing import Literal
 
 from ..auth import require_key, mint_key
 from ..db import pool
-from ..config import app_url, app_fqdn, backend_image
+from ..config import app_url, app_fqdn
 from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing, stats
 from ..provision import SLUG_RE
 
@@ -17,17 +17,6 @@ class CreateApp(BaseModel):
                     "^[a-z][a-z0-9-]{1,30}$. This becomes the hostname: the app "
                     "will be served at https://<id>-coolify.bogdanripa.com. "
                     "Cannot be changed later.")
-    backend_repo: str | None = Field(
-        default=None,
-        description="The GitHub repository whose CI builds this app's backend, "
-                    "e.g. 'notes' (usually the same as the app id — pass it "
-                    "explicitly). The platform derives the image from it; you "
-                    "never name an image, because which image an app runs is "
-                    "decided by its pipeline, not by this call. "
-                    "**Omit it for a frontend-only app** — a static site, an SPA, "
-                    "a browser game: no container is created at all and the app "
-                    "serves the bundle its CI uploads. A backend can be added "
-                    "later with apps_update.")
     db_engine: Literal["postgres", "mongo"] | None = Field(
         default=None,
         description="Whether to provision a dedicated database for this app, and "
@@ -87,13 +76,6 @@ class AutoUpdate(BaseModel):
 
 
 class UpdateApp(BaseModel):
-    backend_repo: str | None = Field(
-        default=None,
-        description="Give this app a backend, or point it at a different GitHub "
-                    "repository. Passing this to a frontend-only app creates its "
-                    "container for the first time, so it then serves both. This "
-                    "is not how code ships — CI pushes the image and the box "
-                    "redeploys; this only changes WHICH repo the app follows.")
     auto_update: bool | None = Field(
         default=None,
         description="Whether the box watches this app's tag and redeploys when the "
@@ -231,169 +213,91 @@ async def get_app(app_id: str):
 
 
 @router.post("", status_code=201, operation_id="apps_create",
-             summary="Create a new app — a backend image, a static frontend, or both")
+             summary="Register a new app — it owns a hostname; CI decides what it becomes")
 async def create_app(body: CreateApp):
-    """Create a new app: registers it, enables a healthcheck, optionally
-    provisions a database, injects DATABASE_URL, and deploys it.
+    """Register an app: it takes an id, owns a public HTTPS URL immediately, and
+    optionally gets a database. Nothing runs yet.
 
-    An app can be a **backend** (pass `image`), a **frontend-only** static site or
-    SPA (omit `image` — no container is created and its CI uploads a bundle
-    instead), or **both** (create with an image, then have CI also upload a
-    frontend; they share the one hostname and requests resolve automatically —
-    real files are served, browser navigations get index.html so SPA routes work,
-    and everything else goes to the backend). A frontend-only app cannot have a
-    database, since there is no container to inject DATABASE_URL into.
+    **You do not say what the app is made of.** No image, no repository — the
+    platform learns that from the app's pipeline, which is the only thing that
+    knows it. The app becomes:
 
-    The public URL is assigned automatically — there is no DNS or certificate
-    step, and the app is reachable over HTTPS within about 30 seconds. Requests
-    made before the image finishes pulling may return 502 briefly.
+    - a **frontend** the first time CI uploads a static bundle,
+    - a **backend** the first time CI deploys an image (which creates its
+      container), or
+    - **both**, if its pipeline does both. They share the one hostname.
 
-    Give it your **real** image reference, e.g. ghcr.io/you/<app>:latest, even if
-    CI has not pushed it yet — the app registers and holds its hostname, and its
-    first real deploy lands when CI pushes and calls /refresh. Do NOT bootstrap
-    with a placeholder like nginx:alpine: auto-update follows the tag you register
-    here, so it would sit watching the placeholder forever. (If you already did,
-    apps_update fixes it without recreating.)
+    So creating an app is a one-off registration; everything after it flows from
+    GitHub. Call apps_deploy_workflow next for the workflow to put in the repo.
 
-    Getting the image right avoids almost every failed first deploy — see
-    dockerfile_requirements from apps_deploy_workflow: **linux/arm64**, listen on
-    **port 80 bound to `::`** (an IPv4-only 0.0.0.0 bind fails the in-container
-    healthcheck), **run as root**, and ship curl for the healthcheck.
+    A **database** can be attached now even though nothing is running: the
+    connection string is composed and injected as DATABASE_URL on every deploy,
+    so it lands the first time code ships. There is no default engine — choose
+    from the app's data model, and ask the user when it is not clear-cut.
 
-    This **queues** a deploy and returns; it does NOT wait for the container to
-    become healthy. The rollback-on-failure covers provisioning only — the
-    Coolify app, database and env — not the container's runtime: an image that
-    starts and then fails its healthcheck stays registered, holding the hostname
-    while serving 502. So after creating, **verify with apps_logs** (or by hitting
-    the URL). The id-taken case still fails fast with 409.
-
-    This only creates the app. Subsequent code changes ship through CI, not by
-    building images by hand.
-
-    After creating an app, set up its deploy pipeline: call
-    **apps_deploy_workflow** to obtain the GitHub Actions file that builds the
-    arm64 image and redeploys on every push, and write it into the app's repo.
-    Offer this without being asked. Do NOT build the image locally and push it to
-    the registry yourself, and do not go hunting for registry credentials to do
-    so — the pipeline is how apps are built and shipped here; a manual build is
-    only ever a one-off bootstrap of the control plane itself.
-
-    The response also includes **paas_key**, a deploy key scoped to this app. CI
-    needs it for BOTH halves of a deploy — the backend's /refresh call and the
-    frontend upload both authenticate with it — so install it as the repo's
-    PAAS_KEY secret with github_secret_set rather than asking the user to paste
-    it. It also authorises the manual deploy path (PUT /apps/<id>/code), e.g. a
-    rollback. The key can only deploy this one app. Shown once; re-issue with
+    The response includes **paas_key**, a deploy key scoped to this app, used by
+    both halves of a deploy (the backend's /refresh call and the frontend
+    upload). Install it as the repo's PAAS_KEY secret with github_secret_set
+    rather than asking the user to paste it. Shown once; re-issue with
     apps_deploy_key.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
-    image = backend_image(body.backend_repo) if body.backend_repo else None
-    if body.db_engine and not image:
-        raise HTTPException(
-            422, "a frontend-only app (no image) cannot have a database — its "
-                 "DATABASE_URL would have no container to be injected into")
 
     async with pool().acquire() as c:
         if await c.fetchval("SELECT 1 FROM apps WHERE id = $1", body.id):
             raise HTTPException(409, "app already exists")
 
-    # Frontend-only: nothing to run, so no Coolify application, no healthcheck and
-    # no deploy — just a registered id holding its hostname, ready for its CI to
-    # upload a bundle. Its traffic is served by the shared static host.
-    if not image:
-        async with pool().acquire() as c:
-            await c.execute(
-                "INSERT INTO apps (id, image, coolify_uuid, sleep_when_idle) "
-                "VALUES ($1, NULL, NULL, false)", body.id)
-            key = await mint_key(c, f"deploy:{body.id}", app_id=body.id)
-        return {
-            "id": body.id,
-            "url": app_url(body.id),
-            "kind": "frontend-only",
-            "paas_key": key,
-            "deploy": [
-                "This app has no container — it serves a static bundle from the "
-                "shared frontend host.",
-                "1. Call apps_deploy_workflow and use its `optional_frontend_job` "
-                "as the app's whole workflow (skip the backend `deploy` job).",
-                "2. Add the paas_key above as the repo's PAAS_KEY secret — the "
-                "frontend upload is authenticated (unlike backend deploys).",
-                "3. Push to main. CI builds the static assets, zips them and "
-                "uploads them; the site is live in about a second.",
-                "Add a backend later with apps_set_image — the two then share this "
-                "hostname automatically.",
-            ],
-        }
-
-    uuid = await coolify.create_app(image, app_fqdn(body.id), app_id=body.id)
-
+    # A database can be provisioned now even though there is no container yet:
+    # DATABASE_URL is composed and injected on every deploy, so it lands the first
+    # time the app's pipeline ships code.
     db_info = None
+    if body.db_engine:
+        db_info = await provision.create(body.id, body.db_engine)
+
     try:
-        await coolify.set_healthcheck(uuid, body.health_path)
-
-        if body.db_engine:
-            db_info = await provision.create(body.id, body.db_engine)
-
-        # Inject the app's environment: any shared variables plus, when it has a
-        # database, a freshly composed DATABASE_URL. A brand-new app has no
-        # app-specific variables yet, so this is shared + DATABASE_URL.
-        async with pool().acquire() as c:
-            await envs.sync_env(
-                c, uuid, body.id, body.db_engine,
-                db_info["user"] if db_info else None,
-                db_info["password"] if db_info else None,
-                db_info["database"] if db_info else None)
-
-        await coolify.deploy(uuid)
-
         async with pool().acquire() as c:
             await c.execute(
                 "INSERT INTO apps (id, image, coolify_uuid, db_engine, "
-                "db_user, db_password, db_name, watch_tag) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-                body.id, image, uuid, body.db_engine,
+                "db_user, db_password, db_name, health_path, sleep_when_idle) "
+                "VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, false)",
+                body.id, body.db_engine,
                 db_info["user"] if db_info else None,
                 db_info["password"] if db_info else None,
                 db_info["database"] if db_info else None,
-                # Auto-update on by default, watching whatever tag it was created
-                # with (usually :latest) — a push to that tag auto-deploys.
-                autoupdate.tag_of(image),
-            )
+                body.health_path)
+            key = await mint_key(c, f"ci-{body.id}", app_id=body.id)
     except Exception:
-        await _rollback(uuid, body.id, body.db_engine if db_info else None)
+        if db_info:
+            try:
+                await provision.drop(body.id, body.db_engine)
+            except Exception:
+                pass
         raise
 
-    # Issue this app's deploy key now, so the CI workflow's PAAS_KEY secret is a
-    # copy-paste away. It is scoped to this app (can only redeploy it) and shown
-    # once — re-issue with apps_deploy_key if lost.
-    async with pool().acquire() as c:
-        paas_key = await mint_key(c, f"ci-{body.id}", app_id=body.id)
-
-    return {
+    out = {
         "id": body.id,
         "url": app_url(body.id),
-        "db_url": (await provision.compose_url(
-            body.db_engine, db_info["user"], db_info["password"],
-            db_info["database"])) if db_info else None,
-        "paas_key": paas_key,
-        # A runbook for the caller to drive the rest end to end, without a human
-        # and without building anything by hand.
+        "kind": "registered — no code deployed yet",
+        "paas_key": key,
         "deploy": [
-            "The app exists but has no code pipeline yet. Set up CI now — no "
-            "secret and no human step needed. Do not build an image locally or "
-            "look for registry credentials.",
-            "1. Call apps_deploy_workflow for this app id to get the GitHub "
-            "Actions workflow file and where it goes.",
-            "2. Write that workflow verbatim to .github/workflows/deploy.yml in "
-            "the app's repo and commit it (use your GitHub tools).",
-            "3. Install the paas_key above as the repo's PAAS_KEY secret with "
-            "github_secret_set — CI authenticates its deploy call with it.",
-            "4. Push to main. CI builds and pushes the arm64 image and calls this "
-            "app's /refresh hook; the box redeploys the new image. Deploying is "
-            "CI's job — there is no tool to deploy by hand.",
+            "The app now owns its hostname. What it becomes is decided by what "
+            "its pipeline ships: a frontend if CI uploads a bundle, a backend if "
+            "CI deploys an image, or both.",
+            "1. Install the paas_key above as the repo's PAAS_KEY secret with "
+            "github_secret_set — it authenticates both halves of a deploy and can "
+            "only deploy this app.",
+            "2. Call apps_deploy_workflow and write what it returns into the "
+            "app's repo: the backend job, the frontend job, or both.",
+            "3. Push to main. The first deploy creates whatever the app needs — "
+            "there is no tool here to deploy by hand.",
         ],
     }
+    if db_info:
+        out["db_url"] = await provision.compose_url(
+            body.db_engine, db_info["user"], db_info["password"],
+            db_info["database"])
+    return out
 
 
 @router.post("/{app_id}/adopt", status_code=201, operation_id="apps_adopt",
@@ -494,11 +398,6 @@ async def update_app(app_id: str, body: UpdateApp):
     """Change an app's configuration. Every field is optional; only what you pass
     is touched.
 
-    - **backend_repo** — give the app a backend, or point it at a different GitHub
-      repository. Passing it to a frontend-only app creates its container for the
-      first time, so the app then serves both: its bundle plus this backend, on
-      one hostname. This is not how code ships — CI pushes the image and the box
-      redeploys.
     - **auto_update** — whether the box redeploys when the watched tag moves.
     - **sleep_when_idle** — whether the app scales to zero when idle.
 
@@ -510,8 +409,6 @@ async def update_app(app_id: str, body: UpdateApp):
             raise HTTPException(404, "no such app")
 
     changed: dict = {"id": app_id}
-    if body.backend_repo is not None:
-        changed.update(await _apply_image(app_id, backend_image(body.backend_repo)))
     if body.auto_update is not None:
         changed.update(await set_autoupdate(app_id, AutoUpdate(enabled=body.auto_update)))
     if body.sleep_when_idle is not None:
@@ -530,7 +427,7 @@ async def _apply_image(app_id: str, image: str) -> dict:
     async with pool().acquire() as c:
         row = await c.fetchrow(
             "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
-            "watch_tag FROM apps WHERE id = $1", app_id)
+            "watch_tag, health_path FROM apps WHERE id = $1", app_id)
         if not row:
             raise HTTPException(404, "no such app")
 
@@ -540,7 +437,7 @@ async def _apply_image(app_id: str, image: str) -> dict:
         if gained_backend:
             uuid = await coolify.create_app(image, app_fqdn(app_id), app_id=app_id)
             try:
-                await coolify.set_healthcheck(uuid, "/")
+                await coolify.set_healthcheck(uuid, row["health_path"] or "/")
             except Exception:
                 pass  # a missing healthcheck must not strand a created app
             await c.execute(
@@ -548,7 +445,7 @@ async def _apply_image(app_id: str, image: str) -> dict:
                 "WHERE id = $2", uuid, app_id)
             row = await c.fetchrow(
                 "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
-                "watch_tag FROM apps WHERE id = $1", app_id)
+                "watch_tag, health_path FROM apps WHERE id = $1", app_id)
 
         await coolify.set_image(row["coolify_uuid"], image)
         await envs.sync_env(c, row["coolify_uuid"], app_id, row["db_engine"],
@@ -732,23 +629,12 @@ async def update_code(app_id: str, body: UpdateCode):
     redeploying does not reliably pull the new image.
     """
     async with pool().acquire() as c:
-        row = await c.fetchrow(
-            "SELECT coolify_uuid, db_engine, db_user, db_password, db_name "
-            "FROM apps WHERE id = $1", app_id)
-        if not row:
+        if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
             raise HTTPException(404, "no such app")
-
-        await coolify.set_image(row["coolify_uuid"], body.image)
-        await envs.sync_env(
-            c, row["coolify_uuid"], app_id, row["db_engine"],
-            row["db_user"], row["db_password"], row["db_name"])
-
-    await coolify.deploy(row["coolify_uuid"])
-
-    async with pool().acquire() as c:
-        await c.execute("UPDATE apps SET image = $1 WHERE id = $2",
-                        body.image, app_id)
-    return {"id": app_id, "image": body.image}
+    # Creates the container on the first call for an app that has none — an app
+    # is registered as a shell and becomes a backend app when its pipeline first
+    # deploys to it. Also re-injects the environment and repoints auto-update.
+    return await _apply_image(app_id, body.image)
 
 
 @router.delete("/{app_id}", operation_id="apps_delete",

@@ -228,17 +228,21 @@ done
 
 `apps_get` also reports the live policy in `backend.runtime.restart_policy`.
 
-## Naming an app's backend
+## What an app is made of
 
-Callers never name a docker image. `apps_create` and `apps_update` take
-**`backend_repo`** — the GitHub repository that builds the app — and the platform
-derives `ghcr.io/<GHCR_OWNER>/<repo>:latest` from it. Which image that produces,
-and when it ships, is the pipeline's business; the create call only records which
-repo the app follows. Omitting `backend_repo` is what makes an app frontend-only.
+`apps_create` takes no image and no repository. It registers an id, hands it a
+hostname and optionally provisions a database — nothing runs. The app becomes a
+**frontend** the first time CI uploads a bundle, a **backend** the first time CI
+deploys an image (`PUT /apps/<id>/code`, which creates the container on that
+first call), or **both**.
 
-Two places still speak in images, correctly: `apps_adopt` describes an app that
-already exists in Coolify, and `apps_update_code` is the REST-only path CI uses
-to deploy a specific tag.
+Information flows from GitHub to the platform, never the other way: the pipeline
+is the only thing that knows what it built, so it reports it. That is why
+`apps_update_code` takes an image and `apps_create` does not. `apps_adopt` also
+takes one, since it describes an app that already exists in Coolify.
+
+`health_path` is recorded at create time and applied when the container is
+eventually created.
 
 ## Deploy keys
 

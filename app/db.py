@@ -58,6 +58,12 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS backend_routes text[] NOT NU
 -- order decides which rule wins.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS redirects jsonb NOT NULL DEFAULT '[]'::jsonb;
 
+-- The path the container healthcheck requests. Recorded at create time and
+-- applied when the container is first created, which happens on the app's first
+-- CI deploy rather than at creation — the platform does not know an app's image
+-- until its pipeline tells it.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS health_path text NOT NULL DEFAULT '/';
+
 -- A frontend-only app has no image and no Coolify application, but the apps
 -- table predates this codebase and declared both NOT NULL, so creating one
 -- failed with a NotNullViolation. Relax them (idempotent — re-running on an
