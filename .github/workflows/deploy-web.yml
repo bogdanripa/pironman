@@ -50,17 +50,25 @@ jobs:
             ghcr.io/bogdanripa/pironman-web:latest
             ghcr.io/bogdanripa/pironman-web:${{ steps.tag.outputs.value }}
 
-      # No secret: the box watches :latest. Tolerant of the app not existing yet,
-      # so the first build can publish the image before `web` is created.
+      # WEB_PAAS_KEY is the `web` app's scoped deploy key — a different key from
+      # PAAS_KEY in this repo, which is scoped to `api`. Tolerant of the app not
+      # existing yet, so the first build can publish the image before it is
+      # created. If this call fails the hourly sweep still deploys the image, so a
+      # failure here delays the deploy rather than losing it.
       - name: Trigger deploy on the Pi
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${{ secrets.WEB_PAAS_KEY }}" \
             "https://api-coolify.bogdanripa.com/apps/web/refresh" || echo 000)
           if [ "$code" = "404" ]; then
             echo "app 'web' does not exist yet — image is pushed; create the app to start serving"
             exit 0
           fi
           case "$code" in
-            2*) echo "refresh ok ($code)" ;;
-            *)  echo "refresh failed ($code)"; exit 1 ;;
+            2*)  echo "refresh ok ($code)" ;;
+            401) echo "refresh unauthorized — set the WEB_PAAS_KEY secret to the"
+                 echo "'web' app's deploy key (apps_deploy_key). The image is"
+                 echo "pushed; the hourly sweep will deploy it meanwhile."
+                 exit 1 ;;
+            *)   echo "refresh failed ($code)"; exit 1 ;;
           esac
