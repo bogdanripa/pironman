@@ -267,18 +267,16 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
             "Frontends are served by a shared static host behind the CDN — there is "
             "no container, no image and no cold start for them, and a deploy is just "
             "an upload (about a second).",
-            "With both, they share one hostname and requests resolve automatically: "
-            "a real file is served, a browser navigation gets index.html (so SPA "
-            "deep links work), and everything else goes to the backend. Call your "
-            "API from the frontend with a relative path — same origin, so no CORS "
-            "and no API base URL to configure.",
-            "Putting the backend under '/api' is a good convention and what we "
-            "suggest for a new app, but nothing enforces it — any path the frontend "
-            "doesn't have a file for reaches the backend.",
-            "The exception is a browser navigation the backend must answer — an "
-            "OAuth callback, a download link, a server-rendered page. Those look "
-            "like page loads, so declare them with apps_backend_routes (e.g. "
-            "['/auth']) and they'll go straight to the backend.",
+            "With both, they share one hostname and requests resolve with one "
+            "rule, with nothing to configure: a file in the bundle is served, and "
+            "everything else — every write, and every path the bundle does not "
+            "contain — goes to the backend. Call your API from the frontend with a "
+            "relative path: same origin, so no CORS and no API base URL.",
+            "Putting the backend under '/api' is a tidy convention, but nothing "
+            "enforces it: OAuth callbacks, downloads and server-rendered pages "
+            "work wherever they live, because they are simply paths the bundle "
+            "does not have. A client-side route the backend also rejects falls "
+            "back to index.html, so SPA deep links work too.",
             "The frontend upload needs the app's scoped deploy key as the PAAS_KEY "
             "repository secret. Install it yourself rather than asking the user: "
             "apps_create returns the key as `paas_key` (apps_deploy_key re-issues "

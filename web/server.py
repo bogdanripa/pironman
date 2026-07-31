@@ -2,22 +2,27 @@
 
 One always-warm container fronts all frontends. It picks the bundle by the
 request's Host header (`<app-id><DOMAIN_SUFFIX>` -> /srv/frontends/<app-id>) and
-resolves each request **static-first**:
+resolves each request with one rule: **a bundle only answers reads, and only for
+files it actually has.**
 
-  1. a path the app explicitly declared as backend-owned  -> proxy to backend
-  2. a file that exists in the bundle                     -> serve it
-  3. a browser navigation (GET + Accept: text/html)       -> index.html
-  4. anything else                                        -> proxy to backend
+  1. not GET/HEAD                    -> backend (a bundle cannot answer writes)
+  2. a file in the bundle            -> serve it ("/" resolves to index.html)
+  3. not a file, and no backend      -> index.html (it is a client-side route)
+  4. not a file, backend exists      -> backend, and its answer stands
+  5. backend said 404 + navigation   -> index.html after all
 
-Step 3 is what makes SPA deep links work with no configuration, and it
-deliberately does NOT consult the backend — so a hard navigation never wakes a
-sleeping backend and never costs a cold start on first paint. Step 4 is where
-XHR/fetch calls go, keeping their real status codes (an API 404 stays a 404
-instead of being replaced by index.html).
+Nothing is declared anywhere. An OAuth callback, a download link and a
+server-rendered page are all just GETs that are not files, so they reach the
+backend like any other request. An earlier design intercepted those as
+"navigations", served index.html, and then needed a per-app list of exceptions to
+undo itself — the exceptions existed only because the heuristic created them.
 
-Step 1 exists because the heuristic has real blind spots: an OAuth callback, a
-download link, or a server-rendered page is a browser navigation that the backend
-must answer. Declaring those prefixes is the escape hatch — not the default.
+Step 5 is the one heuristic left, and it is bounded: it applies solely to a
+request the backend has already rejected, and only when the caller is a browser
+navigating. Anything that wanted data keeps the backend's real 404 rather than
+being handed HTML. The cost is one round trip to the backend before a client-side
+deep link falls back — paid only on paths the backend does not serve, and only by
+apps that have a backend at all.
 
 Backend proxying goes back through Traefik (Host: <app-id>.internal) rather than
 straight to the container, so the Sablier middleware runs and a sleeping backend
@@ -110,6 +115,14 @@ async def health():
     return {"ok": True}
 
 
+def _index_of(aid: str):
+    for name in INDEX_FILES:
+        f = _safe_file(aid, "/" + name)
+        if f:
+            return f
+    return None
+
+
 @app.api_route("/{_path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH",
                                          "DELETE", "OPTIONS"])
 async def resolve(request: Request, _path: str = ""):
@@ -117,38 +130,43 @@ async def resolve(request: Request, _path: str = ""):
     if not aid or not (ROOT / aid).is_dir():
         return JSONResponse({"error": "no frontend for this host"}, status_code=404)
 
-    mf = _manifest(aid)
-    has_backend = bool(mf.get("has_backend"))
+    has_backend = bool(_manifest(aid).get("has_backend"))
     path = request.url.path
 
-    # 1. explicitly declared backend paths win outright
-    for prefix in mf.get("backend_routes") or []:
-        if prefix and (path == prefix or path.startswith(prefix.rstrip("/") + "/")
-                       or prefix == "/"):
-            return await _proxy(request, aid) if has_backend else JSONResponse(
-                {"error": "no backend"}, status_code=404)
+    # 1. Anything that isn't a read belongs to the backend. A bundle only ever
+    #    answers GET/HEAD, so there is nothing to check first.
+    if request.method not in ("GET", "HEAD"):
+        return await _proxy(request, aid) if has_backend else JSONResponse(
+            {"error": "no backend"}, status_code=404)
 
-    # 2. a real file in the bundle. A directory path resolves to its index.html,
-    #    the way any web server serves "/" — without this, "/" matches no file and
-    #    falls through to the backend, so anything that is not a browser sending
-    #    Accept: text/html (curl, uptime monitors, link previewers, CI health
-    #    checks) gets the backend's 404 instead of the site's home page.
-    if request.method in ("GET", "HEAD"):
-        f = _safe_file(aid, path)
-        if f is None and path.endswith("/"):
-            f = next((x for x in (_safe_file(aid, path + n) for n in INDEX_FILES)
-                      if x), None)
-        if f:
-            return _serve(f, path)
+    # 2. A real file in the bundle wins. A directory resolves to its index, the
+    #    way any web server serves "/".
+    f = _safe_file(aid, path)
+    if f is None and path.endswith("/"):
+        f = next((x for x in (_safe_file(aid, path + n) for n in INDEX_FILES)
+                  if x), None)
+    if f:
+        return _serve(f, path)
 
-    # 3. browser navigation -> SPA entrypoint, without touching the backend
-    if request.method == "GET" and "text/html" in request.headers.get("accept", ""):
-        for name in INDEX_FILES:
-            index = _safe_file(aid, "/" + name)
-            if index:
-                return _serve(index, "/" + name)
+    # 3. Not a file. With no backend there is nobody else to ask, so this is a
+    #    client-side route: serve the SPA entrypoint.
+    if not has_backend:
+        index = _index_of(aid)
+        return _serve(index, "/") if index else JSONResponse(
+            {"error": "not found"}, status_code=404)
 
-    # 4. everything else belongs to the backend
-    if has_backend:
-        return await _proxy(request, aid)
-    return JSONResponse({"error": "not found"}, status_code=404)
+    # 4. There is a backend, so it gets the request — and its answer stands.
+    #    This is what makes OAuth callbacks, download links and server-rendered
+    #    pages work with nothing declared anywhere: they are simply GETs that are
+    #    not files, so they reach the backend like everything else.
+    resp = await _proxy(request, aid)
+
+    # 5. Only if the backend also says "no such thing", and the caller is a
+    #    browser navigating, is this a client-side route after all — serve the
+    #    entrypoint. Requests that wanted data (fetch/XHR, Accept: application/
+    #    json) keep the backend's real 404 instead of being handed HTML.
+    if resp.status_code == 404 and "text/html" in request.headers.get("accept", ""):
+        index = _index_of(aid)
+        if index:
+            return _serve(index, "/")
+    return resp

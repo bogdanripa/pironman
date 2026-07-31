@@ -43,10 +43,11 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS sleep_when_idle boolean NOT 
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS sablier_enrolled boolean NOT NULL DEFAULT false;
 
 -- Frontends (see app/frontends.py + web/). has_frontend: a static bundle has been
--- uploaded for this app and is served by the shared static host. backend_routes:
--- OPTIONAL path prefixes the backend owns outright — an escape hatch for the
--- cases static-first resolution guesses wrong (OAuth callbacks, downloads,
--- server-rendered pages). Empty is the normal case: resolution is automatic.
+-- uploaded for this app and is served by the shared static host. backend_routes
+-- is vestigial: it held per-app path exceptions for an earlier resolution scheme
+-- that needed them. The current rule (a bundle answers only reads, only for
+-- files it has) makes exceptions unnecessary, so nothing reads the column; it is
+-- left in place because dropping a column is destructive and buys nothing.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS has_frontend boolean NOT NULL DEFAULT false;
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS backend_routes text[] NOT NULL DEFAULT '{}';
 

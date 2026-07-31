@@ -19,35 +19,20 @@ router = APIRouter(prefix="/apps", tags=["frontend"],
                    dependencies=[Depends(require_key)])
 
 
-class BackendRoutes(BaseModel):
-    routes: list[str] = Field(
-        default_factory=list,
-        description="Path prefixes the BACKEND owns outright, e.g. "
-                    "['/auth', '/oauth/callback']. Usually empty: requests are "
-                    "resolved automatically (a real file is served, a browser "
-                    "navigation gets index.html, anything else goes to the "
-                    "backend). Declare a prefix only where that guess is wrong — "
-                    "typically OAuth callbacks, file downloads, or server-rendered "
-                    "pages, which look like navigations but must hit the backend. "
-                    "Use ['/'] to give the backend the whole host.")
-
-
 async def _sync_manifest(c, app_id: str) -> dict:
     row = await c.fetchrow(
-        "SELECT image, has_frontend, backend_routes FROM apps WHERE id = $1", app_id)
+        "SELECT image, has_frontend FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
     has_backend = bool(row["image"])
-    frontends.write_manifest(app_id, has_backend, list(row["backend_routes"] or []))
+    frontends.write_manifest(app_id, has_backend)
     # Make sure the static host actually has a route for this hostname. A no-op
     # once the route exists, so repeat deploys don't restart the shared host.
     try:
         routed = await routing.sync_frontend_routes(c)
     except Exception as e:  # routing must never fail an otherwise-good deploy
         routed = {"error": str(e)}
-    return {"has_backend": has_backend,
-            "backend_routes": list(row["backend_routes"] or []),
-            "routing": routed}
+    return {"has_backend": has_backend, "routing": routed}
 
 
 @router.put("/{app_id}/frontend", operation_id="apps_frontend_deploy",
@@ -114,26 +99,3 @@ async def write_frontend(app_id: str, body: FrontendFiles):
         await c.execute("UPDATE apps SET has_frontend = true WHERE id = $1", app_id)
         cfg = await _sync_manifest(c, app_id)
     return {"id": app_id, "deployed": True, "url": app_url(app_id), **res, **cfg}
-
-
-@router.put("/{app_id}/backend-routes", operation_id="apps_backend_routes",
-            include_in_schema=False, summary="Declare which paths the backend owns (escape hatch)")
-async def set_backend_routes(app_id: str, body: BackendRoutes):
-    """Override request resolution for an app that has both a frontend and a
-    backend.
-
-    By default nothing needs declaring: a request for a real file gets the file,
-    a browser navigation gets index.html (so SPA deep links work), and everything
-    else goes to the backend with its own status codes intact. Declare prefixes
-    here only for the cases that guess wrong — an OAuth callback, a download link,
-    or a server-rendered page, which arrive as navigations but belong to the
-    backend. `/api` is a good convention for new apps but is not required.
-    """
-    routes = [r if r.startswith("/") else "/" + r for r in body.routes]
-    async with pool().acquire() as c:
-        if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
-            raise HTTPException(404, "no such app")
-        await c.execute("UPDATE apps SET backend_routes = $1 WHERE id = $2",
-                        routes, app_id)
-        cfg = await _sync_manifest(c, app_id)
-    return {"id": app_id, **cfg}

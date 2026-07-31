@@ -103,13 +103,13 @@ into the backend container: the assets then come from the shared static host and
 the CDN instead of the container. So "a game with a leaderboard", "a to-do app",
 "a dashboard with an API" are all frontend + backend + database.
 
-With both, requests resolve automatically: a real file in the bundle is served, a
-browser navigation gets index.html (so client-side routes work), and everything
-else goes to the backend. Serving the API under /api is a good convention and
-what to suggest, but nothing enforces it. Only declare paths with
-apps_update's backend_routes when that automatic split guesses wrong — an OAuth callback,
-a download link or a server-rendered page, which look like page loads but must
-reach the backend.
+With both, requests resolve with one rule and nothing to configure: a file in the
+bundle is served (with "/" resolving to index.html), and everything else — every
+write, and every path the bundle does not contain — goes to the backend. So an
+API under /api works, but so does any other path: OAuth callbacks, downloads and
+server-rendered pages are simply paths the bundle does not have. A client-side
+route the backend also rejects falls back to index.html, so SPA deep links work
+too.
 
 Frontends deploy by upload, not by image: apps_frontend_write publishes a small
 site from inline files (no build, no repo — good for a landing page), while a
@@ -316,8 +316,7 @@ _mcp = FastApiMCP(
                         # plumbing reached through apps_update, which expresses
                         # intent ("give this app a backend") rather than mechanism
                         # ("set its image"). Deploys are CI's job, not a tool call.
-                        "apps_set_image", "apps_autoupdate", "apps_sablier",
-                        "apps_backend_routes"],
+                        "apps_set_image", "apps_autoupdate", "apps_sablier"],
 )
 
 # fastapi-mcp does `Server(name, description)`, and the low-level MCP Server takes

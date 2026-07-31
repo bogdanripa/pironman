@@ -6,9 +6,9 @@ container per frontend and no image build: a deploy is an upload plus an atomic
 directory swap, so it lands in about a second and never restarts anything.
 
 Alongside each bundle we write `.pironman.json` — the manifest the static host
-reads to decide whether the app has a backend and which paths (if any) the app
-declared as backend-owned. Keeping it in the volume means the static host needs
-no database credentials and no call back into paas-api.
+reads to decide whether the app has a backend to forward unmatched requests to.
+Keeping it in the volume means the static host needs no database credentials and
+no call back into paas-api.
 """
 import json
 import shutil
@@ -162,15 +162,12 @@ def deploy_files(app_id: str, files: dict[str, str]) -> dict:
     return {"files": len(cleaned)}
 
 
-def write_manifest(app_id: str, has_backend: bool, backend_routes: list[str]) -> None:
-    """Config the static host reads: whether to proxy at all, and which paths the
-    app claims outright."""
+def write_manifest(app_id: str, has_backend: bool) -> None:
+    """The one thing the static host needs to know that it cannot see on disk:
+    whether this app has a backend to forward unmatched requests to."""
     d = FRONTEND_ROOT / app_id
     d.mkdir(parents=True, exist_ok=True)
-    (d / ".pironman.json").write_text(json.dumps({
-        "has_backend": has_backend,
-        "backend_routes": backend_routes or [],
-    }))
+    (d / ".pironman.json").write_text(json.dumps({"has_backend": has_backend}))
 
 
 def info(app_id: str) -> dict | None:

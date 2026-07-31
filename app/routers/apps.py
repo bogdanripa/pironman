@@ -95,14 +95,6 @@ class UpdateApp(BaseModel):
                     "sets which image the app RUNS and which tag it follows; it is "
                     "not how new builds are shipped. Rolling out code is CI's job: "
                     "it pushes the tag and the box redeploys.")
-    backend_routes: list[str] | None = Field(
-        default=None,
-        description="Paths the backend owns outright, e.g. ['/auth']. Normally "
-                    "empty — requests resolve automatically. Declare a prefix only "
-                    "where that guess is wrong: an OAuth callback, a download link "
-                    "or a server-rendered page, which arrive as browser "
-                    "navigations but must reach the backend. ['/'] gives the "
-                    "backend the whole host. Pass [] to clear.")
     auto_update: bool | None = Field(
         default=None,
         description="Whether the box watches this app's tag and redeploys when the "
@@ -216,10 +208,6 @@ async def get_app(app_id: str):
             # Live: running / asleep / stopped, plus current CPU and memory.
             "runtime": await stats.app_runtime(row["coolify_uuid"],
                                                bool(row["sleep_when_idle"])),
-            # Paths the backend owns outright. Empty is normal: requests resolve
-            # automatically (real file -> served, browser navigation ->
-            # index.html, anything else -> backend).
-            "routes": list(row["backend_routes"] or []),
         } if has_backend else None,
 
         # What is actually published on disk, not merely what the flag says.
@@ -507,7 +495,6 @@ async def update_app(app_id: str, body: UpdateApp):
       time, so the app then serves both: its bundle plus this backend, on one
       hostname. This is not how code ships — CI pushes the tag and the box
       redeploys; use it to change *which* image the app follows.
-    - **backend_routes** — paths the backend owns outright. Normally empty.
     - **auto_update** — whether the box redeploys when the watched tag moves.
     - **sleep_when_idle** — whether the app scales to zero when idle.
 
@@ -525,10 +512,6 @@ async def update_app(app_id: str, body: UpdateApp):
         changed.update(await set_autoupdate(app_id, AutoUpdate(enabled=body.auto_update)))
     if body.sleep_when_idle is not None:
         changed.update(await set_sleep(app_id, Sleep(enabled=body.sleep_when_idle)))
-    if body.backend_routes is not None:
-        from .frontend import set_backend_routes, BackendRoutes
-        changed.update(await set_backend_routes(
-            app_id, BackendRoutes(routes=body.backend_routes)))
     if len(changed) == 1:
         raise HTTPException(400, "nothing to update — pass at least one field")
     return changed
