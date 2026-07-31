@@ -316,6 +316,22 @@ that the backend must answer. `/api` is *suggested* for new apps, never enforced
 Because it is same-origin, the frontend calls its API with a relative path: no
 CORS, no API base URL, no cookie-domain juggling.
 
+**Routing.** A frontend-only app has no container, so nothing would claim its
+hostname. `app/routing.py` derives one Traefik router per frontend app from the
+database and writes them onto the **static host's** Coolify custom labels, so the
+app's Host resolves to the shared static host. It re-syncs after every frontend
+deploy and after an app is deleted, and is a no-op when unchanged (a frontend
+deploy must stay a one-second file swap, not a restart of the shared host).
+
+> Coolify here rejects the readonly-labels flag (`422 … field is not allowed`),
+> so the routers are written **unprotected** — a Coolify label regeneration can
+> drop them. They come back on the next frontend deploy, since the label set is
+> derived from the database. Symptom to recognise: a frontend that suddenly 404s;
+> re-publish it to restore the route.
+
+*Verified end to end:* frontend-only app created with no image → files published
+→ route created automatically → served over HTTPS.
+
 **Waking a sleeping backend:** the static host proxies **back through Traefik**
 with `Host: <app-id>.internal` (an internal-only router carrying the Sablier
 middleware) rather than straight to the container — a direct container connection
