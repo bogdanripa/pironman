@@ -58,6 +58,8 @@ def match(rules: list[dict], path: str, query: str = "") -> tuple[str, int] | No
     breaking every request for the app.
     """
     for rule in rules:
+        if not isinstance(rule, dict):
+            continue  # never let one bad entry break every request for the app
         pattern, target = rule.get("from"), rule.get("to")
         if not pattern or not target:
             continue

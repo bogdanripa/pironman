@@ -5,6 +5,7 @@ else it does, so they work whether the app is a static site, a backend, or both.
 An app with redirects but no frontend is routed through the static host too,
 which is why setting a rule can move where its hostname points.
 """
+import json
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -102,15 +103,11 @@ async def list_redirects(app_id: str):
     """The app's redirect rules in the order they are evaluated — the first match
     wins. Read this before setting rules, since apps_redirects_set replaces the
     whole list."""
-    import json
     async with pool().acquire() as c:
         row = await c.fetchrow("SELECT redirects FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
-    rules = row["redirects"]
-    if isinstance(rules, str):
-        rules = json.loads(rules)
-    return {"id": app_id, "redirects": list(rules or [])}
+    return {"id": app_id, "redirects": list(row["redirects"] or [])}
 
 
 @router.put("/{app_id}/redirects", operation_id="apps_redirects_set",
@@ -132,7 +129,6 @@ async def set_redirects(app_id: str, body: Redirects):
     `:splat`; `:name` matches one segment and is available as `:name`. Targets
     may be paths or absolute URLs, and the incoming query string is preserved.
     """
-    import json
     rules = _validate(body.redirects)
     async with pool().acquire() as c:
         if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):

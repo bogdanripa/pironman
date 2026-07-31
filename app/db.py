@@ -1,3 +1,4 @@
+import json
 import asyncpg
 from .config import PAAS_DB
 
@@ -140,9 +141,24 @@ CREATE TABLE IF NOT EXISTS analytics_latency (
 """
 
 
+async def _init_conn(conn: asyncpg.Connection) -> None:
+    """Decode jsonb to Python objects instead of raw strings.
+
+    Without this asyncpg hands back the JSON text, so `list(row["redirects"])`
+    iterates the *characters* of '[]' and yields ['[', ']'] — which then reaches
+    the static host as a rule list of strings and breaks every request for that
+    app. Registering the codec once fixes it everywhere rather than parsing at
+    each call site.
+    """
+    await conn.set_type_codec(
+        "jsonb", schema="pg_catalog",
+        encoder=json.dumps, decoder=json.loads, format="text")
+
+
 async def init_pool() -> None:
     global _pool
-    _pool = await asyncpg.create_pool(**PAAS_DB, min_size=1, max_size=5)
+    _pool = await asyncpg.create_pool(**PAAS_DB, min_size=1, max_size=5,
+                                      init=_init_conn)
 
 async def ensure_schema() -> None:
     async with _pool.acquire() as c:
