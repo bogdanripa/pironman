@@ -183,7 +183,9 @@ purpose — a bad analytics pass cannot be allowed to take the control plane wit
 it — but a bare `pass` makes a broken ingester indistinguishable from a quiet
 one. That is exactly how "last accessed" read `never` for apps in daily use with
 nothing anywhere to say why. They log the traceback (`main._swallow`), which
-uvicorn captures, so `apps_logs api` shows it.
+uvicorn captures, so `apps_logs api` shows it — and the healthcheck's own
+successful access-log lines are filtered out, or the 10-second cadence would push
+that traceback out of `--tail` within about two minutes.
 
 ### Auth
 

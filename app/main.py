@@ -52,7 +52,24 @@ class RedactKeyFilter(logging.Filter):
         return True
 
 
-logging.getLogger("uvicorn.access").addFilter(RedactKeyFilter())
+class DropHealthchecksFilter(logging.Filter):
+    """Keep the container healthcheck out of the access log.
+
+    It runs every 10 seconds, so it writes ~8,600 lines a day and pushes
+    everything else out of `docker logs --tail`. A background traceback would
+    scroll out of reach within about two minutes, which defeats the point of
+    logging it at all. Only *successful* checks are dropped — a failing one is
+    worth seeing, and shows up as an unhealthy container besides.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        a = record.args
+        return not (isinstance(a, tuple) and len(a) >= 5
+                    and a[1] == "GET" and a[2] == "/health" and a[4] == 200)
+
+
+for _f in (RedactKeyFilter(), DropHealthchecksFilter()):
+    logging.getLogger("uvicorn.access").addFilter(_f)
 
 
 class PromoteKeyMiddleware:
