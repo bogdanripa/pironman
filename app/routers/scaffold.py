@@ -111,12 +111,24 @@ DOCKERFILE_RULES = dedent("""\
     succeeded, so verify with apps_logs after deploying:
 
     1. Built for linux/arm64 (the workflow handles this via the `platforms` key).
-    2. Listen on port 80 bound to :: (dual-stack) — NOT 0.0.0.0 alone, NOT
-       127.0.0.1. The healthcheck runs INSIDE the container against
-       http://localhost:80/, and `localhost` resolves to ::1 (IPv6) first; an
-       IPv4-only bind (0.0.0.0) gets connection-refused and the container is
-       rolled back even though it serves fine from outside. Bind :: (e.g.
-       app.listen(80, '::'), Uvicorn --host '::') and it accepts both stacks.
+    2. Listen on port 80 on BOTH IP families — NOT 0.0.0.0 alone, NOT 127.0.0.1,
+       and beware that ':: ' is not automatically dual-stack in every runtime.
+       Two different failures come from getting this wrong, because two different
+       clients connect: the healthcheck runs INSIDE the container against
+       http://localhost:80/ (which resolves to ::1, IPv6 first), while the proxy
+       connects from OUTSIDE to the container's IPv4 address.
+         - IPv4-only (0.0.0.0): the healthcheck is refused, so the deploy is
+           rolled back even though the app serves fine from outside.
+         - IPv6-only: the healthcheck passes and the container reports healthy,
+           but the proxy is refused and every request 502s. This is the nastier
+           one — the app looks perfectly healthy while serving nothing.
+       Node's app.listen(80, '::') IS dual-stack. **Python is not**: asyncio sets
+       IPV6_V6ONLY, so `uvicorn --host ::` listens on IPv6 only. In Python, bind
+       the socket yourself and hand it to the server:
+           sock = socket.create_server(("::", 80), family=socket.AF_INET6,
+                                       dualstack_ipv6=True)
+           uvicorn.run("app:app", fd=sock.fileno())
+       If unsure, verify from outside the container, not just via localhost.
     3. Run as root, or grant CAP_NET_BIND_SERVICE — binding port 80 is
        privileged. A `USER node`-style line makes the app die at startup with
        EACCES, which looks like any other "won't start". Drop the USER line.

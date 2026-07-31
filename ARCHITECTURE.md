@@ -99,11 +99,21 @@ container by name (see the Sablier gotcha in §9).
   label, fixed at creation.
 - Coolify stores app origins as `http://…` (not https): Cloudflare terminates
   TLS at the edge, and https here would make Traefik redirect-loop.
-- **Apps must listen on port 80, bound to `::` (dual-stack)** — not 3000/8080
-  (→ 502), and not `0.0.0.0` alone. The in-container healthcheck hits
-  `localhost`, which resolves to IPv6 `::1` first, so an IPv4-only bind fails the
-  check and Coolify rolls the deploy back while the app looks fine from outside.
-  Port 80 is privileged → run as root (no `USER` line in the Dockerfile).
+- **Apps must listen on port 80 on BOTH IP families** — not 3000/8080 (→ 502).
+  Two clients connect from opposite directions, so each wrong bind fails
+  differently:
+  - **IPv4-only (`0.0.0.0`)** — the in-container healthcheck hits `localhost`,
+    which resolves to `::1` first, is refused, and Coolify rolls the deploy back
+    even though the app serves fine externally.
+  - **IPv6-only** — the healthcheck passes and the container reports *healthy*,
+    but Traefik connects to the container's IPv4 address, is refused, and every
+    request 502s. The nastier failure: healthy container, dead site.
+
+  Node's `listen(80, '::')` is dual-stack. **Python's is not** — asyncio sets
+  `IPV6_V6ONLY`, so `uvicorn --host ::` listens on IPv6 only. Bind it explicitly:
+  `socket.create_server(("::", 80), family=AF_INET6, dualstack_ipv6=True)` and
+  pass the fd to uvicorn (see `web/run.py`). Port 80 is privileged → run as root.
+  Verify from *outside* the container; `localhost` will lie to you.
 
 ---
 

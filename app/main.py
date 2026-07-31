@@ -87,12 +87,15 @@ Three rules govern almost every mistake:
 1. **Images must be built for linux/arm64.** The host is a Raspberry Pi. An
    amd64 image will pull successfully and then fail to start with an exec format
    error. In a GitHub Actions build this means `platforms: linux/arm64`.
-2. **The container must listen on port 80, bound to `::` (dual-stack).** Not
-   3000/8080 (→ 502 from the proxy), and not `0.0.0.0` alone — the in-container
-   healthcheck hits `localhost`, which resolves to IPv6 `::1` first, so an
-   IPv4-only bind fails the check and the deploy is rolled back while the app
-   looks fine from outside. Port 80 is privileged, so run as root (no `USER`
-   line). When a deploy 'succeeds' but the URL 502s, apps_logs shows why.
+2. **The container must listen on port 80 on both IP families.** Not 3000/8080
+   (→ 502 from the proxy). Two clients connect from different directions: the
+   in-container healthcheck hits `localhost` (IPv6 `::1` first), and the proxy
+   connects to the container's IPv4 address. An IPv4-only bind (`0.0.0.0`) fails
+   the healthcheck and the deploy is rolled back; an IPv6-only bind passes the
+   healthcheck and then 502s every real request — the app reports healthy while
+   serving nothing. Node's `listen(80, '::')` is dual-stack; **Python's is not**
+   (`uvicorn --host ::` is IPv6-only — bind a `dualstack_ipv6=True` socket and
+   pass its fd). Port 80 is privileged, so run as root (no `USER` line).
 3. **App ids become hostnames.** Lowercase, alphanumeric and hyphens only, one
    flat label, fixed once created.
 
