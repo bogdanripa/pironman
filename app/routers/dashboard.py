@@ -70,6 +70,7 @@ _PAGE = """<!doctype html>
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
          margin-right:6px; vertical-align:1px; }
   .up { background:var(--accent2); } .down { background:#e5484d; }
+  .sleep { background:var(--mut); }  /* asleep = idle by design, not broken */
   .warn { color:#e5a13a; } .bad { color:#e5484d; }
   .bar { height:6px; border-radius:3px; background:var(--bar); overflow:hidden; }
   .bar > span { display:block; height:100%; background:var(--accent); }
@@ -239,9 +240,12 @@ function renderResources(data) {
     const errCls = (t.server_error_pct > 0) ? 'bad' : (t.error_pct > 5 ? 'warn' : '');
     return '<tr>' +
       `<td>${esc(a.id)}</td>` +
-      `<td>${a.running === null
-              ? '<span class="muted">static</span>'
-              : `<span class="dot ${a.running ? 'up' : 'down'}"></span>${a.running ? 'running' : 'stopped'}`}</td>` +
+      `<td>${({
+          static:  '<span class="muted">static</span>',
+          running: '<span class="dot up"></span>running',
+          asleep:  '<span class="dot sleep"></span>asleep',
+          stopped: '<span class="dot down"></span>stopped',
+        })[a.state || (a.running === null ? 'static' : a.running ? 'running' : 'stopped')]}</td>` +
       `<td class="n">${a.cpu_pct != null ? a.cpu_pct + '%' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${a.mem_mb != null ? a.mem_mb.toLocaleString() + ' MB' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${fmtMb(a.disk_rw_mb)}</td>` +

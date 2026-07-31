@@ -170,7 +170,7 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
     async with pool().acquire() as conn:
         apps = await conn.fetch(
             "SELECT id, coolify_uuid, db_engine, db_user, db_password, db_name, "
-            "has_frontend FROM apps ORDER BY id")
+            "has_frontend, sleep_when_idle FROM apps ORDER BY id")
         perf = await _perf_map(conn, perf_days)
         latency = await _latency_map(conn, perf_days)
     for aid, lat in latency.items():
@@ -205,6 +205,13 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
                      else "frontend" if app["has_frontend"]
                      else "backend"),
             "running": (cname is not None) if has_backend else None,
+            # Distinguishes a stopped-because-idle app from a broken one: an
+            # enrolled app with no container is asleep and will wake on the next
+            # request, which is very different from a crash.
+            "state": ("static" if not has_backend
+                      else "running" if cname
+                      else "asleep" if app["sleep_when_idle"]
+                      else "stopped"),
             "cpu_pct": s.get("cpu_pct"),
             "mem_mb": s.get("mem_mb"),
             "mem_pct": s.get("mem_pct"),
