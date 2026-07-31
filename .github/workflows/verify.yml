@@ -108,19 +108,29 @@ jobs:
             esac
           done
 
-      - name: An unauthenticated MCP call is challenged, not swallowed
+      - name: A write reaches the backend rather than the bundle
         run: |
+          # POST is the cleanest probe of the split: a bundle can never answer
+          # one, so whatever comes back came from the backend or from nothing.
+          # /mcp is used because an MCP app answers it meaningfully; an app that
+          # has no such route still proves the point by 404ing *itself*.
           code=$(curl -s -D /tmp/hdr -o /tmp/body -w '%{http_code}' --max-time 30 \
             -X POST "https://$APP$SUFFIX/mcp" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')
           echo "POST /mcp -> $code"; head -c 200 /tmp/body; echo
-          # 200/401/403 are all real answers from the app. A 404 or 502 means the
-          # request never reached it, and an HTML body means it was answered with
-          # the site's homepage instead.
+          # The static host stamps `cache-control: no-store, private` on every
+          # response it proxies, so that header is proof the backend answered —
+          # which is what distinguishes an app saying "no such route" from the
+          # request never arriving at all.
+          proxied=no
+          grep -qi '^cache-control:.*no-store' /tmp/hdr && proxied=yes
           case "$code" in
-            200|401|403) ;;
+            200|401|403) ;;                        # a real MCP answer
+            404) test "$proxied" = "yes" || {
+                   echo "::error::/mcp 404'd without reaching the backend"; cat /tmp/hdr; exit 1; }
+                 echo "the app has no /mcp route, and said so itself — the path to the backend is intact" ;;
             *) echo "::error::/mcp returned $code — the backend did not answer"; cat /tmp/hdr; exit 1 ;;
           esac
           if head -c 200 /tmp/body | grep -qi '<!doctype\|<html'; then
