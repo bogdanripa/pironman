@@ -3,7 +3,7 @@ from textwrap import dedent, indent
 
 from ..auth import require_key
 from ..db import pool
-from ..config import app_url, DOMAIN_SUFFIX
+from ..config import app_url, DOMAIN_SUFFIX, GHCR_OWNER
 
 router = APIRouter(prefix="/apps", tags=["apps"],
                    dependencies=[Depends(require_key)])
@@ -78,8 +78,8 @@ def _workflow(app_id: str, repo_name: str) -> str:
                   platforms: linux/arm64
                   push: true
                   tags: |
-                    ghcr.io/bogdanripa/{repo_name}:latest
-                    ghcr.io/bogdanripa/{repo_name}:${{{{ steps.tag.outputs.value }}}}
+                    ghcr.io/{GHCR_OWNER}/{repo_name}:latest
+                    ghcr.io/{GHCR_OWNER}/{repo_name}:${{{{ steps.tag.outputs.value }}}}
 
               # The box watches :latest and redeploys when the digest moves. This
               # asks it to check now instead of waiting for the hourly sweep, and

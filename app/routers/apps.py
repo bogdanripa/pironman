@@ -4,7 +4,7 @@ from typing import Literal
 
 from ..auth import require_key, mint_key
 from ..db import pool
-from ..config import app_url, app_fqdn
+from ..config import app_url, app_fqdn, backend_image
 from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing, stats
 from ..provision import SLUG_RE
 
@@ -17,16 +17,16 @@ class CreateApp(BaseModel):
                     "^[a-z][a-z0-9-]{1,30}$. This becomes the hostname: the app "
                     "will be served at https://<id>-coolify.bogdanripa.com. "
                     "Cannot be changed later.")
-    image: str | None = Field(
+    backend_repo: str | None = Field(
         default=None,
-        description="Pullable docker image reference including tag, e.g. "
-                    "'ghcr.io/bogdanripa/notes:latest'. MUST be built for "
-                    "linux/arm64 — the host is a Raspberry Pi 5, and an amd64 "
-                    "image will pull successfully and then fail to start. The "
-                    "container MUST listen on port 80. "
-                    "Omit it for a **frontend-only** app (a static site or SPA with "
-                    "no server of its own): no container is created, and the app "
-                    "serves the bundle its CI uploads. An app can gain a backend "
+        description="The GitHub repository whose CI builds this app's backend, "
+                    "e.g. 'notes' (usually the same as the app id — pass it "
+                    "explicitly). The platform derives the image from it; you "
+                    "never name an image, because which image an app runs is "
+                    "decided by its pipeline, not by this call. "
+                    "**Omit it for a frontend-only app** — a static site, an SPA, "
+                    "a browser game: no container is created at all and the app "
+                    "serves the bundle its CI uploads. A backend can be added "
                     "later with apps_update.")
     db_engine: Literal["postgres", "mongo"] | None = Field(
         default=None,
@@ -87,14 +87,13 @@ class AutoUpdate(BaseModel):
 
 
 class UpdateApp(BaseModel):
-    image: str | None = Field(
+    backend_repo: str | None = Field(
         default=None,
-        description="Give this app a backend, or point its existing one at a "
-                    "different image — e.g. a frontend-only app that now needs a "
-                    "server, or a move to another repository or registry. This "
-                    "sets which image the app RUNS and which tag it follows; it is "
-                    "not how new builds are shipped. Rolling out code is CI's job: "
-                    "it pushes the tag and the box redeploys.")
+        description="Give this app a backend, or point it at a different GitHub "
+                    "repository. Passing this to a frontend-only app creates its "
+                    "container for the first time, so it then serves both. This "
+                    "is not how code ships — CI pushes the image and the box "
+                    "redeploys; this only changes WHICH repo the app follows.")
     auto_update: bool | None = Field(
         default=None,
         description="Whether the box watches this app's tag and redeploys when the "
@@ -289,7 +288,8 @@ async def create_app(body: CreateApp):
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
-    if body.db_engine and not body.image:
+    image = backend_image(body.backend_repo) if body.backend_repo else None
+    if body.db_engine and not image:
         raise HTTPException(
             422, "a frontend-only app (no image) cannot have a database — its "
                  "DATABASE_URL would have no container to be injected into")
@@ -301,7 +301,7 @@ async def create_app(body: CreateApp):
     # Frontend-only: nothing to run, so no Coolify application, no healthcheck and
     # no deploy — just a registered id holding its hostname, ready for its CI to
     # upload a bundle. Its traffic is served by the shared static host.
-    if not body.image:
+    if not image:
         async with pool().acquire() as c:
             await c.execute(
                 "INSERT INTO apps (id, image, coolify_uuid, sleep_when_idle) "
@@ -326,7 +326,7 @@ async def create_app(body: CreateApp):
             ],
         }
 
-    uuid = await coolify.create_app(body.image, app_fqdn(body.id), app_id=body.id)
+    uuid = await coolify.create_app(image, app_fqdn(body.id), app_id=body.id)
 
     db_info = None
     try:
@@ -352,13 +352,13 @@ async def create_app(body: CreateApp):
                 "INSERT INTO apps (id, image, coolify_uuid, db_engine, "
                 "db_user, db_password, db_name, watch_tag) "
                 "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-                body.id, body.image, uuid, body.db_engine,
+                body.id, image, uuid, body.db_engine,
                 db_info["user"] if db_info else None,
                 db_info["password"] if db_info else None,
                 db_info["database"] if db_info else None,
                 # Auto-update on by default, watching whatever tag it was created
                 # with (usually :latest) — a push to that tag auto-deploys.
-                autoupdate.tag_of(body.image),
+                autoupdate.tag_of(image),
             )
     except Exception:
         await _rollback(uuid, body.id, body.db_engine if db_info else None)
@@ -494,11 +494,11 @@ async def update_app(app_id: str, body: UpdateApp):
     """Change an app's configuration. Every field is optional; only what you pass
     is touched.
 
-    - **image** — give the app a backend, or point an existing one at a different
-      image. Passing it to a frontend-only app creates its container for the first
-      time, so the app then serves both: its bundle plus this backend, on one
-      hostname. This is not how code ships — CI pushes the tag and the box
-      redeploys; use it to change *which* image the app follows.
+    - **backend_repo** — give the app a backend, or point it at a different GitHub
+      repository. Passing it to a frontend-only app creates its container for the
+      first time, so the app then serves both: its bundle plus this backend, on
+      one hostname. This is not how code ships — CI pushes the image and the box
+      redeploys.
     - **auto_update** — whether the box redeploys when the watched tag moves.
     - **sleep_when_idle** — whether the app scales to zero when idle.
 
@@ -510,8 +510,8 @@ async def update_app(app_id: str, body: UpdateApp):
             raise HTTPException(404, "no such app")
 
     changed: dict = {"id": app_id}
-    if body.image is not None:
-        changed.update(await _apply_image(app_id, body.image))
+    if body.backend_repo is not None:
+        changed.update(await _apply_image(app_id, backend_image(body.backend_repo)))
     if body.auto_update is not None:
         changed.update(await set_autoupdate(app_id, AutoUpdate(enabled=body.auto_update)))
     if body.sleep_when_idle is not None:

@@ -51,6 +51,17 @@ SABLIER_EXCLUDE          = set(
 SABLIER_AUTO_ENROLL      = os.environ.get("SABLIER_AUTO_ENROLL", "").lower() in (
     "1", "true", "yes")
 
+# The registry namespace apps are built into. An app's backend image is
+# ghcr.io/<GHCR_OWNER>/<repo>:latest, derived from the GitHub repo that builds it
+# — callers name the repo, not the image, since the image reference is registry
+# mechanics the platform already knows.
+GHCR_OWNER = os.environ.get("GHCR_OWNER", "bogdanripa")
+
+
+def backend_image(repo: str) -> str:
+    return f"ghcr.io/{GHCR_OWNER}/{repo}:latest"
+
+
 # ghcr read credential for the auto-updater's digest checks (docker pull of
 # private packages). Optional — without it auto-update still works for public
 # images. This is ONE server-side credential for the whole platform, not a

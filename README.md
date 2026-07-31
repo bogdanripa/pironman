@@ -228,6 +228,18 @@ done
 
 `apps_get` also reports the live policy in `backend.runtime.restart_policy`.
 
+## Naming an app's backend
+
+Callers never name a docker image. `apps_create` and `apps_update` take
+**`backend_repo`** — the GitHub repository that builds the app — and the platform
+derives `ghcr.io/<GHCR_OWNER>/<repo>:latest` from it. Which image that produces,
+and when it ships, is the pipeline's business; the create call only records which
+repo the app follows. Omitting `backend_repo` is what makes an app frontend-only.
+
+Two places still speak in images, correctly: `apps_adopt` describes an app that
+already exists in Coolify, and `apps_update_code` is the REST-only path CI uses
+to deploy a specific tag.
+
 ## Deploy keys
 
 Two kinds of API key, both stored only as sha256 in `api_keys`:
