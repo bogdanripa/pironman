@@ -21,6 +21,11 @@ FRONTEND_ROOT = Path("/srv/frontends")
 MAX_FILES = 5000
 MAX_BYTES = 200 * 1024 * 1024
 
+# Accepted entry files, in the order the static host prefers them. Keep in sync
+# with INDEX_FILES in web/server.py — a bundle accepted here but not recognised
+# there would upload cleanly and then serve nothing.
+INDEX_FILES = ("index.html", "index.htm")
+
 
 class FrontendError(RuntimeError):
     pass
@@ -90,7 +95,7 @@ def deploy_bundle(app_id: str, data: bytes) -> dict:
             shutil.copyfileobj(src, out)
         written += 1
 
-    if not (staging / "index.html").is_file():
+    if not any((staging / n).is_file() for n in INDEX_FILES):
         shutil.rmtree(staging, ignore_errors=True)
         raise FrontendError(
             "bundle has no index.html at its root — zip the contents of your "
@@ -135,7 +140,7 @@ def deploy_files(app_id: str, files: dict[str, str]) -> dict:
         if not rel or ".." in Path(rel).parts:
             raise FrontendError(f"unsafe path: {path}")
         cleaned[rel] = content
-    if "index.html" not in cleaned:
+    if not any(n in cleaned for n in INDEX_FILES):
         raise FrontendError("files must include an index.html at the root")
 
     shutil.rmtree(staging, ignore_errors=True)
@@ -192,7 +197,7 @@ def info(app_id: str) -> dict | None:
         "files": files,
         "size_kb": round(size / 1024, 1),
         "published_at": datetime.fromtimestamp(newest, timezone.utc).isoformat(),
-        "has_index": (d / "index.html").is_file(),
+        "has_index": any((d / n).is_file() for n in INDEX_FILES),
     }
 
 

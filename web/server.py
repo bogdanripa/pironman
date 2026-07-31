@@ -37,6 +37,10 @@ DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
 PROXY = os.environ.get("TRAEFIK_URL", "http://coolify-proxy")
 
 # Hashed build output is safe to cache forever; everything else is not.
+# Entry files, in preference order. index.htm is the legacy spelling; supporting
+# it costs nothing and avoids a site that looks empty for a puzzling reason.
+INDEX_FILES = ("index.html", "index.htm")
+
 _HASHED = re.compile(r"[.-][0-9a-f]{8,}\.[a-z0-9]+$", re.I)
 IMMUTABLE = "public, max-age=31536000, immutable"
 NO_CACHE = "no-cache"
@@ -92,7 +96,7 @@ async def _proxy(request: Request, aid: str) -> Response:
 
 
 def _serve(f: Path, url_path: str) -> FileResponse:
-    if f.name == "index.html":
+    if f.name in INDEX_FILES:
         cc = NO_CACHE
     elif _HASHED.search(f.name) or url_path.startswith(("/assets/", "/static/")):
         cc = IMMUTABLE
@@ -132,15 +136,17 @@ async def resolve(request: Request, _path: str = ""):
     if request.method in ("GET", "HEAD"):
         f = _safe_file(aid, path)
         if f is None and path.endswith("/"):
-            f = _safe_file(aid, path + "index.html")
+            f = next((x for x in (_safe_file(aid, path + n) for n in INDEX_FILES)
+                      if x), None)
         if f:
             return _serve(f, path)
 
     # 3. browser navigation -> SPA entrypoint, without touching the backend
     if request.method == "GET" and "text/html" in request.headers.get("accept", ""):
-        index = _safe_file(aid, "/index.html")
-        if index:
-            return _serve(index, "/index.html")
+        for name in INDEX_FILES:
+            index = _safe_file(aid, "/" + name)
+            if index:
+                return _serve(index, "/" + name)
 
     # 4. everything else belongs to the backend
     if has_backend:
