@@ -78,7 +78,8 @@ async def sync_frontend_routes(conn) -> dict:
     if desired == current:
         return {"routed": app_ids, "changed": False}
 
-    await coolify.set_custom_labels(
+    res = await coolify.set_custom_labels(
         web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()])
     await coolify.deploy(web["coolify_uuid"])
-    return {"routed": app_ids, "changed": True}
+    return {"routed": app_ids, "changed": True,
+            "labels_readonly": res.get("readonly", False)}

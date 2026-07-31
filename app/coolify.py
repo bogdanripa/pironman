@@ -126,17 +126,36 @@ async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
     })
 
 
-async def set_custom_labels(uuid: str, labels: list[str], readonly: bool = True) -> None:
+async def set_custom_labels(uuid: str, labels: list[str],
+                            readonly: bool = True) -> dict:
     """Replace an app's container labels with `labels` verbatim (base64-encoded,
-    newline-joined, as Coolify stores them). readonly=True flips Coolify's
-    'readonly labels' flag so it stops regenerating them on deploy — which is what
-    makes an added middleware (e.g. Sablier) survive redeploys instead of being
-    wiped. UNVERIFIED shape; field names match Coolify 4.x."""
+    newline-joined, as Coolify stores them).
+
+    `readonly` asks Coolify to stop regenerating the label block on deploy, which
+    is what makes an added router or middleware survive a redeploy. That flag's
+    field name is not stable across Coolify builds — this instance rejects
+    `is_container_label_readonly_enabled` with 422 "field is not allowed" — so we
+    try the known spellings and fall back to writing the labels alone.
+
+    Writing labels without the flag still works; the labels just aren't protected
+    from a future Coolify regeneration. Callers that own their labels (routing,
+    Sablier) re-sync from the database, so drift self-heals on the next change.
+    Returns {"readonly": bool} so callers can tell which happened.
+    """
     encoded = base64.b64encode("\n".join(labels).encode()).decode()
-    await _request("PATCH", f"/applications/{uuid}", json={
-        "custom_labels": encoded,
-        "is_container_label_readonly_enabled": readonly,
-    })
+    if readonly:
+        for field in ("is_container_label_readonly_enabled",
+                      "custom_labels_readonly",
+                      "is_custom_labels_readonly"):
+            try:
+                await _request("PATCH", f"/applications/{uuid}",
+                               json={"custom_labels": encoded, field: True})
+                return {"readonly": True, "field": field}
+            except CoolifyError as e:
+                if "422" not in str(e) or "not allowed" not in str(e):
+                    raise  # a real failure, not an unknown field name
+    await _request("PATCH", f"/applications/{uuid}", json={"custom_labels": encoded})
+    return {"readonly": False}
 
 
 async def deploy(uuid: str) -> None:
