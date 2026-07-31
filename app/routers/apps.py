@@ -5,7 +5,7 @@ from typing import Literal
 from ..auth import require_key, mint_key
 from ..db import pool
 from ..config import app_url, app_fqdn
-from .. import coolify, provision, envs, autoupdate, sablier, frontends
+from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing
 from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
@@ -682,6 +682,10 @@ async def delete_app(app_id: str):
         await c.execute("DELETE FROM app_env WHERE app_id = $1", app_id)
         await c.execute("DELETE FROM api_keys WHERE app_id = $1", app_id)
         await c.execute("DELETE FROM apps WHERE id = $1", app_id)
+        try:  # drop its route from the static host, if it had one
+            await routing.sync_frontend_routes(c)
+        except Exception:
+            pass
     # Return a body, not 204: an MCP tool result with no content is rejected by
     # the connector proxy as "Invalid content from server".
     return {"id": app_id, "deleted": True}

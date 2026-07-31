@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from ..auth import require_key
 from ..db import pool
 from ..config import app_url
-from .. import frontends
+from .. import frontends, routing
 
 router = APIRouter(prefix="/apps", tags=["frontend"],
                    dependencies=[Depends(require_key)])
@@ -39,8 +39,15 @@ async def _sync_manifest(c, app_id: str) -> dict:
         raise HTTPException(404, "no such app")
     has_backend = bool(row["image"])
     frontends.write_manifest(app_id, has_backend, list(row["backend_routes"] or []))
+    # Make sure the static host actually has a route for this hostname. A no-op
+    # once the route exists, so repeat deploys don't restart the shared host.
+    try:
+        routed = await routing.sync_frontend_routes(c)
+    except Exception as e:  # routing must never fail an otherwise-good deploy
+        routed = {"error": str(e)}
     return {"has_backend": has_backend,
-            "backend_routes": list(row["backend_routes"] or [])}
+            "backend_routes": list(row["backend_routes"] or []),
+            "routing": routed}
 
 
 @router.put("/{app_id}/frontend", operation_id="apps_frontend_deploy",
