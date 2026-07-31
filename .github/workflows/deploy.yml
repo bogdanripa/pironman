@@ -19,6 +19,13 @@ on:
 # Requires the PAAS_KEY repository secret (a dedicated API key for this platform)
 # and paas-api to have adopted itself once. See README "Self-management".
 
+# One deploy at a time, newest wins. Successive pushes otherwise build in
+# parallel and can finish out of order, so an older image overwrites :latest
+# after a newer one and the box deploys the older code.
+concurrency:
+  group: deploy-api
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest

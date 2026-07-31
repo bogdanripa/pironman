@@ -19,6 +19,12 @@ on:
 # only deploy that one app. Distinct from PAAS_KEY (scoped to `api`) and
 # WEB_PAAS_KEY (scoped to `web`).
 
+# One publish at a time, newest wins. The bundle is the source, so a superseded
+# upload has nothing to contribute.
+concurrency:
+  group: deploy-dashboard
+  cancel-in-progress: true
+
 jobs:
   publish:
     runs-on: ubuntu-latest

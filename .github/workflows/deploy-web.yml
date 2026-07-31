@@ -18,6 +18,11 @@ on:
 # Unlike paas-api this deploys the secretless way: the box watches :latest and
 # redeploys when the digest moves, so CI only pokes /refresh.
 
+# One deploy at a time, newest wins — see deploy.yml.
+concurrency:
+  group: deploy-web
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
