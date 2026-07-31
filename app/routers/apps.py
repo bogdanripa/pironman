@@ -27,7 +27,7 @@ class CreateApp(BaseModel):
                     "Omit it for a **frontend-only** app (a static site or SPA with "
                     "no server of its own): no container is created, and the app "
                     "serves the bundle its CI uploads. An app can gain a backend "
-                    "later with apps_set_image.")
+                    "later with apps_update.")
     db_engine: Literal["postgres", "mongo"] | None = Field(
         default=None,
         description="Whether to provision a dedicated database for this app, and "
@@ -84,6 +84,35 @@ class AutoUpdate(BaseModel):
                     "push to that tag ships automatically, no deploy key needed. "
                     "Turn it off to pin the app to its current image (e.g. after "
                     "a manual rollback you want to keep).")
+
+
+class UpdateApp(BaseModel):
+    image: str | None = Field(
+        default=None,
+        description="Give this app a backend, or point its existing one at a "
+                    "different image — e.g. a frontend-only app that now needs a "
+                    "server, or a move to another repository or registry. This "
+                    "sets which image the app RUNS and which tag it follows; it is "
+                    "not how new builds are shipped. Rolling out code is CI's job: "
+                    "it pushes the tag and the box redeploys.")
+    backend_routes: list[str] | None = Field(
+        default=None,
+        description="Paths the backend owns outright, e.g. ['/auth']. Normally "
+                    "empty — requests resolve automatically. Declare a prefix only "
+                    "where that guess is wrong: an OAuth callback, a download link "
+                    "or a server-rendered page, which arrive as browser "
+                    "navigations but must reach the backend. ['/'] gives the "
+                    "backend the whole host. Pass [] to clear.")
+    auto_update: bool | None = Field(
+        default=None,
+        description="Whether the box watches this app's tag and redeploys when the "
+                    "image changes. On by default; turn it off to pin an app to "
+                    "what it is running now, e.g. to hold a manual rollback.")
+    sleep_when_idle: bool | None = Field(
+        default=None,
+        description="Whether this app scales to zero when idle, waking on the next "
+                    "request (which then takes a few seconds). Has no effect on a "
+                    "frontend-only app: it has no container to stop.")
 
 
 class Sleep(BaseModel):
@@ -234,7 +263,7 @@ async def create_app(body: CreateApp):
     first real deploy lands when CI pushes and calls /refresh. Do NOT bootstrap
     with a placeholder like nginx:alpine: auto-update follows the tag you register
     here, so it would sit watching the placeholder forever. (If you already did,
-    apps_set_image fixes it without recreating.)
+    apps_update fixes it without recreating.)
 
     Getting the image right avoids almost every failed first deploy — see
     dockerfile_requirements from apps_deploy_workflow: **linux/arm64**, listen on
@@ -467,23 +496,50 @@ async def app_logs(app_id: str, tail: int = 200):
     return {"id": app_id, **await autoupdate.app_logs(row["coolify_uuid"], tail)}
 
 
-@router.put("/{app_id}/image", operation_id="apps_set_image",
-            summary="Point an app at a different base image (and watch tag)")
-async def set_app_image(app_id: str, body: SetImage):
-    """Change the base image an app runs — e.g. move it off a bootstrap
-    placeholder onto its real repository, or switch registries — and redeploy.
+@router.put("/{app_id}", operation_id="apps_update",
+            summary="Update an app: give it a backend, or change how it deploys and sleeps")
+async def update_app(app_id: str, body: UpdateApp):
+    """Change an app's configuration. Every field is optional; only what you pass
+    is touched.
 
-    This also repoints auto-update at the new tag and clears the recorded digest,
-    so the app tracks the right image from here on. It differs from routine
-    deploys, which are automatic (CI push -> /refresh), and from apps_update_code
-    (the authenticated CI redeploy path): use this to change *which* image the
-    app follows, not to roll out a new build of the same one.
+    - **image** — give the app a backend, or point an existing one at a different
+      image. Passing it to a frontend-only app creates its container for the first
+      time, so the app then serves both: its bundle plus this backend, on one
+      hostname. This is not how code ships — CI pushes the tag and the box
+      redeploys; use it to change *which* image the app follows.
+    - **backend_routes** — paths the backend owns outright. Normally empty.
+    - **auto_update** — whether the box redeploys when the watched tag moves.
+    - **sleep_when_idle** — whether the app scales to zero when idle.
 
-    Called on a **frontend-only** app (one created with no image), this gives it a
-    backend for the first time: the container is created and deployed, and from
-    then on it serves both — its frontend bundle plus this backend on the same
-    hostname.
+    To give an app a *frontend*, publish one (apps_frontend_write, or a CI upload)
+    — there is nothing to configure here for that.
     """
+    async with pool().acquire() as c:
+        if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
+            raise HTTPException(404, "no such app")
+
+    changed: dict = {"id": app_id}
+    if body.image is not None:
+        changed.update(await _apply_image(app_id, body.image))
+    if body.auto_update is not None:
+        changed.update(await set_autoupdate(app_id, AutoUpdate(enabled=body.auto_update)))
+    if body.sleep_when_idle is not None:
+        changed.update(await set_sleep(app_id, Sleep(enabled=body.sleep_when_idle)))
+    if body.backend_routes is not None:
+        from .frontend import set_backend_routes, BackendRoutes
+        changed.update(await set_backend_routes(
+            app_id, BackendRoutes(routes=body.backend_routes)))
+    if len(changed) == 1:
+        raise HTTPException(400, "nothing to update — pass at least one field")
+    return changed
+
+
+async def _apply_image(app_id: str, image: str) -> dict:
+    """Point an app at `image` and redeploy, creating its container first if it
+    does not have one yet (a frontend-only app gaining a backend). Also repoints
+    auto-update at the new tag and clears the recorded digest, so the app tracks
+    the right image from here on. Shared by apps_update and the REST-only
+    apps_set_image route."""
     async with pool().acquire() as c:
         row = await c.fetchrow(
             "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
@@ -495,7 +551,7 @@ async def set_app_image(app_id: str, body: SetImage):
         # yet, so create one (and its healthcheck) before pointing it anywhere.
         gained_backend = not row["coolify_uuid"]
         if gained_backend:
-            uuid = await coolify.create_app(body.image, app_fqdn(app_id))
+            uuid = await coolify.create_app(image, app_fqdn(app_id))
             try:
                 await coolify.set_healthcheck(uuid, "/")
             except Exception:
@@ -507,18 +563,18 @@ async def set_app_image(app_id: str, body: SetImage):
                 "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
                 "watch_tag FROM apps WHERE id = $1", app_id)
 
-        await coolify.set_image(row["coolify_uuid"], body.image)
+        await coolify.set_image(row["coolify_uuid"], image)
         await envs.sync_env(c, row["coolify_uuid"], app_id, row["db_engine"],
                             row["db_user"], row["db_password"], row["db_name"])
         await coolify.deploy(row["coolify_uuid"])
         # Keep auto-update following the new tag (only if it was already on) — and
         # turn it on for a backend that has just been added, matching apps_create.
-        watch = (autoupdate.tag_of(body.image)
+        watch = (autoupdate.tag_of(image)
                  if (gained_backend or row["watch_tag"] is not None) else None)
         await c.execute(
             "UPDATE apps SET image = $1, watch_tag = $2, deployed_digest = NULL "
-            "WHERE id = $3", body.image, watch, app_id)
-    return {"id": app_id, "image": body.image, "watch_tag": watch}
+            "WHERE id = $3", image, watch, app_id)
+    return {"id": app_id, "image": image, "watch_tag": watch}
 
 
 @router.post("/{app_id}/db", status_code=201, operation_id="apps_attach_db",
@@ -594,7 +650,7 @@ async def detach_db(app_id: str):
 
 
 @router.put("/{app_id}/autoupdate", operation_id="apps_autoupdate",
-            summary="Turn hourly image auto-update on or off for an app")
+            include_in_schema=False, summary="Turn hourly image auto-update on or off for an app")
 async def set_autoupdate(app_id: str, body: AutoUpdate):
     """Enable or disable auto-update for one app.
 
@@ -618,7 +674,7 @@ async def set_autoupdate(app_id: str, body: AutoUpdate):
 
 
 @router.put("/{app_id}/sleep", operation_id="apps_sablier",
-            summary="Turn idle scale-to-zero (Sablier) on or off for an app")
+            include_in_schema=False, summary="Turn idle scale-to-zero (Sablier) on or off for an app")
 async def set_sleep(app_id: str, body: Sleep):
     """Enable or disable Sablier scale-to-zero for one app.
 

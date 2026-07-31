@@ -117,7 +117,7 @@ async def write_frontend(app_id: str, body: FrontendFiles):
 
 
 @router.put("/{app_id}/backend-routes", operation_id="apps_backend_routes",
-            summary="Declare which paths the backend owns (escape hatch)")
+            include_in_schema=False, summary="Declare which paths the backend owns (escape hatch)")
 async def set_backend_routes(app_id: str, body: BackendRoutes):
     """Override request resolution for an app that has both a frontend and a
     backend.

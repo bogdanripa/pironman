@@ -80,7 +80,7 @@ an app goes down, recovers, or starts throwing 5xx errors; alerts_test confirms
 that wiring.
 
 Apps scale to zero when idle (Sablier): they stop after a few idle minutes and
-start again on the next request. apps_sablier turns this on or off per app; the
+start again on the next request. apps_update turns this on or off per app; the
 control plane itself never sleeps.
 
 **Choose the app's shape first.** An app has up to three parts — a static
@@ -94,7 +94,7 @@ matters more than any other decision here:
 - **Backend only** (create it with an image): an API, an MCP server, a worker —
   anything with no browser UI of its own.
 - **Both** (create with an image, then upload a frontend — or create frontend-only
-  and add a backend later with apps_set_image): the usual web app. They share one
+  and add a backend later with apps_update): the usual web app. They share one
   hostname, so the frontend calls its API with a relative path — no CORS, no API
   base URL to configure.
 
@@ -107,7 +107,7 @@ With both, requests resolve automatically: a real file in the bundle is served, 
 browser navigation gets index.html (so client-side routes work), and everything
 else goes to the backend. Serving the API under /api is a good convention and
 what to suggest, but nothing enforces it. Only declare paths with
-apps_backend_routes when that automatic split guesses wrong — an OAuth callback,
+apps_update's backend_routes when that automatic split guesses wrong — an OAuth callback,
 a download link or a server-rendered page, which look like page loads but must
 reach the backend.
 
@@ -173,7 +173,7 @@ hand is only ever a first-time bootstrap step for the control plane itself.
 Creating the app itself is the one-off you do here, before its first CI run.
 apps_create and apps_deploy_workflow each return an ordered deploy runbook —
 follow it to wire up CI and ship the app end to end yourself, with no repository
-secret and no human step. New apps auto-update by default; apps_autoupdate turns
+secret and no human step. New apps auto-update by default; apps_update turns
 it off (e.g. to hold a manual rollback).
 
 The whole platform runs on one small machine at home. Deleting an app destroys
@@ -261,7 +261,7 @@ app.include_router(analytics_router.router)  # analytics_* — cross-app visitor
 app.include_router(dashboard.router)   # GET /analytics/dashboard — HTML page (keyless)
 app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health snapshot
 app.include_router(alerts_router.router)  # alerts_test — Telegram alert wiring check
-app.include_router(frontend.router)    # apps_frontend_deploy / apps_backend_routes
+app.include_router(frontend.router)    # apps_frontend_deploy / apps_frontend_write
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
@@ -312,7 +312,12 @@ _mcp = FastApiMCP(
     description=SERVER_DESCRIPTION,
     # apps_frontend_deploy takes a raw zip body — a CI call, not something a model
     # can meaningfully construct, so it stays REST-only like apps_update_code.
-    exclude_operations=["apps_update_code", "apps_refresh", "apps_frontend_deploy"],
+    exclude_operations=["apps_update_code", "apps_refresh", "apps_frontend_deploy",
+                        # plumbing reached through apps_update, which expresses
+                        # intent ("give this app a backend") rather than mechanism
+                        # ("set its image"). Deploys are CI's job, not a tool call.
+                        "apps_set_image", "apps_autoupdate", "apps_sablier",
+                        "apps_backend_routes"],
 )
 
 # fastapi-mcp does `Server(name, description)`, and the low-level MCP Server takes
