@@ -1,6 +1,6 @@
 import json
 import asyncpg
-from .config import PAAS_DB
+from .config import PAAS_DB, STATIC_HOST_APP
 
 _pool: asyncpg.Pool | None = None
 
@@ -167,6 +167,13 @@ _REPAIRS = [
     # JSON *string* ("[]") rather than an array, and read back as text.
     """UPDATE apps SET redirects = (redirects #>> '{}')::jsonb
         WHERE jsonb_typeof(redirects) = 'string'""",
+
+    # The static host inherited the default (sleep when idle) like any other app.
+    # It fronts every app that sleeps and is what wakes them, so it sleeping would
+    # strand all of them with nothing able to start anything. sablier.excluded()
+    # refuses to enrol it regardless; this stops the row from claiming otherwise.
+    f"""UPDATE apps SET sleep_when_idle = false, sablier_enrolled = false
+        WHERE id = '{STATIC_HOST_APP}' AND sleep_when_idle""",
 ]
 
 
