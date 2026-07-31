@@ -91,9 +91,10 @@ def _workflow(app_id: str, repo_name: str) -> str:
                     -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
                     "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh"
 
-              # /refresh only queues the deploy; poll the app until it actually
-              # answers so a crash-looping container fails the run instead of
-              # going green. 502/503/504/000 = proxy can't reach the container.
+              # /refresh verifies the deploy server-side and returns non-2xx if
+              # the container failed and Coolify rolled it back, so this step is a
+              # second opinion: it also catches an app that starts and answers
+              # healthily but serves errors.
               - name: Wait for the new version to be healthy
                 run: |
                   url="https://{app_id}{DOMAIN_SUFFIX}"

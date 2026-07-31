@@ -42,4 +42,16 @@ async def refresh(app_id: str):
             raise HTTPException(
                 400, "frontend-only app — there is no image to refresh; deploy it "
                      "by uploading its bundle to PUT /apps/<id>/frontend")
-        return await autoupdate.check_and_update(c, app)
+        # verify=True: Coolify rolls a failed deploy back silently, so without
+        # this the hook returns 2xx while the previous container keeps serving —
+        # CI goes green and the change is simply missing.
+        result = await autoupdate.check_and_update(c, app, verify=True)
+
+    if result.get("updated") and result.get("verified") is False:
+        raise HTTPException(502, {
+            "deployed": False,
+            "app": app_id,
+            "reason": result.get("reason"),
+            "hint": f"apps_logs {app_id} shows why the container failed to start",
+        })
+    return result

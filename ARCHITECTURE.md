@@ -238,6 +238,13 @@ flowchart LR
    the image digest actually moved** re-points Coolify at the new image and
    redeploys. Also runs **hourly** regardless.
 
+Deploys are **verified**: Coolify rolls a failed deploy back silently, leaving
+the previous container serving while every signal reports success, so
+`autoupdate.verify_deploy` confirms the container was actually replaced and came
+up healthy. `/refresh` and `/code` return 502 when it was not (CI goes red), and
+the hourly sweep alerts. The control plane is exempt — it cannot watch its own
+replacement.
+
 `/refresh` accepts no caller-supplied image — it only makes the box re-check the
 tag it already watches — so the key is defence in depth rather than the only thing
 standing between a caller and an arbitrary deploy. `apps_deploy_workflow`

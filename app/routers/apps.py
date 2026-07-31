@@ -4,7 +4,7 @@ from typing import Literal
 
 from ..auth import require_key, mint_key
 from ..db import pool
-from ..config import app_url, app_fqdn
+from ..config import app_url, app_fqdn, CONTROL_PLANE_APP
 from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing, stats
 from ..provision import SLUG_RE
 
@@ -629,12 +629,34 @@ async def update_code(app_id: str, body: UpdateCode):
     redeploying does not reliably pull the new image.
     """
     async with pool().acquire() as c:
-        if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
+        row = await c.fetchrow(
+            "SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
+        if not row:
             raise HTTPException(404, "no such app")
+
+    before = (await autoupdate._container_started_at(row["coolify_uuid"])
+              if row["coolify_uuid"] else None)
     # Creates the container on the first call for an app that has none — an app
     # is registered as a shell and becomes a backend app when its pipeline first
     # deploys to it. Also re-injects the environment and repoints auto-update.
-    return await _apply_image(app_id, body.image)
+    result = await _apply_image(app_id, body.image)
+
+    # The control plane cannot verify its own deploy: this request is served by
+    # the container being replaced, so waiting would kill the response and fail
+    # the caller for a deploy that actually worked.
+    if app_id == CONTROL_PLANE_APP:
+        return {**result, "verified": None,
+                "note": "self-deploy — the control plane cannot observe its own "
+                        "replacement; check apps_logs afterwards"}
+
+    async with pool().acquire() as c:
+        uuid = await c.fetchval("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
+    check = await autoupdate.verify_deploy(uuid, before)
+    if not check.get("verified"):
+        raise HTTPException(502, {"deployed": False, "app": app_id,
+                                  "reason": check.get("reason"),
+                                  "hint": f"apps_logs {app_id} shows why"})
+    return {**result, **check}
 
 
 @router.delete("/{app_id}", operation_id="apps_delete",

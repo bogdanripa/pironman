@@ -116,7 +116,65 @@ async def app_logs(uuid: str, tail: int = 200) -> dict:
     return {"container": name, "status": status.strip(), "logs": logs}
 
 
-async def check_and_update(conn, app) -> dict:
+async def _container_started_at(uuid: str) -> str | None:
+    """RFC3339 start time of the app's current container, or None if there is
+    none. Used to tell a container that a deploy actually replaced from one that
+    merely survived it."""
+    name = await _container_name(uuid)
+    if not name:
+        return None
+    rc, out = await _docker("inspect", "--format", "{{.State.StartedAt}}", name,
+                            timeout=30)
+    return out.strip() if rc == 0 else None
+
+
+async def verify_deploy(uuid: str, before: str | None, timeout: int = 150) -> dict:
+    """Wait for a deploy to actually take, and say so honestly if it did not.
+
+    Coolify's deploy call is asynchronous and its rollback is silent: if the new
+    container fails to start or fails its healthcheck, Coolify removes it and the
+    PREVIOUS container keeps serving. Everything then looks healthy — the deploy
+    call returned 2xx, a container exists, and it reports running — while the code
+    that was deployed is nowhere. That failure cost a long debugging session, so
+    it is worth the wait to catch it.
+
+    A deploy is verified when the app's container has a start time later than the
+    one observed before the deploy (i.e. it was genuinely replaced) and is running
+    without an unhealthy healthcheck.
+    """
+    deadline = timeout
+    last = {"replaced": False, "status": None}
+    while deadline > 0:
+        name = await _container_name(uuid)
+        if name:
+            _, started = await _docker(
+                "inspect", "--format", "{{.State.StartedAt}}", name, timeout=30)
+            _, status = await _docker(
+                "inspect", "--format",
+                "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}"
+                "{{else}}none{{end}}", name, timeout=30)
+            started, status = started.strip(), status.strip()
+            state, health = (status.split("|", 1) + ["none"])[:2]
+            replaced = bool(started) and (before is None or started > before)
+            last = {"replaced": replaced, "status": status, "container": name}
+            if replaced and state == "running" and health in ("healthy", "none"):
+                return {"verified": True, "container": name}
+        await asyncio.sleep(5)
+        deadline -= 5
+
+    return {
+        "verified": False,
+        **last,
+        "reason": ("the new container never became healthy, so Coolify rolled the "
+                   "deploy back and the previous container is still serving — the "
+                   "code you deployed is not running. apps_logs shows why it "
+                   "failed to start."
+                   if not last["replaced"] else
+                   "the container was replaced but did not become healthy in time"),
+    }
+
+
+async def check_and_update(conn, app, verify: bool = False) -> dict:
     """Pull the app's watched tag; if its digest differs from what is running,
     redeploy (re-injecting env like a normal deploy) and record the new digest.
     A no-op when nothing changed. `app` is a row selected with APP_COLS."""
@@ -129,6 +187,7 @@ async def check_and_update(conn, app) -> dict:
     if digest == app["deployed_digest"]:
         return {"id": app["id"], "updated": False, "image": ref}
 
+    before = await _container_started_at(app["coolify_uuid"])
     await coolify.set_image(app["coolify_uuid"], ref)
     await envs.sync_env(conn, app["coolify_uuid"], app["id"], app["db_engine"],
                         app["db_user"], app["db_password"], app["db_name"])
@@ -137,7 +196,10 @@ async def check_and_update(conn, app) -> dict:
         "UPDATE apps SET image = $1, deployed_digest = $2 WHERE id = $3",
         ref, digest, app["id"])
     await _maybe_enroll_sablier(conn, app)
-    return {"id": app["id"], "updated": True, "image": ref, "digest": digest}
+    result = {"id": app["id"], "updated": True, "image": ref, "digest": digest}
+    if verify:
+        result.update(await verify_deploy(app["coolify_uuid"], before))
+    return result
 
 
 async def _maybe_enroll_sablier(conn, app) -> None:
@@ -159,14 +221,27 @@ async def _maybe_enroll_sablier(conn, app) -> None:
 
 
 async def check_all() -> list[dict]:
-    """Check every opted-in app once. One app's failure never aborts the sweep."""
+    """Check every opted-in app once. One app's failure never aborts the sweep.
+
+    Deploys made here are verified, and a rollback is reported: nobody is watching
+    a background sweep, so a silently reverted deploy would otherwise sit
+    undiscovered until someone noticed a change had gone missing.
+    """
+    from . import notify
+
     async with pool().acquire() as c:
         apps = await c.fetch(
             f"SELECT {APP_COLS} FROM apps WHERE watch_tag IS NOT NULL ORDER BY id")
         results = []
         for app in apps:
             try:
-                results.append(await check_and_update(c, app))
+                res = await check_and_update(c, app, verify=True)
+                results.append(res)
+                if res.get("updated") and res.get("verified") is False:
+                    await notify.send(
+                        f"⚠️ <b>{app['id']}</b> deploy rolled back\n"
+                        f"{res.get('reason', '')}\n"
+                        f"The previous version is still serving.")
             except Exception as e:
                 results.append({"id": app["id"], "updated": False, "error": str(e)})
     return results

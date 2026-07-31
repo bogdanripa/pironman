@@ -255,6 +255,28 @@ takes one, since it describes an app that already exists in Coolify.
 `health_path` is recorded at create time and applied when the container is
 eventually created.
 
+## Deploys are verified, not assumed
+
+Coolify's deploy call is asynchronous and its rollback is **silent**: if the new
+container fails to start or fails its healthcheck, Coolify removes it and the
+previous container keeps serving. Everything then looks fine — the deploy
+returned 2xx, a container exists, `apps_logs` reports `running (healthy)` — while
+the code that was deployed is nowhere. That is exactly how a broken static-host
+image went unnoticed while three separate signals said success.
+
+So a deploy is now checked rather than assumed (`autoupdate.verify_deploy`): it
+waits for the app's container to have a start time *later* than the one observed
+before the deploy — proving it was genuinely replaced, not merely survived — and
+to be running without an unhealthy healthcheck.
+
+- **`POST /apps/<id>/refresh`** returns **502** when the deploy rolled back, so
+  CI goes red instead of green.
+- **`PUT /apps/<id>/code`** does the same, except for the control plane itself
+  (`CONTROL_PLANE_APP`, default `api`), which cannot observe its own replacement
+  — that request is served by the container being replaced.
+- The **hourly sweep** verifies too and sends a Telegram alert on a rollback,
+  since nobody is watching a background sweep.
+
 ## Deploy keys
 
 Two kinds of API key, both stored only as sha256 in `api_keys`:

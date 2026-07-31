@@ -90,6 +90,10 @@ PAAS_DB = dict(
     database=os.environ.get("PAAS_DB_NAME", "_paas"),
 )
 
+# This control plane's own app id. It cannot verify its own deploy — the request
+# is served by the container being replaced — so that one path skips the check.
+CONTROL_PLANE_APP = os.environ.get("CONTROL_PLANE_APP", "api")
+
 # The dashboard runs as its own app, so the control plane must accept its origin
 # for cross-origin reads (see app/cors.py).
 DASHBOARD_ORIGIN = os.environ.get(
