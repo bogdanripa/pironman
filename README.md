@@ -152,6 +152,28 @@ holds the routine. `apps_update_code` plus a scoped deploy key remain the
 *authenticated* path for explicit deploys/rollbacks — the control plane itself
 (`api`) still deploys that way and is opted out of auto-update.
 
+## Container names
+
+Coolify names containers `<resource-uuid>-<deploy-timestamp>`, which is
+unreadable and changes on every deploy — so never reference a container by name
+(all the code here matches on the uuid prefix instead). Two things make them
+resolvable rather than renaming them, which Coolify would undo and which would
+break its own bookkeeping:
+
+- `apps_create` sets the Coolify application **name** to the app id, so the
+  Coolify UI and the labels it derives show `space-invaders` rather than the
+  image reference.
+- Every custom-label write stamps **`pironman.app=<app-id>`** on the container,
+  so it self-identifies regardless of what Coolify does with names.
+
+`tools/papps` lists containers by app name, state and restart policy:
+
+```bash
+sudo cp tools/papps /usr/local/bin/ && sudo chmod +x /usr/local/bin/papps
+papps        # running
+papps -a     # include stopped (asleep) containers
+```
+
 ## Reboots and scale-to-zero
 
 Coolify already creates app containers with **`restart: unless-stopped`**

@@ -123,7 +123,8 @@ async def enroll(uuid: str, app_id: str) -> dict:
     if not labels:
         raise RuntimeError(
             "no running container to read labels from — deploy the app once first")
-    lab = await coolify.set_custom_labels(uuid, _as_list(enrolled_labels(labels, app_id)))
+    lab = await coolify.set_custom_labels(
+        uuid, _as_list(enrolled_labels(labels, app_id)), app_id=app_id)
     await coolify.deploy(uuid)
     return {"labels_readonly": lab.get("readonly", False)}
 
@@ -134,5 +135,6 @@ async def unenroll(uuid: str, app_id: str) -> None:
     labels = await _current_labels(uuid)
     if not labels:
         return
-    await coolify.set_custom_labels(uuid, _as_list(_strip(labels, app_id)))
+    await coolify.set_custom_labels(uuid, _as_list(_strip(labels, app_id)),
+                                   app_id=app_id)
     await coolify.deploy(uuid)

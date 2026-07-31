@@ -326,7 +326,7 @@ async def create_app(body: CreateApp):
             ],
         }
 
-    uuid = await coolify.create_app(body.image, app_fqdn(body.id))
+    uuid = await coolify.create_app(body.image, app_fqdn(body.id), app_id=body.id)
 
     db_info = None
     try:
@@ -537,7 +537,7 @@ async def _apply_image(app_id: str, image: str) -> dict:
         # yet, so create one (and its healthcheck) before pointing it anywhere.
         gained_backend = not row["coolify_uuid"]
         if gained_backend:
-            uuid = await coolify.create_app(image, app_fqdn(app_id))
+            uuid = await coolify.create_app(image, app_fqdn(app_id), app_id=app_id)
             try:
                 await coolify.set_healthcheck(uuid, "/")
             except Exception:

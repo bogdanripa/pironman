@@ -80,7 +80,8 @@ async def _internalize_backend(app_id: str, uuid: str) -> bool:
     desired = internalized(labels, app_id)
     if desired == labels:
         return False
-    await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()])
+    await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()],
+                                    app_id=app_id)
     await coolify.deploy(uuid)
     return True
 
@@ -128,7 +129,8 @@ async def sync_frontend_routes(conn) -> dict:
                 "internalized": internalized_ids}
 
     res = await coolify.set_custom_labels(
-        web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()])
+        web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()],
+        app_id=WEB_APP_ID)
     await coolify.deploy(web["coolify_uuid"])
     return {"routed": app_ids, "changed": True,
             "internalized": internalized_ids,

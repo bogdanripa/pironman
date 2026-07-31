@@ -37,8 +37,13 @@ async def _request(method: str, path: str, **kw) -> dict | list | None:
         return None
 
 
-async def create_app(image: str, fqdn: str) -> str:
-    """VERIFIED. Returns the new application UUID."""
+async def create_app(image: str, fqdn: str, app_id: str | None = None) -> str:
+    """VERIFIED. Returns the new application UUID.
+
+    `app_id` becomes the application's Coolify name. Without it Coolify names the
+    app after the image, so the UI (and the labels it derives) show
+    'ghcr.io/bogdanripa/space-invaders' rather than 'space-invaders'.
+    """
     name, _, tag = image.partition(":")
     body = {
         "project_uuid": COOLIFY_PROJECT,
@@ -51,6 +56,8 @@ async def create_app(image: str, fqdn: str) -> str:
         "domains": fqdn,
         "instant_deploy": False,
     }
+    if app_id:
+        body["name"] = app_id
     data = await _request("POST", "/applications/dockerimage", json=body)
     return data["uuid"]
 
@@ -127,7 +134,8 @@ async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
 
 
 async def set_custom_labels(uuid: str, labels: list[str],
-                            readonly: bool = True) -> dict:
+                            readonly: bool = True,
+                            app_id: str | None = None) -> dict:
     """Replace an app's container labels with `labels` verbatim (base64-encoded,
     newline-joined, as Coolify stores them).
 
@@ -142,6 +150,14 @@ async def set_custom_labels(uuid: str, labels: list[str],
     Sablier) re-sync from the database, so drift self-heals on the next change.
     Returns {"readonly": bool} so callers can tell which happened.
     """
+    # Stamp the app's own id on the container. Coolify names containers
+    # <resource-uuid>-<timestamp>, which is unreadable in `docker ps` and changes
+    # every deploy, so this is how a container says which app it is without
+    # anyone having to resolve a uuid.
+    if app_id:
+        labels = [l for l in labels if not l.startswith("pironman.app=")]
+        labels.append(f"pironman.app={app_id}")
+
     encoded = base64.b64encode("\n".join(labels).encode()).decode()
     if readonly:
         for field in ("is_container_label_readonly_enabled",

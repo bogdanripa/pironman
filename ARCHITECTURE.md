@@ -89,6 +89,12 @@ identity is the **uuid prefix** (`coolify_uuid` in the `apps` table); the suffix
 changes each redeploy — a fact that matters for anything that references a
 container by name (see the Sablier gotcha in §9).
 
+Renaming them is not an option: Coolify manages containers by that name and would
+regenerate it on the next deploy. Instead they are made *resolvable* — the
+Coolify application is named after the app id at creation, and every custom-label
+write stamps `pironman.app=<app-id>` on the container. `tools/papps` uses those
+to list containers by app name, state and restart policy.
+
 ---
 
 ## 4. Networking & domains

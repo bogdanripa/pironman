@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# List containers by APP NAME instead of Coolify's <uuid>-<timestamp>.
+#
+# Coolify names containers after the resource uuid plus a deploy timestamp, which
+# is unreadable and changes on every deploy. paas-api stamps `pironman.app` on the
+# containers it manages, and Coolify sets `coolify.resourceName`; this prefers
+# ours, falls back to Coolify's, and finally to the raw name.
+#
+# Install:  sudo cp tools/papps /usr/local/bin/ && sudo chmod +x /usr/local/bin/papps
+# Usage:    papps            running only
+#           papps -a         include stopped (i.e. asleep) containers
+set -u
+
+printf '%-22s %-12s %-16s %s\n' APP STATE RESTART CONTAINER
+docker ps "${1:-}" --format '{{.Names}}\t{{.State}}' | while IFS=$'\t' read -r c state; do
+    [ -n "$c" ] || continue
+    name=$(docker inspect "$c" --format \
+        '{{with index .Config.Labels "pironman.app"}}{{.}}{{else}}{{with index .Config.Labels "coolify.resourceName"}}{{.}}{{end}}{{end}}' \
+        2>/dev/null)
+    restart=$(docker inspect "$c" --format '{{.HostConfig.RestartPolicy.Name}}' 2>/dev/null)
+    printf '%-22s %-12s %-16s %s\n' "${name:-?}" "$state" "${restart:-?}" "$c"
+done
