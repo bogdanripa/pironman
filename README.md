@@ -219,11 +219,15 @@ Two caveats worth knowing:
   new URLs and the `no-cache` entry file points at them immediately. Hashing is
   the real answer; purging is for bundles that ship `app.js` unhashed.
 
-**Invalidation on publish:** a frontend deploy purges exactly the URLs it just
-wrote (`app/cdn.py`), not the whole zone — a zone-wide purge would evict every
+**Invalidation on publish:** a frontend deploy purges that app's cached
+responses (`app/cdn.py`), never the whole zone — a zone-wide purge would evict every
 other app's assets and send the whole box's traffic back to origin to fix one
-app. `/` is purged alongside `index.html`, since that is what browsers actually
-request. Set `CLOUDFLARE_API_TOKEN` (Zone.Cache Purge on this zone) and
+app. It purges by **hostname** where the plan allows it (one call, and it also clears
+files a deploy removed) and falls back to the exact URLs published, which every
+Cloudflare plan supports — hostname, prefix and tag purging are Enterprise-only.
+Which applies is discovered on the first attempt and remembered. In the fallback,
+`/` is purged alongside `index.html`, since they are separate cache entries and
+`/` is what browsers actually request. Set `CLOUDFLARE_API_TOKEN` (Zone.Cache Purge on this zone) and
 `CLOUDFLARE_ZONE_ID` to enable it; without them the platform works unchanged and
 unhashed assets simply wait out their TTL. A failed purge never fails a deploy —
 the files are published and correct either way — and the result is reported as

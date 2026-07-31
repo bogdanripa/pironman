@@ -20,6 +20,10 @@ from .config import (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, DOMAIN_SUFFIX)
 # Cloudflare accepts at most 30 URLs per purge call.
 _BATCH = 30
 
+# Whether this zone's plan allows purge-by-hostname (Enterprise). None until the
+# first attempt tells us; cached so we try the good mechanism once, not forever.
+_host_purge_supported: bool | None = None
+
 
 def configured() -> bool:
     return bool(CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID)
@@ -43,18 +47,39 @@ def urls_for(app_id: str, paths: list[str]) -> list[str]:
 
 
 async def purge(app_id: str, paths: list[str]) -> dict:
-    """Purge the given files from Cloudflare's edge cache for this app's host."""
+    """Drop this app's cached responses from Cloudflare's edge.
+
+    Purging by **hostname** is what we actually want — it clears everything for
+    this app in one call, including files a deploy removed and any URL we did not
+    write ourselves. Cloudflare gates that (like prefixes and tags) behind
+    Enterprise, so we try it and fall back to purging the exact URLs published,
+    which every plan supports. The fallback costs one extra request and is
+    skipped from then on, since the plan will not change between deploys.
+
+    Never purges the whole zone: that would evict every other app's assets and
+    send the entire box's traffic back to origin to fix one app.
+    """
+    global _host_purge_supported
     if not configured():
         return {"purged": False, "reason": "no Cloudflare credentials configured"}
 
-    urls = urls_for(app_id, paths)
     endpoint = (f"https://api.cloudflare.com/client/v4/zones/"
                 f"{CLOUDFLARE_ZONE_ID}/purge_cache")
     headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+    host = f"{app_id}{DOMAIN_SUFFIX}"
 
-    purged, errors = 0, []
     try:
         async with httpx.AsyncClient(timeout=20.0) as c:
+            if _host_purge_supported is not False:
+                r = await c.post(endpoint, headers=headers,
+                                 json={"hosts": [host]})
+                if r.status_code == 200 and r.json().get("success"):
+                    _host_purge_supported = True
+                    return {"purged": "host", "host": host}
+                _host_purge_supported = False  # not on this plan; stop trying
+
+            urls = urls_for(app_id, paths)
+            purged, errors = 0, []
             for i in range(0, len(urls), _BATCH):
                 batch = urls[i:i + _BATCH]
                 r = await c.post(endpoint, headers=headers, json={"files": batch})
@@ -63,7 +88,7 @@ async def purge(app_id: str, paths: list[str]) -> dict:
                 else:
                     errors.append(f"{r.status_code}: {r.text[:200]}")
     except httpx.HTTPError as e:
-        errors.append(str(e))
+        return {"purged": 0, "errors": [str(e)]}
 
     # A failed purge must not fail the deploy: the files are published and
     # correct, they may just be served stale until their TTL expires.
