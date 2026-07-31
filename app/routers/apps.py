@@ -213,6 +213,9 @@ async def get_app(app_id: str):
         # What is actually published on disk, not merely what the flag says.
         "frontend": fe,
 
+        # Ordered redirect rules, first match wins (apps_redirects_list/_set).
+        "redirects": list(row["redirects"] or []),
+
         "crons": [dict(c) for c in crons],
         "env": [{"key": r["key"], "preview": envs.mask(r["value"])} for r in env],
     }

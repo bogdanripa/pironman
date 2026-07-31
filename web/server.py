@@ -35,7 +35,9 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+
+import redirects as redirect_rules
 
 ROOT = Path(os.environ.get("FRONTEND_ROOT", "/srv/frontends"))
 DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
@@ -130,8 +132,19 @@ async def resolve(request: Request, _path: str = ""):
     if not aid or not (ROOT / aid).is_dir():
         return JSONResponse({"error": "no frontend for this host"}, status_code=404)
 
-    has_backend = bool(_manifest(aid).get("has_backend"))
+    mf = _manifest(aid)
+    has_backend = bool(mf.get("has_backend"))
     path = request.url.path
+
+    # 0. Redirects come first, so a rule for a path still present in the bundle
+    #    (or still served by the backend) actually takes effect — a redirect that
+    #    silently loses to an existing file is the confusing case.
+    hit = redirect_rules.match(mf.get("redirects") or [], path,
+                               request.url.query or "")
+    if hit:
+        location, status = hit
+        return RedirectResponse(location, status_code=status,
+                                headers={"Cache-Control": NO_CACHE})
 
     # 1. Anything that isn't a read belongs to the backend. A bundle only ever
     #    answers GET/HEAD, so there is nothing to check first.

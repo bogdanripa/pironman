@@ -298,23 +298,29 @@ them to `/apps/<id>/frontend`; `paas-api` unpacks the zip into a shared volume
 host** (`web/`, an always-warm app, Sablier-excluded) serves them. A frontend
 deploy is ~1 second and restarts nothing.
 
-**Request resolution is static-first, with no path convention required:**
+**Request resolution — one rule, nothing to configure:** a bundle answers only
+reads, and only for files it actually has.
 
-1. a path the app explicitly declared as backend-owned → backend
-2. a real file in the bundle → serve it (hashed assets `immutable`, `index.html`
-   `no-cache`)
-3. **GET + `Accept: text/html`** (browser navigation) → `index.html`
-4. anything else → backend (its own status codes preserved)
+1. not GET/HEAD → backend (a bundle cannot answer writes)
+2. a file in the bundle → serve it (`/` resolves to `index.html`/`index.htm`)
+3. not a file, no backend → `index.html` (a client-side route)
+4. not a file, backend exists → **backend, and its answer stands**
+5. backend said 404 *and* the caller is a browser navigating → `index.html`
 
-Step 3 makes SPA deep links work with zero config, and deliberately does **not**
-consult the backend — so a page load never wakes a sleeping backend or pays a cold
-start. Step 4 is where `fetch`/XHR goes, so an API 404 stays a 404 instead of
-becoming `index.html`.
+OAuth callbacks, download links and server-rendered pages need no declaration:
+they are simply GETs the bundle does not have, so they reach the backend like
+anything else. An earlier design intercepted them as "navigations", served
+`index.html`, and needed a per-app exception list to undo itself — the exceptions
+existed only because the heuristic created them. Step 5 is the one heuristic
+left and it is bounded: it can only act on a request the backend has already
+rejected, so `fetch`/XHR keeps the backend's real 404 instead of being handed
+HTML. Cost: one round trip before a client-side deep link falls back.
 
-Step 1 is the escape hatch (`apps_backend_routes`, stored in
-`apps.backend_routes`, normally empty) for the cases the heuristic can't know:
-**OAuth callbacks, download links, server-rendered pages** — browser navigations
-that the backend must answer. `/api` is *suggested* for new apps, never enforced.
+**Redirects** (`apps.redirects`, `web/redirects.py`) are evaluated ahead of all
+of the above — ordered, first match wins, `*` → `:splat` and `:name` segment
+placeholders, 301/302/307/308, query string preserved, path or absolute-URL
+targets. They need no redeploy, and an app with redirects but no bundle is routed
+through the static host so they work for backend-only apps too.
 
 Because it is same-origin, the frontend calls its API with a relative path: no
 CORS, no API base URL, no cookie-domain juggling.

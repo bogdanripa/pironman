@@ -97,12 +97,14 @@ async def sync_frontend_routes(conn) -> dict:
     if not web or not web["coolify_uuid"]:
         return {"routed": [], "reason": "no 'web' static host app is set up"}
 
-    # Every app with a frontend is routed to the static host — including apps that
-    # also have a backend, whose own router is moved to <app>.internal first so
-    # the two do not both claim the public hostname. The static host is excluded:
-    # it serves its own hostname directly.
+    # Every app the static host must see is routed to it: one with a frontend, or
+    # one with redirect rules (which the static host applies even when there is no
+    # bundle). Apps that also have a backend get their own router moved to
+    # <app>.internal first, so the two do not both claim the public hostname. The
+    # static host is excluded: it serves its own hostname directly.
     rows = await conn.fetch(
-        "SELECT id, coolify_uuid FROM apps WHERE has_frontend = true "
+        "SELECT id, coolify_uuid FROM apps "
+        "WHERE (has_frontend = true OR jsonb_array_length(redirects) > 0) "
         "AND id <> $1 ORDER BY id", WEB_APP_ID)
     app_ids, internalized_ids = [], []
     for r in rows:

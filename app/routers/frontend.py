@@ -21,11 +21,13 @@ router = APIRouter(prefix="/apps", tags=["frontend"],
 
 async def _sync_manifest(c, app_id: str) -> dict:
     row = await c.fetchrow(
-        "SELECT image, has_frontend FROM apps WHERE id = $1", app_id)
+        "SELECT image, has_frontend, redirects FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
     has_backend = bool(row["image"])
-    frontends.write_manifest(app_id, has_backend)
+    # Rewrite the whole manifest, redirects included — a frontend deploy must not
+    # drop rules the static host is relying on.
+    frontends.write_manifest(app_id, has_backend, list(row["redirects"] or []))
     # Make sure the static host actually has a route for this hostname. A no-op
     # once the route exists, so repeat deploys don't restart the shared host.
     try:

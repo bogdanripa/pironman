@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from .db import init_pool, ensure_schema, close_pool
 from . import autoupdate, analytics, alerts
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
+                      redirects as redirects_router,
                       analytics as analytics_router, dashboard, stats,
                       alerts as alerts_router, frontend)
 
@@ -110,6 +111,13 @@ API under /api works, but so does any other path: OAuth callbacks, downloads and
 server-rendered pages are simply paths the bundle does not have. A client-side
 route the backend also rejects falls back to index.html, so SPA deep links work
 too.
+
+Any app can also carry **redirect rules** (apps_redirects_list / apps_redirects_set)
+— ordered, first match wins, applied ahead of files and the backend. They support
+'*' (available in the target as ':splat') and ':name' segment placeholders, take
+301/302/307/308, preserve the query string, and can point at another path or an
+absolute URL. Setting them needs no redeploy, and works for a backend-only app
+too. Reach for these when paths move, rather than adding redirect code to an app.
 
 Frontends deploy by upload, not by image: apps_frontend_write publishes a small
 site from inline files (no build, no repo — good for a landing page), while a
@@ -262,6 +270,7 @@ app.include_router(dashboard.router)   # GET /analytics/dashboard — HTML page 
 app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health snapshot
 app.include_router(alerts_router.router)  # alerts_test — Telegram alert wiring check
 app.include_router(frontend.router)    # apps_frontend_deploy / apps_frontend_write
+app.include_router(redirects_router.router)  # apps_redirects_list / _set
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
@@ -340,7 +349,8 @@ try:
     _READONLY = {"apps_list", "apps_get", "apps_logs", "apps_deploy_workflow",
                  "apps_env_list", "crons_list", "env_list", "github_secrets_list",
                  "analytics_overview", "analytics_timeseries", "analytics_cohorts",
-                 "analytics_agents", "analytics_recent", "apps_stats"}
+                 "analytics_agents", "analytics_recent", "apps_stats",
+                 "apps_redirects_list"}
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
                     "crons_delete", "db_run_script", "env_delete",
                     "github_secret_delete"}

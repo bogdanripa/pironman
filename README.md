@@ -281,6 +281,34 @@ bundle directory, which is the only part Coolify has to be told about:
 Until that exists, `apps_frontend_deploy` still accepts and stores bundles — they
 simply aren't served yet.
 
+## Redirects
+
+Any app can carry an ordered list of redirect rules (`apps_redirects_list` /
+`apps_redirects_set`, stored in `apps.redirects`). They are applied by the shared
+static host **before** files and before the backend, so a rule wins even where a
+file or route still exists, and they take effect immediately with no redeploy.
+
+Patterns follow the conventions from Netlify-style `_redirects`, so rules usually
+port across unchanged:
+
+```
+/old-page          /new-page                  exact
+/blog/*            /news/:splat               wildcard, tail captured
+/posts/:id         /articles/:id              named segment
+/docs/:section/*   /help/:section/:splat      both
+/gone              https://example.com/new    external target
+```
+
+First match wins, so put specific rules before catch-alls. Status may be 301
+(default), 302, 307 or 308; the incoming query string is carried over unless the
+target sets its own. `apps_redirects_set` replaces the whole list — list, edit,
+send back.
+
+An app with redirects but no frontend is routed through the static host too, so
+this works for backend-only apps. Validation rejects the mistakes that would
+otherwise fail silently: a target placeholder the pattern never captures, a
+duplicate source, or a rule pointing at itself.
+
 ## Known-unverified
 
 `create_app`, `delete_app`, `set_image`, `deploy` and `get_app` in `coolify.py`

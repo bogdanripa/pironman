@@ -51,6 +51,12 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS sablier_enrolled boolean NOT
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS has_frontend boolean NOT NULL DEFAULT false;
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS backend_routes text[] NOT NULL DEFAULT '{}';
 
+-- Redirect rules, ordered, as [{from, to, status}]. Applied by the static host
+-- before anything else it does (see web/redirects.py). Stored as jsonb rather
+-- than a table because they are always read and written as one ordered list —
+-- order decides which rule wins.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS redirects jsonb NOT NULL DEFAULT '[]'::jsonb;
+
 -- A frontend-only app has no image and no Coolify application, but the apps
 -- table predates this codebase and declared both NOT NULL, so creating one
 -- failed with a NotNullViolation. Relax them (idempotent — re-running on an

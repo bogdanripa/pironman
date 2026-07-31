@@ -162,12 +162,20 @@ def deploy_files(app_id: str, files: dict[str, str]) -> dict:
     return {"files": len(cleaned)}
 
 
-def write_manifest(app_id: str, has_backend: bool) -> None:
-    """The one thing the static host needs to know that it cannot see on disk:
-    whether this app has a backend to forward unmatched requests to."""
+def write_manifest(app_id: str, has_backend: bool,
+                   redirects: list[dict] | None = None) -> None:
+    """What the static host needs and cannot see on disk: whether this app has a
+    backend to forward unmatched requests to, and its ordered redirect rules.
+
+    Creates the directory if absent, so an app with redirects but no bundle is
+    still served by the static host.
+    """
     d = FRONTEND_ROOT / app_id
     d.mkdir(parents=True, exist_ok=True)
-    (d / ".pironman.json").write_text(json.dumps({"has_backend": has_backend}))
+    (d / ".pironman.json").write_text(json.dumps({
+        "has_backend": has_backend,
+        "redirects": redirects or [],
+    }))
 
 
 def info(app_id: str) -> dict | None:
