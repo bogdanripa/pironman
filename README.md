@@ -152,6 +152,16 @@ holds the routine. `apps_update_code` plus a scoped deploy key remain the
 *authenticated* path for explicit deploys/rollbacks — the control plane itself
 (`api`) still deploys that way and is opted out of auto-update.
 
+## Reboots and scale-to-zero
+
+Docker restarts containers when the daemon starts, including ones Sablier
+stopped, so a reboot would bring every app back awake. On startup `paas-api`
+checks the **host** uptime (`/proc/uptime`, not namespaced) and, if the box
+booted within the last 10 minutes, stops every enrolled sleep-enabled app again
+— so apps that scale to zero come back **asleep** and start on first request.
+The uptime check keeps this from firing on an ordinary self-redeploy of the
+control plane. `api` and `web` are excluded and always start.
+
 ## Deploy keys
 
 Two kinds of API key, both stored only as sha256 in `api_keys`:

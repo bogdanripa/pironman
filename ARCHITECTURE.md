@@ -272,6 +272,17 @@ Traefik router chain, and writes the whole set back as Coolify **read-only custo
 labels** (`is_container_label_readonly_enabled`) so Coolify stops regenerating
 them and the enrollment survives every redeploy.
 
+**On host reboot:** Docker's restart policy starts containers again when the
+daemon comes up — including ones Sablier had stopped — so a reboot would
+otherwise leave every app awake and holding memory until each idled out again.
+`paas-api` therefore re-settles at startup: if the **host** has been up less than
+10 minutes (read from `/proc/uptime`, which is not namespaced, so a container
+sees the machine's uptime), it stops every enrolled sleep-enabled app. The uptime
+check is what distinguishes a real reboot from this control plane merely
+redeploying itself, which happens constantly — stopping sleeping apps then would
+cold-start whatever someone was browsing. Only apps with `sablier_enrolled` are
+touched, so nothing is stopped that has no way to be woken.
+
 - **Default: every app sleeps** when idle (`apps.sleep_when_idle`, default true).
 - **`api` is hard-excluded** (`SABLIER_EXCLUDE`) — it runs the ingester,
   auto-update sweep and alert loop and must never sleep.

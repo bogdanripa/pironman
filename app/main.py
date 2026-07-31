@@ -3,8 +3,8 @@ from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 from fastapi import FastAPI
 
-from .db import init_pool, ensure_schema, close_pool
-from . import autoupdate, analytics, alerts
+from .db import init_pool, ensure_schema, close_pool, pool
+from . import autoupdate, analytics, alerts, sablier
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
                       redirects as redirects_router,
                       analytics as analytics_router, dashboard, stats,
@@ -226,10 +226,35 @@ async def _alerts_loop():
             pass
 
 
+# A container that has just been rebooted into, rather than merely redeployed.
+# This control plane restarts on every self-deploy, and stopping sleeping apps
+# then would cold-start whatever someone is browsing; after a host reboot it is
+# exactly what should happen.
+_REBOOT_WINDOW_S = 600
+
+
+async def _resettle_after_reboot():
+    """Put scale-to-zero apps back to sleep after a host reboot.
+
+    Docker's restart policy starts containers again when the daemon comes up,
+    including ones Sablier had stopped, so without this a reboot leaves every app
+    awake and holding memory until it idles out.
+    """
+    try:
+        uptime = await sablier.host_uptime_seconds()
+        if uptime is None or uptime > _REBOOT_WINDOW_S:
+            return  # not a fresh boot — just this container restarting
+        async with pool().acquire() as c:
+            await sablier.stop_sleeping_apps(c)
+    except Exception:
+        pass  # never block startup on this
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_pool()
     await ensure_schema()  # create env tables if missing — no manual SQL on the Pi
+    await _resettle_after_reboot()
     tasks = [asyncio.create_task(_autoupdate_loop()),
              asyncio.create_task(_analytics_loop()),
              asyncio.create_task(_alerts_loop())]
