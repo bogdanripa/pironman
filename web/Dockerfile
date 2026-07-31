@@ -12,7 +12,11 @@ RUN apt-get update \
 RUN pip install --no-cache-dir fastapi==0.115.6 "uvicorn[standard]==0.34.0" httpx==0.28.1
 
 WORKDIR /srv
-COPY server.py run.py /srv/
+# Copy every module, not a hand-maintained list. server.py imports redirects.py,
+# which an explicit list silently omitted: the image built fine, crashed on
+# import at startup, failed its healthcheck and was rolled back — so the old
+# container kept serving and the deploy looked like it had worked.
+COPY *.py /srv/
 
 # Bundles are mounted here by the platform (shared volume with paas-api).
 VOLUME ["/srv/frontends"]
