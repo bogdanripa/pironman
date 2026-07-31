@@ -152,6 +152,14 @@ async def _last_seen_map(conn) -> dict[str, str]:
     return {r["app_id"]: r["last_seen"].isoformat() for r in rows if r["last_seen"]}
 
 
+async def last_seen_of(app_id: str) -> str | None:
+    """When one app was last requested, or None if it never has been."""
+    async with pool().acquire() as conn:
+        at = await conn.fetchval(
+            "SELECT last_seen FROM analytics_last_seen WHERE app_id = $1", app_id)
+    return at.isoformat() if at else None
+
+
 async def _perf_map(conn, days: int) -> dict[str, dict]:
     rows = await conn.fetch(
         "SELECT app_id, SUM(requests) req, SUM(err_client) ec, "
