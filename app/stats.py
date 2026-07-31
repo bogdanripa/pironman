@@ -164,6 +164,31 @@ async def _perf_map(conn, days: int) -> dict[str, dict]:
     return out
 
 
+async def app_runtime(uuid: str | None, sleeps: bool = False) -> dict:
+    """Live state for ONE app: is its container up, and what is it using right now.
+
+    One `docker stats` sample, so it costs about a second — fine for a per-app
+    lookup. `state` distinguishes 'asleep' (stopped by scale-to-zero, wakes on
+    the next request) from 'stopped' (not running and not supposed to be), which
+    matters because the first is healthy and the second is not.
+    """
+    if not uuid:
+        return {"state": "static", "container": None,
+                "note": "no container — served by the shared frontend host"}
+    stats = await _container_stats()
+    cname = next((n for n in stats if uuid in n), None)
+    if not cname:
+        return {"state": "asleep" if sleeps else "stopped", "container": None,
+                "note": ("stopped while idle; the next request wakes it"
+                         if sleeps else
+                         "not running — the deploy failed, was rolled back, or it "
+                         "crashed. apps_logs shows why")}
+    s = stats[cname]
+    return {"state": "running", "container": cname,
+            "cpu_pct": s.get("cpu_pct"), "mem_mb": s.get("mem_mb"),
+            "mem_pct": s.get("mem_pct")}
+
+
 async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
     """Per-app resource snapshot plus host totals. `include_db=False` skips the
     (slightly slower) database-size probe for a faster CPU/RAM-only view."""

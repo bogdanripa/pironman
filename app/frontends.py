@@ -168,5 +168,33 @@ def write_manifest(app_id: str, has_backend: bool, backend_routes: list[str]) ->
     }))
 
 
+def info(app_id: str) -> dict | None:
+    """What is actually on disk for this app's frontend: file count, total bytes
+    and when it was last published. None if no bundle exists.
+
+    Read from the filesystem rather than the database so it reports the truth —
+    a bundle that failed to land, or one left behind, shows up as it really is.
+    """
+    d = FRONTEND_ROOT / app_id
+    if not d.is_dir():
+        return None
+    files, size, newest = 0, 0, 0.0
+    for p in d.rglob("*"):
+        if p.is_file() and p.name != ".pironman.json":
+            st = p.stat()
+            files += 1
+            size += st.st_size
+            newest = max(newest, st.st_mtime)
+    if not files:
+        return None
+    from datetime import datetime, timezone
+    return {
+        "files": files,
+        "size_kb": round(size / 1024, 1),
+        "published_at": datetime.fromtimestamp(newest, timezone.utc).isoformat(),
+        "has_index": (d / "index.html").is_file(),
+    }
+
+
 def remove(app_id: str) -> None:
     shutil.rmtree(FRONTEND_ROOT / app_id, ignore_errors=True)

@@ -5,7 +5,7 @@ from typing import Literal
 from ..auth import require_key, mint_key
 from ..db import pool
 from ..config import app_url, app_fqdn
-from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing
+from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing, stats
 from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
@@ -109,34 +109,52 @@ class AdoptApp(BaseModel):
 @router.get("", operation_id="apps_list",
             summary="List every app deployed on the Pi")
 async def list_apps():
-    """List all deployed apps with their image, database engine, public URL and
-    number of scheduled jobs.
+    """List all deployed apps with their shape, image, database engine, public URL
+    and number of scheduled jobs.
 
     Call this first whenever the user refers to an app by name — it confirms the
     app exists and shows how it is configured, which avoids guessing at ids.
+    **kind** is 'backend' (a container), 'frontend' (a static bundle, no
+    container) or 'both'; apps_get has the full detail for one app.
     """
     async with pool().acquire() as c:
         rows = await c.fetch(
-            "SELECT a.id, a.image, a.db_engine, a.created_at, "
+            "SELECT a.id, a.image, a.db_engine, a.created_at, a.has_frontend, "
             "  (SELECT count(*) FROM crons WHERE app_id = a.id) AS cron_count "
             "FROM apps a ORDER BY a.id"
         )
-    return [
-        {**dict(r), "url": app_url(r["id"]), "cron_count": int(r["cron_count"])}
-        for r in rows
-    ]
+    out = []
+    for r in rows:
+        d = dict(r)
+        has_frontend = bool(d.pop("has_frontend"))
+        out.append({
+            **d,
+            "kind": ("both" if d["image"] and has_frontend else
+                     "frontend" if has_frontend else "backend"),
+            "url": app_url(r["id"]),
+            "cron_count": int(r["cron_count"]),
+        })
+    return out
 
 
 @router.get("/{app_id}", operation_id="apps_get",
             summary="Get one app's full configuration, including database credentials")
 async def get_app(app_id: str):
-    """Full detail for a single app: current image, database engine, a
-    ready-to-use database connection string, every scheduled job, and the public
-    URL.
+    """Full detail for a single app — read this before changing anything about it.
 
-    The connection string is composed fresh on each call rather than stored,
-    because the database container's hostname changes whenever the database
-    resource is rebuilt. Always read it from here rather than caching it.
+    **kind** tells you the app's shape: 'backend' (a container), 'frontend' (a
+    static bundle, no container) or 'both'. Everything else follows from that:
+    `backend` describes the container, its image and how it deploys, and
+    `frontend` describes what is actually published on disk (file count, size,
+    when it was last published) or is null if the app has no frontend.
+
+    Use it to answer "does this app already have a frontend?", "is it
+    auto-updating?", "does it sleep when idle?" and "which paths does its backend
+    own?" without guessing or making changes to find out.
+
+    The database connection string is composed fresh on each call rather than
+    stored, because the database container's hostname changes whenever the
+    database resource is rebuilt. Always read it from here rather than caching it.
     """
     async with pool().acquire() as c:
         row = await c.fetchrow("SELECT * FROM apps WHERE id = $1", app_id)
@@ -148,15 +166,48 @@ async def get_app(app_id: str):
         env = await c.fetch(
             "SELECT key, value FROM app_env WHERE app_id = $1 ORDER BY key", app_id)
 
+    fe = frontends.info(app_id)
+    has_backend = bool(row["image"])
     out = {
-        "id": row["id"], "url": app_url(row["id"]), "image": row["image"],
+        "id": row["id"], "url": app_url(row["id"]),
+        "kind": ("both" if has_backend and fe else
+                 "frontend" if fe else "backend"),
+        "image": row["image"],
         "db_engine": row["db_engine"], "created_at": row["created_at"],
+
+        # The container half. None for a frontend-only app, which has no
+        # container, no image and nothing to deploy or wake.
+        "backend": {
+            "image": row["image"],
+            "auto_update": row["watch_tag"] is not None,
+            "watch_tag": row["watch_tag"],
+            "deployed_digest": row["deployed_digest"],
+            "sleep_when_idle": row["sleep_when_idle"],
+            "sablier_enrolled": row["sablier_enrolled"],
+            # Live: running / asleep / stopped, plus current CPU and memory.
+            "runtime": await stats.app_runtime(row["coolify_uuid"],
+                                               bool(row["sleep_when_idle"])),
+            # Paths the backend owns outright. Empty is normal: requests resolve
+            # automatically (real file -> served, browser navigation ->
+            # index.html, anything else -> backend).
+            "routes": list(row["backend_routes"] or []),
+        } if has_backend else None,
+
+        # What is actually published on disk, not merely what the flag says.
+        "frontend": fe,
+
         "crons": [dict(c) for c in crons],
         "env": [{"key": r["key"], "preview": envs.mask(r["value"])} for r in env],
     }
     if row["db_engine"]:
         out["db_url"] = await provision.compose_url(
             row["db_engine"], row["db_user"], row["db_password"], row["db_name"])
+        try:
+            size = await provision.db_size(row["db_engine"], row["db_name"],
+                                           row["db_user"], row["db_password"])
+            out["db_size_mb"] = round(size / 1048576, 1) if size is not None else None
+        except Exception:
+            out["db_size_mb"] = None  # never fail the read over a size probe
     return out
 
 
