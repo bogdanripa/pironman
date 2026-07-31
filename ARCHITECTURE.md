@@ -504,6 +504,22 @@ debounce keeps rolling redeploys from looking like outages. Configure with
   and won't reproduce; the box watches the registry itself.
 - **The `api` control plane is special** — no auto-update, no scale-to-zero,
   authenticated self-deploy only.
+- **Traefik's Docker provider only sees running containers** — a stopped app has
+  no router, so anything that must survive the app being stopped (a wake path
+  above all) has to live on a container that stays up.
+- **Never let a failure be answered with something that looks like success** —
+  an SPA fallback in place of an unreachable backend, a compressed body labelled
+  as text, an internal hostname in otherwise valid metadata. Every long debugging
+  session here started with a green signal.
+
+**Checking it from outside.** `.github/workflows/verify.yml` (workflow_dispatch)
+asserts these against the live box as a real client sees them: the static host
+404s its own hostname, a frontend-only app serves its bundle and its deep links,
+a frontend+backend app serves the bundle at `/` while its backend answers on the
+same public hostname, no discovery metadata names an unreachable host, a proxied
+body decodes, and `/mcp` is answered by the app rather than by the homepage. Run
+it after any routing, proxy or Sablier change — none of those failures show up in
+a status code.
 
 ---
 

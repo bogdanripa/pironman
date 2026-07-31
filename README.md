@@ -447,6 +447,19 @@ bundle directory, which is the only part Coolify has to be told about:
 Until that exists, `apps_frontend_deploy` still accepts and stores bundles — they
 simply aren't served yet.
 
+## Checking the live box
+
+`web/tests/test_server.py` covers the static host in isolation (a woken backend,
+a dead one, SPA fallback, compressed passthrough, SSE streaming) and runs in CI
+before its image is built.
+
+`.github/workflows/verify.yml` is the other half: run it by hand
+(`workflow_dispatch`, optionally naming an app with both a frontend and a
+backend) to assert the same invariants against the **running** platform, from
+outside, as a real client sees them. Reach for it after any routing, proxy or
+Sablier change — the failures that have cost real time here all returned a
+perfectly good status code while serving the wrong thing.
+
 ## Redirects
 
 Any app can carry an ordered list of redirect rules (`apps_redirects_list` /
