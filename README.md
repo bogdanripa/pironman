@@ -139,12 +139,11 @@ goes through the host Docker daemon (`docker pull` + `inspect`), reusing its
 existing pull credentials, and a redeploy fires only when the digest actually
 moved.
 
-`/refresh` was originally unauthenticated, on the grounds that it accepts no
-caller-supplied image. That was true but stopped being a good trade once the
-platform could install the secret itself: the only thing it bought was avoiding a
-human step, which is now free, while leaving an endpoint anyone could hit to make
-the box pull images. Both halves of a deploy — the backend trigger and the
-frontend upload — now use the same key.
+`/refresh` authenticates with the app's scoped deploy key, as does the frontend
+upload — one secret covers both halves. Because that key can only touch one app,
+the call also carries the image CI just built, and on an app's **first** deploy
+that image is what creates its container: registration writes a bare id, and the
+pipeline is the only thing that knows what the app runs.
 
 New apps have auto-update on, watching the tag they were created with;
 `apps_autoupdate` toggles it (off to hold a manual rollback). `app/autoupdate.py`

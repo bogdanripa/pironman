@@ -4,6 +4,7 @@ from typing import Literal
 
 from ..auth import require_key, mint_key
 from ..db import pool
+from ..locks import app_lock
 from ..config import app_url, app_fqdn, CONTROL_PLANE_APP
 from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing, stats
 from ..provision import SLUG_RE
@@ -419,46 +420,14 @@ async def update_app(app_id: str, body: UpdateApp):
 
 
 async def _apply_image(app_id: str, image: str) -> dict:
-    """Point an app at `image` and redeploy, creating its container first if it
-    does not have one yet (a frontend-only app gaining a backend). Also repoints
-    auto-update at the new tag and clears the recorded digest, so the app tracks
-    the right image from here on. Shared by apps_update and the REST-only
-    apps_set_image route."""
-    async with pool().acquire() as c:
-        row = await c.fetchrow(
-            "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
-            "watch_tag, health_path FROM apps WHERE id = $1", app_id)
-        if not row:
+    """Point an app at `image` and redeploy, via the shared implementation in
+    autoupdate. Serialised per app: CI's frontend and backend jobs run at once,
+    and overlapping Coolify deploys of one app fight rather than queue."""
+    async with app_lock(app_id):
+        try:
+            return await autoupdate.apply_image(app_id, image)
+        except autoupdate.NoSuchApp:
             raise HTTPException(404, "no such app")
-
-        # Frontend-only app gaining a backend: there is no Coolify application
-        # yet, so create one (and its healthcheck) before pointing it anywhere.
-        gained_backend = not row["coolify_uuid"]
-        if gained_backend:
-            uuid = await coolify.create_app(image, app_fqdn(app_id), app_id=app_id)
-            try:
-                await coolify.set_healthcheck(uuid, row["health_path"] or "/")
-            except Exception:
-                pass  # a missing healthcheck must not strand a created app
-            await c.execute(
-                "UPDATE apps SET coolify_uuid = $1, sleep_when_idle = true "
-                "WHERE id = $2", uuid, app_id)
-            row = await c.fetchrow(
-                "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
-                "watch_tag, health_path FROM apps WHERE id = $1", app_id)
-
-        await coolify.set_image(row["coolify_uuid"], image)
-        await envs.sync_env(c, row["coolify_uuid"], app_id, row["db_engine"],
-                            row["db_user"], row["db_password"], row["db_name"])
-        await coolify.deploy(row["coolify_uuid"])
-        # Keep auto-update following the new tag (only if it was already on) — and
-        # turn it on for a backend that has just been added, matching apps_create.
-        watch = (autoupdate.tag_of(image)
-                 if (gained_backend or row["watch_tag"] is not None) else None)
-        await c.execute(
-            "UPDATE apps SET image = $1, watch_tag = $2, deployed_digest = NULL "
-            "WHERE id = $3", image, watch, app_id)
-    return {"id": app_id, "image": image, "watch_tag": watch}
 
 
 @router.post("/{app_id}/db", status_code=201, operation_id="apps_attach_db",
@@ -583,18 +552,29 @@ async def set_sleep(app_id: str, body: Sleep):
                 400, "this is a frontend-only app: it has no container to sleep. "
                      "Its assets are served by the shared frontend host, which "
                      "stays warm.")
-        applied = {}
-        try:
-            if body.enabled:
-                applied = await sablier.enroll(row["coolify_uuid"], app_id)
-            else:
-                await sablier.unenroll(row["coolify_uuid"], app_id)
-        except RuntimeError as e:
-            raise HTTPException(409, str(e))
+        # Turning sleep ON means the static host must already hold this app's
+        # hostname, or the first time it sleeps nothing can wake it. Route first,
+        # then write the labels — one write, covering both the enrollment and the
+        # marker condition (see routing.apply_backend_labels).
         await c.execute(
-            "UPDATE apps SET sleep_when_idle = $1, sablier_enrolled = $1 "
-            "WHERE id = $2", body.enabled, app_id)
-    return {"id": app_id, "sleep_when_idle": body.enabled, **applied}
+            "UPDATE apps SET sleep_when_idle = $1 WHERE id = $2",
+            body.enabled, app_id)
+        try:
+            await routing.sync_frontend_routes(c, scope_backends=False)
+            fronted = routing.is_fronted(
+                await c.fetchrow(
+                    "SELECT id, coolify_uuid, has_frontend, redirects, "
+                    "sleep_when_idle FROM apps WHERE id = $1", app_id))
+            changed = await routing.apply_backend_labels(
+                app_id, row["coolify_uuid"], sleeps=body.enabled, fronted=fronted)
+        except sablier.NoContainer:
+            raise HTTPException(
+                409, "this app has never deployed, so it has no labels to build "
+                     "on — deploy it once first")
+        await c.execute(
+            "UPDATE apps SET sablier_enrolled = $1 WHERE id = $2",
+            body.enabled, app_id)
+    return {"id": app_id, "sleep_when_idle": body.enabled, "redeployed": changed}
 
 
 async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:
@@ -628,18 +608,11 @@ async def update_code(app_id: str, body: UpdateCode):
     Use an immutable tag such as ':sha-a1b2c3d'. Re-pushing ':latest' and
     redeploying does not reliably pull the new image.
     """
-    async with pool().acquire() as c:
-        row = await c.fetchrow(
-            "SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
-        if not row:
-            raise HTTPException(404, "no such app")
-
-    before = (await autoupdate._container_started_at(row["coolify_uuid"])
-              if row["coolify_uuid"] else None)
     # Creates the container on the first call for an app that has none — an app
     # is registered as a shell and becomes a backend app when its pipeline first
     # deploys to it. Also re-injects the environment and repoints auto-update.
-    result = await _apply_image(app_id, body.image)
+    res = await _apply_image(app_id, body.image)
+    result = {"id": app_id, "image": res["image"], "watch_tag": res["watch_tag"]}
 
     # The control plane cannot verify its own deploy: this request is served by
     # the container being replaced, so waiting would kill the response and fail
@@ -649,9 +622,8 @@ async def update_code(app_id: str, body: UpdateCode):
                 "note": "self-deploy — the control plane cannot observe its own "
                         "replacement; check apps_logs afterwards"}
 
-    async with pool().acquire() as c:
-        uuid = await c.fetchval("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
-    check = await autoupdate.verify_deploy(uuid, before)
+    check = await autoupdate.settle(app_id, res["coolify_uuid"],
+                                    res["started_before"])
     if not check.get("verified"):
         raise HTTPException(502, {"deployed": False, "app": app_id,
                                   "reason": check.get("reason"),

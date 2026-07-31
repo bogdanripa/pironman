@@ -120,15 +120,30 @@ def scoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
     return out
 
 
-async def _scope_backend(app_id: str, uuid: str) -> bool:
-    """Add the marker condition to a linked backend's routers. No-op (and no
-    redeploy) if it is already scoped, so this is safe to call on every frontend
-    deploy."""
-    labels = await sablier._current_labels(uuid)
-    if not labels:
-        return False
-    desired = scoped(labels, app_id)
-    if desired == labels:
+async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
+                               fronted: bool) -> bool:
+    """Write everything the platform stamps on a backend's container labels, in
+    ONE pass: its Sablier enrollment and the static host's marker condition.
+    Returns whether anything changed (and therefore whether it redeployed).
+
+    They cannot be two writes. Each is a read-modify-write against the container's
+    **live** labels, and a Coolify deploy is asynchronous — so a second write
+    moments after the first still reads the old container and silently reverts
+    what the first one did. Enrolling an app and then routing it would leave it
+    routed but not sleeping, with nothing to say so.
+
+    `fronted` must be true whenever the static host holds this app's hostname:
+    scoping a backend that nothing fronts makes it unreachable, since the marker
+    header would never be sent.
+    """
+    base = await sablier._current_labels(uuid)
+    if not base:
+        raise sablier.NoContainer(app_id)
+    desired = (sablier.enrolled_labels(base, app_id) if sleeps
+               else sablier.stripped(base, app_id))
+    if fronted:
+        desired = scoped(desired, app_id)
+    if desired == base:
         return False
     await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()],
                                     app_id=app_id)
@@ -136,27 +151,39 @@ async def _scope_backend(app_id: str, uuid: str) -> bool:
     return True
 
 
+def is_fronted(row) -> bool:
+    """Whether the static host holds this app's hostname — see _FRONTED."""
+    return bool(row["has_frontend"] or (row["redirects"] or [])
+                or (row["coolify_uuid"] and row["sleep_when_idle"])) \
+        and not sablier.excluded(row["id"])
+
+
 # Apps the static host must front:
 #   - it has a bundle to serve;
 #   - it has redirect rules, which the static host applies even with no bundle;
 #   - it has a backend that sleeps, and so needs something that is awake to hold
 #     its route and start it.
-_FRONTED = ("SELECT id, coolify_uuid, image, redirects FROM apps "
+_FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle FROM apps "
             "WHERE id <> $1 AND (has_frontend = true "
             "  OR jsonb_array_length(redirects) > 0 "
             "  OR (coolify_uuid IS NOT NULL AND sleep_when_idle = true)) "
             "ORDER BY id")
 
 
-async def sync_frontend_routes(conn) -> dict:
+async def sync_frontend_routes(conn, scope_backends: bool = True) -> dict:
     """Serialised entry point — the body computes one label set for the shared
     static host from the whole apps table, so two concurrent syncs would each
-    write a set the other has already invalidated."""
+    write a set the other has already invalidated.
+
+    `scope_backends=False` skips the per-backend label pass. Pass it when the
+    caller has just written an app's labels itself: this pass reads the container,
+    which still shows the pre-deploy set, and would write it back.
+    """
     async with ROUTING_LOCK:
-        return await _sync(conn)
+        return await _sync(conn, scope_backends)
 
 
-async def _sync(conn) -> dict:
+async def _sync(conn, scope_backends: bool = True) -> dict:
     """Make the static host's routers match the apps that need fronting.
 
     Redeploys the static host **only when the label set actually changes** — a
@@ -216,11 +243,13 @@ async def _sync(conn) -> dict:
                               "their public hostname"}
 
     scoped_ids = []
-    for r in rows:
+    for r in rows if scope_backends else []:
         if not r["coolify_uuid"]:
             continue
         try:
-            if await _scope_backend(r["id"], r["coolify_uuid"]):
+            if await apply_backend_labels(r["id"], r["coolify_uuid"],
+                                          sleeps=bool(r["sleep_when_idle"]),
+                                          fronted=True):
                 scoped_ids.append(r["id"])
         except Exception:
             pass  # leave its public router alone; the next sync retries

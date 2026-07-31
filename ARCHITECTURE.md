@@ -292,6 +292,20 @@ ones that were running. Sleeping apps come back asleep and wake on their first
 request. `apps_get` reports the live policy in `backend.runtime.restart_policy`
 if it ever needs checking.
 
+**One write, not two.** The enrollment and the static host's marker condition
+(§9b) both live in the same label set, and both are read-modify-writes against the
+container's *live* labels. A Coolify deploy is asynchronous, so a second write
+moments after the first still reads the OLD container and silently reverts it —
+which would leave an app routed but not sleeping, or sleeping but not routed, with
+nothing to say so. `routing.apply_backend_labels` is the single place that
+computes and writes both.
+
+**Drift is repaired, not assumed away.** Because this Coolify build rejects the
+read-only flag, a regeneration can drop the enrollment while `sablier_enrolled`
+stays true in the database — the app just quietly stops sleeping. The hourly sweep
+runs `sablier.reconcile`, which compares the database's belief against the
+container's actual labels and re-applies.
+
 - **Default: every app sleeps** when idle (`apps.sleep_when_idle`, default true).
 - **`api` is hard-excluded** (`SABLIER_EXCLUDE`) — it runs the ingester,
   auto-update sweep and alert loop and must never sleep.
@@ -423,9 +437,11 @@ Verify with `CF-Cache-Status`: `DYNAMIC`/`BYPASS` on API paths, `HIT` on assets.
 
 **One key for both halves:** the backend `/refresh` trigger and the frontend
 upload both authenticate with the app's **scoped deploy key** (`PAAS_KEY`), which
-can only deploy that one app. `/refresh` was unauthenticated originally, since it
-takes no caller content; that was dropped once the platform could install the
-secret itself, making consistent auth free.
+can only deploy that one app. Because the key is that narrow, `/refresh` also
+accepts the image CI just built — and on an app's **first** deploy that image is
+what creates the Coolify application and its container. `apps_create` registers a
+bare id on purpose (only the pipeline knows what the app runs), so without this
+an app could be registered and then never deploy.
 
 ## 10. Analytics & observability
 

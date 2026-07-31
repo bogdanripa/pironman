@@ -90,19 +90,24 @@ def _workflow(app_id: str, repo_name: str) -> str:
                     ghcr.io/{GHCR_OWNER}/{repo_name}:latest
                     ghcr.io/{GHCR_OWNER}/{repo_name}:${{{{ steps.tag.outputs.value }}}}
 
-              # The box watches :latest and redeploys when the digest moves. This
-              # asks it to check now instead of waiting for the hourly sweep, and
-              # authenticates with this app's scoped deploy key (PAAS_KEY), which
-              # can only deploy this one app. A 2xx means the new container came
-              # up healthy — the platform verifies that before answering, so a
-              # rolled-back deploy fails this step instead of going green.
-              # The control plane redeploys itself often and answers 404 while it
-              # restarts, so transient codes are retried rather than believed.
+              # Tells the box what this build pushed. On the app's FIRST deploy
+              # that image is what creates its container — the app was registered
+              # as a bare id, because only this pipeline knows what it runs. After
+              # that the box watches the tag itself and this just asks it to check
+              # now rather than at the next hourly sweep. Authenticated with this
+              # app's scoped deploy key (PAAS_KEY), which can only deploy this one
+              # app. A 2xx means the new container came up healthy — the platform
+              # verifies that before answering, so a rolled-back deploy fails this
+              # step instead of going green. The control plane redeploys itself
+              # often and answers 404 while it restarts, so transient codes are
+              # retried rather than believed.
               - name: Trigger deploy on the Pi
                 run: |
                   for i in $(seq 1 10); do
                     code=$(curl -sS -o /tmp/out -w '%{{http_code}}' -X POST \\
                       -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
+                      -H "Content-Type: application/json" \\
+                      -d '{{"image": "ghcr.io/{GHCR_OWNER}/{repo_name}:latest"}}' \\
                       "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh" || echo 000)
                     case "$code" in
                       2*) cat /tmp/out; echo; exit 0 ;;
@@ -202,10 +207,9 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
     scheme, the arm64 platform flag and the redeploy call all have to match what
     this platform expects.
 
-    Secrets: a **backend** deploy needs none — CI pushes the image and calls the
-    app's unauthenticated /refresh hook. A **frontend** upload does, because it
-    sends real content to be served on the app's domain, so it authenticates with
-    that app's scoped deploy key as the PAAS_KEY repository secret.
+    Secrets: one, PAAS_KEY — the app's scoped deploy key, which authenticates
+    both halves of a deploy (the backend's /refresh call and the frontend
+    upload). It can only ever deploy this one app.
 
     Do not ask the user to create that secret by hand — set it yourself. The key
     is returned by apps_create (as `paas_key`) and re-issued by apps_deploy_key,
@@ -231,11 +235,12 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "Set it yourself with github_secret_set — apps_create returns the key as "
         "`paas_key` and apps_deploy_key re-issues one — rather than asking the "
         "user to paste it. It is scoped to this app alone, so a leaked copy can "
-        "only redeploy this app to an image that is already in the registry.",
-        "The box never takes an image from the caller: /refresh only makes it "
-        "re-check the tag it already watches, and it redeploys solely when that "
-        "tag's digest actually changes. It also sweeps hourly, so a missed or "
-        "failed /refresh call delays a deploy rather than losing it.",
+        "only deploy this one app.",
+        "The first /refresh call is what CREATES the app's container: an app is "
+        "registered as a bare id, and its pipeline reports what it built. After "
+        "that the box watches the tag itself and redeploys only when the digest "
+        "actually changes. It also sweeps hourly, so a missed or failed /refresh "
+        "call delays a deploy rather than losing it.",
         "The app must already exist here before the first workflow run (create it "
         "with apps_create). New apps have auto-update on by default; toggle it "
         "with apps_autoupdate.",

@@ -28,6 +28,10 @@ from .config import (SABLIER_URL, SABLIER_SESSION_DURATION, SABLIER_STRATEGY,
                      SABLIER_BLOCKING_TIMEOUT, SABLIER_EXCLUDE, STATIC_HOST_APP)
 
 
+class NoContainer(RuntimeError):
+    """The app has never deployed, so there are no base labels to build on."""
+
+
 def excluded(app_id: str) -> bool:
     """Apps that must never sleep. The static host is hard-coded rather than left
     to SABLIER_EXCLUDE: it is the thing that wakes everything else, so if it ever
@@ -105,31 +109,10 @@ def enrolled_labels(labels: dict[str, str], app_id: str) -> dict[str, str]:
     return d
 
 
-def _as_list(d: dict[str, str]) -> list[str]:
-    return [f"{k}={v}" for k, v in d.items()]
-
-
-async def enroll(uuid: str, app_id: str) -> dict:
-    """Write the app's Sablier enrollment into Coolify (read-only labels) and
-    redeploy so it takes effect. Raises if the app has no running container to
-    read the base labels from (deploy it once first).
-
-    Returns what the label write achieved, since it depends on a Coolify field
-    name this build may not accept — a caller that gets no report back cannot
-    tell a working enrollment from a half-applied one.
-
-    Nothing here touches the restart policy: Coolify already creates app
-    containers with `unless-stopped`, so a container Sablier stopped stays stopped
-    across a reboot without any help from us (verified on the box).
-    """
-    labels = await _current_labels(uuid)
-    if not labels:
-        raise RuntimeError(
-            "no running container to read labels from — deploy the app once first")
-    lab = await coolify.set_custom_labels(
-        uuid, _as_list(enrolled_labels(labels, app_id)), app_id=app_id)
-    await coolify.deploy(uuid)
-    return {"labels_readonly": lab.get("readonly", False)}
+# The enrollment and the static host's routing marker are written together, in
+# routing.apply_backend_labels — see the note there on why they cannot be two
+# separate read-modify-writes. This module supplies the two pure transforms.
+stripped = _strip
 
 
 def is_enrolled(labels: dict[str, str], app_id: str) -> bool:
@@ -154,8 +137,9 @@ async def reconcile() -> list[dict]:
     out: list[dict] = []
     async with pool().acquire() as c:
         apps = await c.fetch(
-            "SELECT id, coolify_uuid FROM apps "
-            "WHERE sleep_when_idle = true AND coolify_uuid IS NOT NULL ORDER BY id")
+            "SELECT id, coolify_uuid, has_frontend, redirects, sleep_when_idle "
+            "FROM apps WHERE sleep_when_idle = true AND coolify_uuid IS NOT NULL "
+            "ORDER BY id")
         for app in apps:
             if excluded(app["id"]):
                 continue
@@ -163,7 +147,10 @@ async def reconcile() -> list[dict]:
                 labels = await _current_labels(app["coolify_uuid"])
                 if not labels or is_enrolled(labels, app["id"]):
                     continue
-                await enroll(app["coolify_uuid"], app["id"])
+                from . import routing  # lazy: routing imports this module
+                await routing.apply_backend_labels(
+                    app["id"], app["coolify_uuid"], sleeps=True,
+                    fronted=routing.is_fronted(app))
                 await c.execute(
                     "UPDATE apps SET sablier_enrolled = true WHERE id = $1",
                     app["id"])
@@ -173,12 +160,3 @@ async def reconcile() -> list[dict]:
     return out
 
 
-async def unenroll(uuid: str, app_id: str) -> None:
-    """Remove the app's Sablier enrollment and redeploy. Leaves the labels
-    read-only (Coolify keeps managing the rest verbatim)."""
-    labels = await _current_labels(uuid)
-    if not labels:
-        return
-    await coolify.set_custom_labels(uuid, _as_list(_strip(labels, app_id)),
-                                   app_id=app_id)
-    await coolify.deploy(uuid)

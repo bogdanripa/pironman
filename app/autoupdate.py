@@ -5,20 +5,19 @@ box watches the registry itself. Two entry points share one routine,
 check_and_update:
 
   - an hourly sweep over every app that opts in (watch_tag set), and
-  - an unauthenticated POST /apps/<id>/refresh the CI workflow curls right after
+  - an authenticated POST /apps/<id>/refresh the CI workflow curls right after
     it pushes a new image, for an immediate deploy instead of waiting the hour.
 
 Digest resolution goes through the host Docker daemon (the mounted socket)
 rather than talking to the registry directly, so it borrows the daemon's
 existing pull credentials — nothing new to configure. A `docker pull` on an
 unchanged tag is a cheap no-op, so both paths are idempotent: they redeploy only
-when the tag's digest actually moved, which is what makes the unauthenticated
-/refresh safe to expose (a caller cannot inject an image, only trigger a check).
+when the tag's digest actually moved.
 """
 import asyncio
 
 from . import coolify, envs
-from .config import GHCR_USER, GHCR_TOKEN, SABLIER_AUTO_ENROLL
+from .config import GHCR_USER, GHCR_TOKEN, SABLIER_AUTO_ENROLL, app_fqdn
 from .db import pool
 
 _ghcr_logged_in = False
@@ -174,6 +173,84 @@ async def verify_deploy(uuid: str, before: str | None, timeout: int = 150) -> di
     }
 
 
+class NoSuchApp(LookupError):
+    pass
+
+
+async def apply_image(app_id: str, image: str) -> dict:
+    """Point an app at `image` and redeploy, creating its container first if it
+    does not have one yet.
+
+    This is how an app gets a backend at all. Registration (apps_create) writes
+    only an id — it deliberately does not ask what the app will run, because only
+    the app's pipeline knows that — so the first CI deploy is what turns the
+    registration into a container. Also repoints auto-update at the new tag and
+    clears the recorded digest, so the app tracks the right image from here on.
+    """
+    async with pool().acquire() as c:
+        row = await c.fetchrow(
+            "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
+            "watch_tag, health_path FROM apps WHERE id = $1", app_id)
+        if not row:
+            raise NoSuchApp(app_id)
+
+        # No Coolify application yet: create one (and its healthcheck) before
+        # pointing it anywhere. sleep_when_idle turns on here rather than at
+        # registration — until now there was no container for it to describe.
+        gained_backend = not row["coolify_uuid"]
+        if gained_backend:
+            uuid = await coolify.create_app(image, app_fqdn(app_id), app_id=app_id)
+            try:
+                await coolify.set_healthcheck(uuid, row["health_path"] or "/")
+            except Exception:
+                pass  # a missing healthcheck must not strand a created app
+            await c.execute(
+                "UPDATE apps SET coolify_uuid = $1, sleep_when_idle = true "
+                "WHERE id = $2", uuid, app_id)
+            row = await c.fetchrow(
+                "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
+                "watch_tag, health_path FROM apps WHERE id = $1", app_id)
+
+        before = await _container_started_at(row["coolify_uuid"])
+        await coolify.set_image(row["coolify_uuid"], image)
+        await envs.sync_env(c, row["coolify_uuid"], app_id, row["db_engine"],
+                            row["db_user"], row["db_password"], row["db_name"])
+        await coolify.deploy(row["coolify_uuid"])
+        # Keep auto-update following the new tag (only if it was already on) — and
+        # turn it on for a backend that has just been added.
+        watch = (tag_of(image)
+                 if (gained_backend or row["watch_tag"] is not None) else None)
+        await c.execute(
+            "UPDATE apps SET image = $1, watch_tag = $2, deployed_digest = NULL "
+            "WHERE id = $3", image, watch, app_id)
+
+    return {"id": app_id, "image": image, "watch_tag": watch,
+            "created_container": gained_backend,
+            "coolify_uuid": row["coolify_uuid"], "started_before": before}
+
+
+async def settle(app_id: str, uuid: str, before: str | None) -> dict:
+    """Confirm a deploy landed, then finish the app's setup: record the running
+    digest, enrol it in scale-to-zero and put the static host in front of it.
+
+    Enrolment has to come after the container exists — its labels are read off the
+    running container — which is why this is a step of its own rather than part of
+    apply_image."""
+    result = await verify_deploy(uuid, before)
+    if not result.get("verified"):
+        return result
+    async with pool().acquire() as c:
+        app = await c.fetchrow(f"SELECT {APP_COLS} FROM apps WHERE id = $1", app_id)
+        if app and app["image"]:
+            digest = await remote_digest(app["image"])
+            if digest:
+                await c.execute(
+                    "UPDATE apps SET deployed_digest = $1 WHERE id = $2",
+                    digest, app_id)
+            await _maybe_enroll_sablier(c, app)
+    return result
+
+
 async def check_and_update(conn, app, verify: bool = False) -> dict:
     """Pull the app's watched tag; if its digest differs from what is running,
     redeploy (re-injecting env like a normal deploy) and record the new digest.
@@ -209,19 +286,20 @@ async def _maybe_enroll_sablier(conn, app) -> None:
     verified on one app. Best-effort: a failure just leaves it for next time."""
     if not SABLIER_AUTO_ENROLL or app["sablier_enrolled"] or not app["sleep_when_idle"]:
         return
-    from . import sablier  # lazy: sablier imports this module
+    from . import routing, sablier  # lazy: both import this module
     if sablier.excluded(app["id"]):
         return
     try:
-        await sablier.enroll(app["coolify_uuid"], app["id"])
+        # The static host's router comes FIRST. From the moment this app is
+        # enrolled it can be stopped, and Traefik drops a stopped container's
+        # router — so without something awake holding its hostname there would be
+        # nothing left to wake it. scope_backends=False because the enrollment
+        # write below covers this app's own labels in one pass.
+        await routing.sync_frontend_routes(conn, scope_backends=False)
+        await routing.apply_backend_labels(
+            app["id"], app["coolify_uuid"], sleeps=True, fronted=True)
         await conn.execute(
             "UPDATE apps SET sablier_enrolled = true WHERE id = $1", app["id"])
-        # It can sleep from now on, so it needs the static host in front of it
-        # before it does: Traefik drops a stopped container's router, and nothing
-        # would be left to wake it. Once per app — this branch is guarded by
-        # sablier_enrolled.
-        from . import routing
-        await routing.sync_frontend_routes(conn)
     except Exception:
         pass  # container may not be up yet; a later sweep retries
 

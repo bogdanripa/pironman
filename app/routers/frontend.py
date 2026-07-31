@@ -1,11 +1,9 @@
 """Frontend deploys and routing configuration.
 
 The upload endpoint is what an app's CI calls after building its static bundle.
-Unlike the backend's /refresh hook it CANNOT be unauthenticated: /refresh takes no
-caller content (it only makes the box pull an image the registry already
-controls), whereas a zip is caller-supplied content that gets served on the app's
-own domain. So it takes the app's scoped deploy key — the same PAAS_KEY an app
-already mints, which can only touch that one app.
+It takes the app's scoped deploy key — the same PAAS_KEY the backend's /refresh
+hook uses, which can only touch that one app. Both halves of a deploy are
+authenticated with it, so an app's pipeline needs exactly one secret.
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -51,7 +49,7 @@ async def deploy_frontend(app_id: str, request: Request):
     The bundle is unpacked and swapped in atomically, so the site is never served
     half-written and nothing restarts — a frontend deploy takes about a second.
     This is the call an app's CI makes after `npm run build`; it needs the app's
-    scoped deploy key, unlike the backend's unauthenticated /refresh hook.
+    scoped deploy key — the same one the backend's /refresh hook uses.
     """
     # Serialised: this can rewrite routing labels and redeploy, and an app's CI
     # ships its frontend and its backend at the same time.
