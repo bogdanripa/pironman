@@ -21,12 +21,15 @@ windows never double-count.
 """
 import hashlib
 import json
+import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from . import autoupdate
 from .config import ANALYTICS_PROXY, ANALYTICS_SALT, DOMAIN_SUFFIX
 from .db import pool
+
+_log = logging.getLogger("pironman.analytics")
 
 _CURSOR_KEY = "accesslog_cursor"
 
@@ -162,6 +165,11 @@ async def ingest_once() -> dict:
         lat: dict[tuple[str, str, int], int] = {}  # (app, day, bucket) -> count
         agents: dict[tuple[str, str, str], list] = {}  # (app, day, ua) -> [hits, bot]
         last: dict[str, datetime] = {}  # app -> newest request time in this batch
+        # Fallback for a line whose timestamp will not parse. "Last accessed" is
+        # answering "has anyone used this lately", and the ingest pass is at most
+        # two minutes behind the request — so being approximately right beats
+        # recording nothing, which is what an unparsed stamp used to mean.
+        now = datetime.now(timezone.utc)
         newest = cursor or ""
         seen = 0
         for line in raw.splitlines():
@@ -196,8 +204,8 @@ async def ingest_once() -> dict:
             ar = agents.setdefault(ak, [0, rec["is_bot"]])
             ar[0] += 1
 
-            at = rec["at"]
-            if at and (rec["app_id"] not in last or at > last[rec["app_id"]]):
+            at = rec["at"] or now
+            if rec["app_id"] not in last or at > last[rec["app_id"]]:
                 last[rec["app_id"]] = at
 
         if visits:
@@ -237,11 +245,20 @@ async def ingest_once() -> dict:
                 [(a, d, ua, v[1], v[0]) for (a, d, ua), v in agents.items()])
             # GREATEST, not assignment: a pass could otherwise move an app's
             # last-seen backwards if its lines arrive out of order.
-            await conn.executemany(
-                "INSERT INTO analytics_last_seen (app_id, last_seen) "
-                "VALUES ($1, $2) ON CONFLICT (app_id) DO UPDATE SET last_seen = "
-                "GREATEST(analytics_last_seen.last_seen, EXCLUDED.last_seen)",
-                list(last.items()))
+            #
+            # Isolated on purpose. The rollups above are already committed by the
+            # time this runs, and the cursor advances after it — so letting a
+            # failure here escape would leave the cursor unmoved and every later
+            # pass would re-count the same window, inflating every number on the
+            # dashboard. This one column is not worth that.
+            try:
+                await conn.executemany(
+                    "INSERT INTO analytics_last_seen (app_id, last_seen) "
+                    "VALUES ($1, $2) ON CONFLICT (app_id) DO UPDATE SET last_seen = "
+                    "GREATEST(analytics_last_seen.last_seen, EXCLUDED.last_seen)",
+                    list(last.items()))
+            except Exception:
+                _log.exception("could not record last-accessed times")
 
         if newest and newest != cursor:
             await conn.execute(

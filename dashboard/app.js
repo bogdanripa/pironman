@@ -134,18 +134,35 @@ function fmtMb(v) {
   return v >= 1024 ? (v / 1024).toFixed(2) + ' GB' : v.toLocaleString() + ' MB';
 }
 // "how long ago", which is the question being asked — an absolute timestamp
-// would have to be subtracted from now by eye. The exact time is the cell title.
+// would have to be subtracted from now by eye. The exact local time is the cell
+// title, so the precise answer is one hover away when it matters.
 function ago(iso) {
   if (!iso) return '<span class="muted">never</span>';
   const s = (Date.now() - Date.parse(iso)) / 1000;
   if (!isFinite(s)) return '<span class="muted">—</span>';
-  if (s < 90) return 'just now';
-  const units = [[60, 'm'], [3600, 'h'], [86400, 'd']];
-  for (const [div, suffix] of units) {
-    const next = div * (suffix === 'm' ? 60 : suffix === 'h' ? 24 : Infinity);
-    if (s < next) return Math.round(s / div) + suffix + ' ago';
-  }
-  return Math.round(s / 86400) + 'd ago';
+  if (s < 0) return 'just now';                 // clock skew between box and browser
+  const m = s / 60, h = s / 3600, d = s / 86400;
+  if (s < 45) return 'just now';
+  if (s < 90) return 'a minute ago';
+  if (m < 45) return Math.round(m) + ' minutes ago';
+  if (m < 90) return 'an hour ago';
+  if (h < 22) return Math.round(h) + ' hours ago';
+  if (h < 36) return 'yesterday';
+  if (d < 6.5) return Math.round(d) + ' days ago';
+  if (d < 11) return 'last week';
+  if (d < 31) return Math.round(d / 7) + ' weeks ago';
+  if (d < 45) return 'last month';
+  if (d < 345) return Math.round(d / 30) + ' months ago';
+  if (d < 548) return 'last year';
+  return Math.round(d / 365) + ' years ago';
+}
+
+// The exact moment, in the reader's own timezone — the stored value is UTC and
+// working that out by eye is exactly what the relative label exists to avoid.
+function exact(iso) {
+  if (!iso) return 'no request has ever been recorded for this app';
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString();
 }
 function renderResources(data) {
   const apps = data.apps || [], h = data.host || {};
@@ -196,7 +213,7 @@ function renderResources(data) {
       `<td class="n">${(t.requests || 0).toLocaleString()}</td>` +
       `<td class="n ${errCls}">${(t.error_pct || 0)}%</td>` +
       `<td class="n">${latency(t)}</td>` +
-      `<td class="n" title="${esc(a.last_seen || '')}">${ago(a.last_seen)}</td>` +
+      `<td class="n" title="${esc(exact(a.last_seen))}">${ago(a.last_seen)}</td>` +
       '</tr>';
   }).join('');
   $('resources').innerHTML =

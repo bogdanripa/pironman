@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import re
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 from fastapi import FastAPI
@@ -11,6 +13,46 @@ from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
                       redirects as redirects_router,
                       analytics as analytics_router, stats,
                       alerts as alerts_router, frontend)
+
+
+log = logging.getLogger("pironman")
+
+
+def _swallow(what: str) -> None:
+    """Report a background failure and carry on.
+
+    The loops must not die — a bad analytics pass or a failed sweep cannot be
+    allowed to take the control plane with it — but swallowing the exception
+    *silently* is how a broken ingester ran for hours looking healthy. uvicorn
+    captures this, so `apps_logs api` shows it.
+    """
+    log.exception("background task failed: %s", what)
+
+
+class RedactKeyFilter(logging.Filter):
+    """Keep the connector's `?key=` out of the access log.
+
+    claude.ai connectors cannot send an Authorization header, so the key rides in
+    the query string (see PromoteKeyMiddleware) — and uvicorn logs the full path.
+    That put a working **admin** key in plaintext in this container's logs, where
+    `apps_logs api` hands it to anyone who asks, including the model itself.
+    Redacting at the log record is the fix that cannot be forgotten: it covers
+    every path, not just the ones someone remembered to sanitise.
+    """
+
+    _KEY = re.compile(r"([?&]key=)[^&\s\"\']+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._KEY.sub(r"\1<redacted>", a) if isinstance(a, str) else a
+                for a in record.args)
+        if isinstance(record.msg, str):
+            record.msg = self._KEY.sub(r"\1<redacted>", record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(RedactKeyFilter())
 
 
 class PromoteKeyMiddleware:
@@ -213,7 +255,7 @@ async def _sync_routes(reason: str) -> None:
         async with pool().acquire() as c:
             await routing.sync_frontend_routes(c)
     except Exception:
-        pass  # routing drift must never take the control plane down
+        _swallow(f"route sync ({reason})")  # drift must never take the box down
 
 
 async def _autoupdate_loop():
@@ -225,7 +267,7 @@ async def _autoupdate_loop():
         try:
             await autoupdate.check_all()
         except Exception:
-            pass  # a bad sweep must never take the control plane down
+            _swallow("auto-update sweep")
         # Same cadence: repair anything a Coolify label regeneration undid — the
         # static host's per-app routers, and each app's Sablier enrollment. Both
         # fail silently (a hostname resolves nowhere; an app quietly stops
@@ -234,7 +276,7 @@ async def _autoupdate_loop():
         try:
             await sablier.reconcile()
         except Exception:
-            pass
+            _swallow("sablier reconcile")
 
 
 async def _analytics_loop():
@@ -245,7 +287,7 @@ async def _analytics_loop():
         try:
             await analytics.ingest_once()
         except Exception:
-            pass
+            _swallow("analytics ingest")
         await asyncio.sleep(120)
 
 
@@ -258,7 +300,7 @@ async def _alerts_loop():
         try:
             await alerts.check_once()
         except Exception:
-            pass
+            _swallow("alert check")
 
 
 @asynccontextmanager
