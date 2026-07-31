@@ -5,7 +5,6 @@ else it does, so they work whether the app is a static site, a backend, or both.
 An app with redirects but no frontend is routed through the static host too,
 which is why setting a rule can move where its hostname points.
 """
-import json
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -133,7 +132,11 @@ async def set_redirects(app_id: str, body: Redirects):
     async with pool().acquire() as c:
         if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
             raise HTTPException(404, "no such app")
-        await c.execute("UPDATE apps SET redirects = $1::jsonb WHERE id = $2",
-                        json.dumps(rules), app_id)
+        # Pass the list itself: the pool registers a jsonb codec, so asyncpg
+        # encodes it. json.dumps() here would encode it twice and store the JSON
+        # *string* "[]" rather than an empty array — which reads back as a string
+        # and iterates into ['[', ']'].
+        await c.execute("UPDATE apps SET redirects = $1 WHERE id = $2",
+                        rules, app_id)
         applied = await _apply(c, app_id)
     return {"id": app_id, "count": len(rules), **applied}

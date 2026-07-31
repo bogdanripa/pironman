@@ -58,6 +58,12 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS backend_routes text[] NOT NU
 -- order decides which rule wins.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS redirects jsonb NOT NULL DEFAULT '[]'::jsonb;
 
+-- Repair rows written before the jsonb codec landed: a double-encoded value is
+-- stored as a JSON *string* ("[]") rather than an array, which reads back as
+-- text and iterates into ['[', ']']. jsonb_typeof identifies them precisely.
+UPDATE apps SET redirects = redirects #>> '{}'
+ WHERE jsonb_typeof(redirects) = 'string';
+
 -- The path the container healthcheck requests. Recorded at create time and
 -- applied when the container is first created, which happens on the app's first
 -- CI deploy rather than at creation — the platform does not know an app's image
