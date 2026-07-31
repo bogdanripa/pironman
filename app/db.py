@@ -50,6 +50,13 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS sablier_enrolled boolean NOT
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS has_frontend boolean NOT NULL DEFAULT false;
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS backend_routes text[] NOT NULL DEFAULT '{}';
 
+-- A frontend-only app has no image and no Coolify application, but the apps
+-- table predates this codebase and declared both NOT NULL, so creating one
+-- failed with a NotNullViolation. Relax them (idempotent — re-running on an
+-- already-nullable column is a no-op).
+ALTER TABLE IF EXISTS apps ALTER COLUMN image DROP NOT NULL;
+ALTER TABLE IF EXISTS apps ALTER COLUMN coolify_uuid DROP NOT NULL;
+
 -- Analytics rollups from the Traefik access log (see app/analytics.py). visitor
 -- is a cookieless hash of salt+IP+UA (person, not per-app), so distinct visitor
 -- counts unique people across apps and filtering by app_id counts one app.
