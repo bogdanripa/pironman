@@ -400,12 +400,14 @@ flows through: the Traefik access log** — nothing is installed per app.
 - Rollups in `_paas`: `analytics_visits` (per app/visitor/day, with an `is_bot`
   flag), `analytics_first_seen` (cohorts), `analytics_perf` (requests / 4xx /
   5xx / summed latency), `analytics_latency` (additive histogram → p50/p95
-  without storing raw samples), `analytics_agents` (top raw user-agent strings).
+  without storing raw samples), `analytics_agents` (top raw user-agent strings),
+  `analytics_last_seen` (each app's last request, to the second — the other
+  rollups are day-keyed and cannot say how long an app has been idle).
 - **Read-only MCP tools:** `analytics_overview` (uniques, hits, DAU/WAU/MAU,
   humans-vs-bots, per-app breakdown), `analytics_timeseries`, `analytics_cohorts`,
   `analytics_agents`, `analytics_recent` (live tail of raw requests), and
   `apps_stats` (per-app running state, live CPU/RAM, disk, DB size, error rate,
-  p50/p95, plus host CPU/RAM/disk headroom).
+  p50/p95, last accessed, plus host CPU/RAM/disk headroom).
 - A human dashboard runs as its own **frontend-only app** at
   `dashboard-coolify.bogdanripa.com` (`dashboard/` in this repo) — the platform
   dogfooding its own frontend feature: no image, no container, served by the

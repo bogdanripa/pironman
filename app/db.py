@@ -133,6 +133,16 @@ CREATE TABLE IF NOT EXISTS analytics_perf (
     PRIMARY KEY (app_id, day)
 );
 
+-- When each app was last requested, to the second. The rollups above are keyed
+-- by day, which cannot answer "is anyone still using this?" for an app that was
+-- last touched an hour ago. Kept as its own tiny table rather than a column on
+-- apps: the ingester derives it from hostnames in the access log and so knows
+-- about traffic to apps this control plane never created.
+CREATE TABLE IF NOT EXISTS analytics_last_seen (
+    app_id    text PRIMARY KEY,
+    last_seen timestamptz NOT NULL
+);
+
 -- Latency histogram: one row per (app, day, bucket), counting requests whose
 -- response time fell in that bucket (bucket edges in app/analytics.py). Counts
 -- are additive, so p50/p95 can be estimated over any window without storing raw

@@ -133,6 +133,20 @@ function fmtMb(v) {
   if (v == null) return '<span class="muted">—</span>';
   return v >= 1024 ? (v / 1024).toFixed(2) + ' GB' : v.toLocaleString() + ' MB';
 }
+// "how long ago", which is the question being asked — an absolute timestamp
+// would have to be subtracted from now by eye. The exact time is the cell title.
+function ago(iso) {
+  if (!iso) return '<span class="muted">never</span>';
+  const s = (Date.now() - Date.parse(iso)) / 1000;
+  if (!isFinite(s)) return '<span class="muted">—</span>';
+  if (s < 90) return 'just now';
+  const units = [[60, 'm'], [3600, 'h'], [86400, 'd']];
+  for (const [div, suffix] of units) {
+    const next = div * (suffix === 'm' ? 60 : suffix === 'h' ? 24 : Infinity);
+    if (s < next) return Math.round(s / div) + suffix + ' ago';
+  }
+  return Math.round(s / 86400) + 'd ago';
+}
 function renderResources(data) {
   const apps = data.apps || [], h = data.host || {};
   if (h.mem_total_mb) {
@@ -143,12 +157,20 @@ function renderResources(data) {
     $('hostline').textContent = line;
   }
   const win = data.traffic_window_days;
-  const ms = v => v != null ? v + '' : '<span class="muted">—</span>';
+  // p50 and p95 are read together — one is only meaningful next to the other —
+  // so they share a cell, as do a database and its size.
+  const latency = t => (t.p50_ms == null && t.p95_ms == null)
+    ? '<span class="muted">—</span>'
+    : `${t.p50_ms ?? '–'} / ${t.p95_ms ?? '–'}`;
+  const database = a => a.db_engine
+    ? esc(a.db_engine) + (a.db_size_mb != null
+        ? ` <span class="muted">${fmtMb(a.db_size_mb)}</span>` : '')
+    : '<span class="muted">—</span>';
   let head = '<table><tr><th>App</th><th>Parts</th><th>Status</th>' +
     '<th class="n">CPU</th><th class="n">RAM</th><th class="n">Disk</th>' +
-    '<th>Database</th><th class="n">DB size</th>' +
+    '<th>Database</th>' +
     `<th class="n">Req ${win}d</th><th class="n">Err %</th>` +
-    '<th class="n">p50 ms</th><th class="n">p95 ms</th></tr>';
+    '<th class="n">p50/p95 ms</th><th class="n">Last accessed</th></tr>';
   const rows = apps.map(a => {
     const t = a.traffic || {};
     const errCls = (t.server_error_pct > 0) ? 'bad' : (t.error_pct > 5 ? 'warn' : '');
@@ -170,17 +192,16 @@ function renderResources(data) {
       `<td class="n">${a.cpu_pct != null ? a.cpu_pct + '%' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${a.mem_mb != null ? a.mem_mb.toLocaleString() + ' MB' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${fmtMb(a.disk_rw_mb)}</td>` +
-      `<td>${a.db_engine ? esc(a.db_engine) : '<span class="muted">—</span>'}</td>` +
-      `<td class="n">${a.db_engine ? fmtMb(a.db_size_mb) : '<span class="muted">—</span>'}</td>` +
+      `<td>${database(a)}</td>` +
       `<td class="n">${(t.requests || 0).toLocaleString()}</td>` +
       `<td class="n ${errCls}">${(t.error_pct || 0)}%</td>` +
-      `<td class="n">${ms(t.p50_ms)}</td>` +
-      `<td class="n">${ms(t.p95_ms)}</td>` +
+      `<td class="n">${latency(t)}</td>` +
+      `<td class="n" title="${esc(a.last_seen || '')}">${ago(a.last_seen)}</td>` +
       '</tr>';
   }).join('');
   $('resources').innerHTML =
     '<div style="overflow-x:auto">' + head +
-    (apps.length ? rows : '<tr><td colspan="12" class="muted">No apps.</td></tr>') +
+    (apps.length ? rows : '<tr><td colspan="11" class="muted">No apps.</td></tr>') +
     '</table></div>';
 }
 function renderBots(byAgent) {

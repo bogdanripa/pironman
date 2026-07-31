@@ -22,7 +22,7 @@ windows never double-count.
 import hashlib
 import json
 import re
-from datetime import date
+from datetime import date, datetime
 
 from . import autoupdate
 from .config import ANALYTICS_PROXY, ANALYTICS_SALT, DOMAIN_SUFFIX
@@ -58,6 +58,19 @@ _BOT_RE = re.compile(
 
 def _is_bot(ua: str) -> bool:
     return (not ua) or bool(_BOT_RE.search(ua))
+
+
+# Traefik stamps StartUTC with nanosecond precision, which fromisoformat rejects;
+# trim the fraction to the six digits a datetime can hold.
+_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
+def _moment(start: str) -> datetime | None:
+    """An RFC3339 StartUTC as an aware datetime, or None if it will not parse."""
+    try:
+        return datetime.fromisoformat(_FRACTION.sub(r"\1", start).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _visitor(ip: str, ua: str) -> str:
@@ -107,7 +120,7 @@ def _parse_line(line: str) -> dict | None:
     status = e.get("DownstreamStatus")
     dur = e.get("Duration")  # Traefik reports request time in nanoseconds
     return {"app_id": app_id, "visitor": _visitor(ip, ua),
-            "day": day, "start": start, "is_bot": _is_bot(ua),
+            "day": day, "start": start, "at": _moment(start), "is_bot": _is_bot(ua),
             "ua": (ua or "(none)")[:512],  # stored for the top-agents breakdown
             "status": int(status) if isinstance(status, (int, float)) else None,
             "dur_ms": (dur / 1e6) if isinstance(dur, (int, float)) else None}
@@ -148,6 +161,7 @@ async def ingest_once() -> dict:
         perf: dict[tuple[str, str], list] = {}  # (app, day) -> [req, 4xx, 5xx, ms]
         lat: dict[tuple[str, str, int], int] = {}  # (app, day, bucket) -> count
         agents: dict[tuple[str, str, str], list] = {}  # (app, day, ua) -> [hits, bot]
+        last: dict[str, datetime] = {}  # app -> newest request time in this batch
         newest = cursor or ""
         seen = 0
         for line in raw.splitlines():
@@ -181,6 +195,10 @@ async def ingest_once() -> dict:
             ak = (rec["app_id"], rec["day"], rec["ua"])
             ar = agents.setdefault(ak, [0, rec["is_bot"]])
             ar[0] += 1
+
+            at = rec["at"]
+            if at and (rec["app_id"] not in last or at > last[rec["app_id"]]):
+                last[rec["app_id"]] = at
 
         if visits:
             await conn.executemany(
@@ -217,6 +235,13 @@ async def ingest_once() -> dict:
                 "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (app_id, day, ua) "
                 "DO UPDATE SET hits = analytics_agents.hits + EXCLUDED.hits",
                 [(a, d, ua, v[1], v[0]) for (a, d, ua), v in agents.items()])
+            # GREATEST, not assignment: a pass could otherwise move an app's
+            # last-seen backwards if its lines arrive out of order.
+            await conn.executemany(
+                "INSERT INTO analytics_last_seen (app_id, last_seen) "
+                "VALUES ($1, $2) ON CONFLICT (app_id) DO UPDATE SET last_seen = "
+                "GREATEST(analytics_last_seen.last_seen, EXCLUDED.last_seen)",
+                list(last.items()))
 
         if newest and newest != cursor:
             await conn.execute(

@@ -144,6 +144,14 @@ async def _latency_map(conn, days: int) -> dict[str, dict]:
             for app, h in hist.items()}
 
 
+async def _last_seen_map(conn) -> dict[str, str]:
+    """app_id -> ISO timestamp of its most recent request. Not windowed like the
+    rollups: an app nobody has touched in months is exactly the one whose last
+    access is worth knowing."""
+    rows = await conn.fetch("SELECT app_id, last_seen FROM analytics_last_seen")
+    return {r["app_id"]: r["last_seen"].isoformat() for r in rows if r["last_seen"]}
+
+
 async def _perf_map(conn, days: int) -> dict[str, dict]:
     rows = await conn.fetch(
         "SELECT app_id, SUM(requests) req, SUM(err_client) ec, "
@@ -205,6 +213,7 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
             "has_frontend, sleep_when_idle FROM apps ORDER BY id")
         perf = await _perf_map(conn, perf_days)
         latency = await _latency_map(conn, perf_days)
+        last_seen = await _last_seen_map(conn)
     for aid, lat in latency.items():
         if aid in perf:
             perf[aid].update(lat)
@@ -251,6 +260,9 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
             "image_mb": d.get("image_mb"),
             "db_engine": app["db_engine"],
             "db_size_mb": await db_mb(app),
+            # Null means "never seen in the access log" — a brand-new app, or one
+            # that has had no traffic since ingestion started.
+            "last_seen": last_seen.get(app["id"]),
             "traffic": perf.get(app["id"], {
                 "requests": 0, "error_pct": 0, "server_error_pct": 0,
                 "avg_ms": None, "p50_ms": None, "p95_ms": None}),

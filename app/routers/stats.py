@@ -25,6 +25,8 @@ async def apps_stats(
     - **cpu_pct / mem_mb / mem_pct** — sampled live from `docker stats` (cpu_pct
       is share of one core, so >100% means multiple cores).
     - **db_size_mb** — on-disk size of the app's database, or null if it has none.
+    - **last_seen** — when the app was last requested (any traffic, all time), or
+      null if it has never been seen in the access log.
     - **traffic** — requests, error_pct (4xx+5xx), server_error_pct (5xx) and
       avg_ms over the last `traffic_days`, from the access-log rollup.
 

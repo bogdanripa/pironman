@@ -368,15 +368,18 @@ bot flag), `analytics_recent` (live tail of recent HTTP requests). A human-facin
 dashboard of all of it runs as its own frontend-only app — see below.
 
 The ingester also fills request-health rollups (`analytics_perf`, per-app 4xx/5xx
-and summed latency) and a latency histogram (`analytics_latency`) from the same
-log, which feed the resource view below.
+and summed latency), a latency histogram (`analytics_latency`) and each app's
+last request time (`analytics_last_seen`, to the second — the day-keyed rollups
+cannot answer "is anyone still using this?") from the same log, which feed the
+resource view below.
 
 ### Live resources (`apps_stats`)
 
 `apps_stats` returns, per app in one call: running state, live CPU/RAM (from a
 single `docker stats`), writable-layer disk, database size (Postgres
-`pg_database_size` / Mongo `storageSize` via `docker exec`), and 7-day request
-health (volume, error rate, p50/p95 latency). It also returns host totals — CPU
+`pg_database_size` / Mongo `storageSize` via `docker exec`), 7-day request
+health (volume, error rate, p50/p95 latency), and when it was **last accessed**
+(all-time, not windowed). It also returns host totals — CPU
 count, RAM, and disk used/free — for headroom. Same numbers power the dashboard's
 Resources panel.
 
