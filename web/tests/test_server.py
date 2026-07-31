@@ -75,6 +75,13 @@ async def route(request: Request, p: str = ""):
                     yield f"data: {i}\n\n".encode()
                     await asyncio.sleep(0.4)
             return StreamingResponse(gen(), media_type="text/event-stream")
+        if request.url.path == "/gzipped":
+            # What Traefik's gzip middleware does to any response over ~1KB.
+            import gzip as _gzip
+            from fastapi.responses import Response as _Resp
+            page = ("<html><body>" + "CONSENT PAGE " * 200 + "</body></html>").encode()
+            return _Resp(_gzip.compress(page), media_type="text/html",
+                         headers={"content-encoding": "gzip"})
         if request.url.path.startswith("/api/"):
             return JSONResponse({"backend": True, "path": request.url.path})
         return JSONResponse({"error": "not_found"}, status_code=404)
@@ -172,6 +179,16 @@ async def main():
         check("write to a dead backend is a 502 too",
               r.status_code == 502, r.status_code)
         STATE["sablier_ok"] = True
+
+        print("\n[a compressed backend response]")
+        STATE["up"] = True
+        r = await c.get(f"http://127.0.0.1:{WEB_PORT}/gzipped",
+                        headers={**H, "Accept-Encoding": "gzip"})
+        check("a gzipped page decodes rather than arriving as mojibake",
+              "CONSENT PAGE" in r.text, r.text[:60])
+        check("content-encoding is passed through, not silently dropped",
+              r.headers.get("content-encoding") == "gzip",
+              r.headers.get("content-encoding"))
 
         print("\n[SSE streaming, as the MCP transport uses]")
         STATE["up"] = True

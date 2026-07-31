@@ -141,6 +141,10 @@ async def _send(request: Request, aid: str):
     headers = {k: v for k, v in request.headers.items()
                if k.lower() != "content-length"}
     headers[BACKEND_HEADER] = BACKEND_TOKEN
+    # httpx would otherwise advertise gzip on its own behalf, and the response is
+    # passed through still encoded — so a caller that never asked for compression
+    # would be handed a compressed body. Ask for exactly what the caller asked for.
+    headers.setdefault("accept-encoding", "identity")
 
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, read=None), follow_redirects=False)
@@ -162,9 +166,17 @@ def _stream(client: httpx.AsyncClient, r: httpx.Response) -> StreamingResponse:
     and a large download is held in memory before a byte reaches the client.
     """
     out = dict(r.headers)
-    # Hop-by-hop headers describe the backend connection, not this one. Leaving
-    # content-length in place would contradict a streamed body.
-    for h in ("content-encoding", "content-length", "transfer-encoding", "connection"):
+    # Hop-by-hop headers describe the backend connection, not this one, and
+    # content-length would contradict a streamed body.
+    #
+    # content-encoding is deliberately NOT dropped. The body is forwarded raw,
+    # exactly as it arrived, and Traefik's gzip middleware sits on the backend's
+    # router — so removing the header while still sending compressed bytes tells
+    # the browser to render a gzip stream as text. That is what an OAuth consent
+    # page looked like: a screenful of mojibake. Small responses were unaffected
+    # (Traefik only compresses above ~1KB), which is why JSON endpoints and
+    # healthchecks looked fine.
+    for h in ("content-length", "transfer-encoding", "connection"):
         out.pop(h, None)
     # Never let a proxied (potentially per-user) response be cached at the edge.
     out["cache-control"] = NO_STORE
