@@ -41,9 +41,12 @@ traffic analytics are harvested automatically from the shared proxy log.
 flowchart TD
     U[User / bot] -->|HTTPS| CF[Cloudflare edge]
     CF -->|HTTP, real IP in CF-Connecting-Ip| TR[Traefik v3.6 · coolify-proxy]
-    TR -->|Sablier plugin: wake if asleep| SB[Sablier]
+    TR -->|route by Host| WEB[web · static host]
+    WEB -->|bundle| U
+    WEB -->|not a file: forward + marker header| TR
+    WEB -->|wake if stopped| SB[Sablier]
     SB -.->|start container on demand| APP
-    TR -->|route by Host| APP[App container :80]
+    TR -->|route by Host + marker| APP[App container :80]
     subgraph Coolify control
       CO[coolify] --- CDB[(coolify-db · Postgres)]
       CO --- CR[(coolify-redis)]
@@ -61,8 +64,12 @@ flowchart TD
 **Request path:** Cloudflare terminates TLS and forwards HTTP to Traefik
 (`coolify-proxy`). Because we're behind Cloudflare, the **real client IP is in the
 `CF-Connecting-Ip` header**, not the socket. Traefik routes by `Host` to the app
-container on **port 80**. If the app is asleep, the Sablier Traefik plugin starts
-it first and shows a brief "starting" page.
+container on **port 80** — or, for an app with a frontend or one that sleeps, to
+the **static host**, which serves the bundle and forwards the rest (§9b). A
+sleeping app is started by the static host calling Sablier directly (§9c), not by
+the Traefik plugin: the plugin cannot help, because Traefik has no route to a
+stopped container in the first place. The caller waits a few seconds; there is no
+"starting" page.
 
 **Control path:** Coolify owns the lifecycle (create/deploy/delete containers,
 generate Traefik labels, provision databases). `paas-api` is a facade over
@@ -162,6 +169,22 @@ It runs *as one of its own apps* (`api`), which is why it can redeploy itself
 - Tools are annotated read-only / write / destructive (`ToolAnnotations`) so the
   connector UI groups them instead of dumping everything in "Other tools".
 
+### Two rules for the control plane's own logs
+
+**The connector key must never reach a log line.** claude.ai connectors cannot
+send an `Authorization` header, so the key rides in the `/mcp` query string —
+and uvicorn logs the full path, which put a working **admin** key in plaintext in
+this container's log, where `apps_logs api` hands it to anyone who asks. A
+`logging.Filter` on `uvicorn.access` redacts `key=` at the record, so it covers
+every path rather than the ones someone remembered to sanitise.
+
+**A background loop must never fail silently.** The loops swallow exceptions on
+purpose — a bad analytics pass cannot be allowed to take the control plane with
+it — but a bare `pass` makes a broken ingester indistinguishable from a quiet
+one. That is exactly how "last accessed" read `never` for apps in daily use with
+nothing anywhere to say why. They log the traceback (`main._swallow`), which
+uvicorn captures, so `apps_logs api` shows it.
+
 ### Auth
 
 `api_keys` table (sha256 only). Two kinds:
@@ -255,6 +278,31 @@ private-registry digest check needs one server-side credential
 `api` itself is the exception: it deploys via the **authenticated**
 `apps_update_code` path with a scoped deploy key, and is opted out of
 auto-update, so a self-deploy is deliberate.
+
+---
+
+### Two deploys of one app must not overlap
+
+Coolify's deploy call is asynchronous, so two overlapping calls for one app do
+not queue — the second starts against a config the first is still changing, and
+which container survives is a coin toss. This is not hypothetical: an app whose CI
+ships a frontend and a backend runs both jobs at once, and the frontend upload
+can itself rewrite routing labels and redeploy.
+
+There is exactly one control-plane process, so an in-process lock is enough
+(`app/locks.py`). Two scopes: `app_lock(id)` at every API entry point that
+redeploys one app, and `ROUTING_LOCK` inside the route sync, which touches the
+shared static host and therefore every app at once. Locks are taken only at the
+outermost layer, and `ROUTING_LOCK` → `app_lock(web)` is the only nesting, always
+in that order — asyncio locks are not reentrant, and a deploy path that deadlocks
+is worse than one that races.
+
+**CI needs the same guarantee one level up.** Every run pushes the same `:latest`
+tag, so two overlapping runs race and the one that *finishes* last wins,
+regardless of which commit is newer — and an arm64 build takes ~15 minutes under
+QEMU, so a quick follow-up commit can easily land first and then be undone by its
+predecessor. Every workflow this repo ships or scaffolds carries a `concurrency`
+group with `cancel-in-progress`.
 
 ---
 
@@ -422,14 +470,32 @@ and the app's real Host. If the backend is stopped, Traefik has no router for it
 so the forwarded request matches the *frontend* router and arrives back at the
 static host. It recognises its own marker, answers `503` + `X-Pironman-Backend-Down`,
 and the forwarding side reads that as "asleep": it calls **Sablier's blocking API
-directly** (`GET /api/strategies/blocking?names=<app>`), which starts the container
-and returns when it is ready, then retries. Sablier's own Docker provider lists
-stopped containers, so it can always find the group — it is only Traefik that
-cannot. The caller sees one slow request; there is no interstitial.
+directly** (`GET /api/strategies/blocking?group=<app-id>`), which starts the
+container and returns when it is ready, then retries. Sablier's own Docker
+provider lists stopped containers, so it can always find the group — it is only
+Traefik that cannot.
+
+By **group**, not by name: enrollment tags the container `sablier.group=<app-id>`,
+a stable id, while its actual name is the Coolify uuid plus a deploy timestamp.
+`?names=<app-id>` returns `500 … No such container` — verified on the box. The caller sees one slow request; there is no interstitial.
 
 The one thing the static host must never do here is fall through to `index.html`.
 An unreachable backend that answers with the site's homepage looks like a working
 site — that is precisely how the failure above stayed invisible. It is a 502.
+
+**Proxying rules the static host cannot break:**
+- **Never strip `content-encoding`.** The body is forwarded exactly as it
+  arrived, and both Traefik and Cloudflare compress. Dropping the header while
+  passing the compressed bytes tells the browser to render a gzip stream as text
+  — which is what an OAuth consent page looked like. Only responses over ~1KB are
+  compressed, so JSON endpoints and healthchecks looked fine throughout.
+- **Ask only for what the caller asked for.** The forwarded request advertises
+  the caller's own `Accept-Encoding` (`identity` if it sent none), or httpx would
+  request gzip on its own behalf and hand a compressed body to a client that
+  cannot decode one.
+- **Release a response you discard.** A `StreamingResponse` closes its upstream
+  only when its body is iterated, so replacing a proxied response without
+  `_release`-ing it holds an httpx connection open until garbage collection.
 
 **CDN caching** is defended in layers, because a mis-cached API response is the
 one failure that really hurts:
@@ -493,6 +559,13 @@ debounce keeps rolling redeploys from looking like outages. Configure with
 `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; unset, the loop is a no-op.
 `alerts_test` confirms delivery.
 
+**The 5xx path is a sleeping app's only cover.** Such an app is never reported
+down, because being stopped is the feature working — so if it fails to wake or
+crashes on start, the errors its requests produce are the one thing that says so.
+That check spent its whole life nested in a branch requiring an app to both sleep
+*and* have been alerted down, which meant it had never fired for anything. Treat
+it as load-bearing.
+
 ---
 
 ## 12. Hard-won lessons (checklist)
@@ -517,8 +590,19 @@ debounce keeps rolling redeploys from looking like outages. Configure with
   above all) has to live on a container that stays up.
 - **Never let a failure be answered with something that looks like success** —
   an SPA fallback in place of an unreachable backend, a compressed body labelled
-  as text, an internal hostname in otherwise valid metadata. Every long debugging
-  session here started with a green signal.
+  as text, an internal hostname in otherwise valid metadata, a background loop
+  swallowing its own exception. Every long debugging session here started with a
+  green signal.
+- **Two writes to one label set is one write too many** — each is a
+  read-modify-write against the live container, and a Coolify deploy is
+  asynchronous, so the second reads the pre-deploy container and reverts the
+  first.
+
+**Checking it in isolation.** `web/tests/test_server.py` stands the real static
+host up against a fake Traefik and a fake Sablier and drives the paths that have
+actually broken: a woken backend, a dead one (which must 502, not quietly serve
+the homepage), the 404 / `404.html` / `spa` fork, compressed passthrough and SSE
+streaming. `deploy-web.yml` runs it before building the image.
 
 **Checking it from outside.** `.github/workflows/verify.yml` (workflow_dispatch)
 asserts these against the live box as a real client sees them: the static host
