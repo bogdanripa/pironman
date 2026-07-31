@@ -43,7 +43,7 @@ static host, which is the only way absolute URLs can be right.
 """
 from . import coolify, frontends, sablier
 from .config import DOMAIN_SUFFIX, STATIC_HOST_APP
-from .locks import ROUTING_LOCK
+from .locks import ROUTING_LOCK, app_lock
 
 WEB_APP_ID = STATIC_HOST_APP
 _PREFIX = "traefik.http.routers.fe-"
@@ -226,16 +226,22 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
     readonly = None
     if changed:
         from . import autoupdate  # lazy: keeps the import graph one-directional
-        before = await autoupdate._container_started_at(web["coolify_uuid"])
-        res = await coolify.set_custom_labels(
-            web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()],
-            app_id=WEB_APP_ID)
-        await coolify.deploy(web["coolify_uuid"])
-        readonly = res.get("readonly", False)
-        # Wait for the new routers to actually exist before taking any backend
-        # off its public hostname. Scoping into a static host that is still
-        # restarting is the one ordering that leaves an app answering nowhere.
-        landed = await autoupdate.verify_deploy(web["coolify_uuid"], before)
+        # The static host's own deploy path (its CI /refresh) holds this lock too,
+        # so a routing write cannot land in the middle of one. Always taken while
+        # holding ROUTING_LOCK and never the other way round, so the order is
+        # fixed and the pair cannot deadlock.
+        async with app_lock(WEB_APP_ID):
+            before = await autoupdate._container_started_at(web["coolify_uuid"])
+            res = await coolify.set_custom_labels(
+                web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()],
+                app_id=WEB_APP_ID)
+            await coolify.deploy(web["coolify_uuid"])
+            readonly = res.get("readonly", False)
+            # Wait for the new routers to actually exist before taking any
+            # backend off its public hostname. Scoping into a static host that is
+            # still restarting is the one ordering that leaves an app answering
+            # nowhere.
+            landed = await autoupdate.verify_deploy(web["coolify_uuid"], before)
         if not landed.get("verified"):
             return {"routed": app_ids, "changed": True, "scoped": [],
                     "labels_readonly": readonly,
