@@ -83,6 +83,12 @@ PAAS_DB = dict(
     database=os.environ.get("PAAS_DB_NAME", "_paas"),
 )
 
+# The dashboard runs as its own app, so the control plane must accept its origin
+# for cross-origin reads (see app/cors.py).
+DASHBOARD_ORIGIN = os.environ.get(
+    "DASHBOARD_ORIGIN", f"https://dashboard{DOMAIN_SUFFIX}")
+
+
 def app_url(app_id: str) -> str:
     return f"https://{app_id}{DOMAIN_SUFFIX}"
 

@@ -399,9 +399,14 @@ flows through: the Traefik access log** — nothing is installed per app.
   `analytics_agents`, `analytics_recent` (live tail of raw requests), and
   `apps_stats` (per-app running state, live CPU/RAM, disk, DB size, error rate,
   p50/p95, plus host CPU/RAM/disk headroom).
-- A human dashboard is served by the control plane at
-  **`/analytics/dashboard?key=<PAAS_KEY>`** — self-contained HTML, inline SVG
-  charts, no external assets.
+- A human dashboard runs as its own **frontend-only app** at
+  `dashboard-coolify.bogdanripa.com` (`dashboard/` in this repo) — the platform
+  dogfooding its own frontend feature: no image, no container, served by the
+  static host and cached at the CDN. It reads the control plane cross-origin,
+  which `app/cors.py` allows for the read-only analytics/stats paths only, and
+  never for `/mcp`. It was kept off the control plane's hostname on purpose:
+  routing `api` through the static host would put the control plane's
+  availability behind another app.
 
 ---
 

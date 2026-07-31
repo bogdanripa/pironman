@@ -1,137 +1,14 @@
-"""The analytics dashboard — a self-contained HTML page served by the control
-plane itself, so it is always live and needs no external hosting.
+const PARAMS = new URLSearchParams(location.search);
+const KEY = PARAMS.get('key') || '';
 
-The page carries no data and no secret: it is plain markup. It reads the API key
-from its own URL (`?key=…`, the same key the connector uses) and its JavaScript
-calls the read-only /analytics/* JSON endpoints with that key as a bearer token.
-So the page is public but the numbers still require the key — open it at
-https://api-coolify.bogdanripa.com/analytics/dashboard?key=<PAAS_KEY>.
-
-Charts are drawn with inline SVG/CSS — no external scripts or fonts — so it works
-offline and behind a strict CSP.
-"""
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
-
-# Not on the require_key router and hidden from the schema, so it is a plain page,
-# never an MCP tool. include_in_schema=False keeps fastapi-mcp from seeing it.
-router = APIRouter(tags=["analytics"])
-
-_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pironman Analytics</title>
-<style>
-  :root {
-    --bg:#0f1115; --panel:#181b22; --line:#262b36; --fg:#e6e9ef; --mut:#8b93a3;
-    --accent:#5b9dff; --accent2:#3ecf8e; --bar:#2a3140;
-  }
-  @media (prefers-color-scheme: light) {
-    :root { --bg:#f5f6f8; --panel:#fff; --line:#e5e8ee; --fg:#1a1d24;
-            --mut:#697488; --bar:#e9edf4; }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
-  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center;
-           padding:18px 22px; border-bottom:1px solid var(--line); }
-  h1 { font-size:18px; margin:0; font-weight:600; }
-  h1 span { color:var(--mut); font-weight:400; }
-  .controls { margin-left:auto; display:flex; gap:8px; }
-  select { background:var(--panel); color:var(--fg); border:1px solid var(--line);
-           border-radius:8px; padding:7px 10px; font:inherit; }
-  main { padding:22px; max-width:1100px; margin:0 auto; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-           gap:14px; margin-bottom:22px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
-          padding:16px 18px; }
-  .card .k { color:var(--mut); font-size:12px; text-transform:uppercase;
-             letter-spacing:.04em; }
-  .card .v { font-size:30px; font-weight:650; margin-top:6px; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px;
-           padding:18px; margin-bottom:22px; }
-  .panel h2 { font-size:14px; margin:0 0 14px; font-weight:600; color:var(--mut);
-              text-transform:uppercase; letter-spacing:.04em; }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
-  th { color:var(--mut); font-weight:500; }
-  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
-  .cohort td { text-align:center; border:1px solid var(--bg); border-radius:4px; }
-  .cohort td.lbl { text-align:left; white-space:nowrap; color:var(--mut); }
-  .legend { display:flex; gap:16px; font-size:12px; color:var(--mut);
-            margin-bottom:8px; }
-  .legend i { display:inline-block; width:11px; height:11px; border-radius:3px;
-              margin-right:5px; vertical-align:-1px; }
-  .muted { color:var(--mut); }
-  .link { color:var(--accent); cursor:pointer; font-size:13px; }
-  .link:hover { text-decoration:underline; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
-         margin-right:6px; vertical-align:1px; }
-  .up { background:var(--accent2); } .down { background:#e5484d; }
-  .sleep { background:var(--mut); }  /* asleep = idle by design, not broken */
-  .warn { color:#e5a13a; } .bad { color:#e5484d; }
-  .bar { height:6px; border-radius:3px; background:var(--bar); overflow:hidden; }
-  .bar > span { display:block; height:100%; background:var(--accent); }
-  svg { width:100%; height:220px; display:block; }
-  .err { background:#3a1d1d; border:1px solid #6b2b2b; color:#ffb4b4;
-         padding:14px 16px; border-radius:10px; }
-</style>
-</head>
-<body>
-<header>
-  <h1>Pironman Analytics <span id="scopeLabel"></span></h1>
-  <div class="controls">
-    <select id="app"></select>
-    <select id="days">
-      <option value="7">Last 7 days</option>
-      <option value="30" selected>Last 30 days</option>
-      <option value="90">Last 90 days</option>
-    </select>
-  </div>
-</header>
-<main id="root">
-  <div id="msg" class="muted">Loading…</div>
-  <div id="content" style="display:none">
-    <div class="cards" id="cards"></div>
-    <div class="panel">
-      <h2>Resources <span id="hostline" class="muted" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
-      <div id="resources"><span class="muted">Loading live stats…</span></div>
-    </div>
-    <div class="panel">
-      <h2>Daily traffic</h2>
-      <div class="legend">
-        <span><i style="background:var(--accent)"></i>Unique visitors</span>
-        <span><i style="background:var(--bar)"></i>Hits</span>
-      </div>
-      <div id="chart"></div>
-    </div>
-    <div class="panel">
-      <h2>Last HTTP calls <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· live tail</span></h2>
-      <div id="recent"><span class="muted">Loading…</span></div>
-    </div>
-    <div class="panel">
-      <h2>Traffic sources <span id="botsline" class="muted" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
-      <div id="agents"><span class="muted">Loading…</span></div>
-    </div>
-    <div class="panel" id="perAppPanel" style="display:none">
-      <h2>By app</h2>
-      <div id="perApp"></div>
-    </div>
-    <div class="panel">
-      <h2>Weekly retention cohorts</h2>
-      <div id="cohorts"></div>
-    </div>
-  </div>
-</main>
-<script>
-const KEY = new URLSearchParams(location.search).get('key') || '';
+// The dashboard is its own app, so the control plane is a different origin. The
+// base URL is overridable with ?api= for pointing a local copy at the live box.
+const API = (PARAMS.get('api') || 'https://api-coolify.bogdanripa.com').replace(/\/$/, '');
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 async function api(path) {
-  const r = await fetch(path, { headers: { Authorization: 'Bearer ' + KEY } });
+  const r = await fetch(API + path, { headers: { Authorization: 'Bearer ' + KEY } });
   if (!r.ok) throw new Error(path + ' → ' + r.status + ' ' + r.statusText);
   return r.json();
 }
@@ -367,11 +244,3 @@ $('days').onchange = refresh;
   try { await loadApps(); } catch (e) { /* refresh() surfaces the error */ }
   refresh();
 })();
-</script>
-</body>
-</html>"""
-
-
-@router.get("/analytics/dashboard", include_in_schema=False)
-async def dashboard():
-    return HTMLResponse(_PAGE)

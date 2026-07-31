@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pironman Analytics</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Pironman Analytics <span id="scopeLabel"></span></h1>
+  <div class="controls">
+    <select id="app"></select>
+    <select id="days">
+      <option value="7">Last 7 days</option>
+      <option value="30" selected>Last 30 days</option>
+      <option value="90">Last 90 days</option>
+    </select>
+  </div>
+</header>
+<main id="root">
+  <div id="msg" class="muted">Loading…</div>
+  <div id="content" style="display:none">
+    <div class="cards" id="cards"></div>
+    <div class="panel">
+      <h2>Resources <span id="hostline" class="muted" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="resources"><span class="muted">Loading live stats…</span></div>
+    </div>
+    <div class="panel">
+      <h2>Daily traffic</h2>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i>Unique visitors</span>
+        <span><i style="background:var(--bar)"></i>Hits</span>
+      </div>
+      <div id="chart"></div>
+    </div>
+    <div class="panel">
+      <h2>Last HTTP calls <span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">· live tail</span></h2>
+      <div id="recent"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="panel">
+      <h2>Traffic sources <span id="botsline" class="muted" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="agents"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="panel" id="perAppPanel" style="display:none">
+      <h2>By app</h2>
+      <div id="perApp"></div>
+    </div>
+    <div class="panel">
+      <h2>Weekly retention cohorts</h2>
+      <div id="cohorts"></div>
+    </div>
+  </div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -5,9 +5,11 @@ from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool
 from . import autoupdate, analytics, alerts
+from .cors import CorsMiddleware
+from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
                       redirects as redirects_router,
-                      analytics as analytics_router, dashboard, stats,
+                      analytics as analytics_router, stats,
                       alerts as alerts_router, frontend)
 
 
@@ -73,8 +75,9 @@ when no app is given), analytics_timeseries for a daily line chart,
 analytics_cohorts for retention, analytics_agents for the top user-agents, and
 analytics_recent for a live tail of the most recent HTTP requests. apps_stats
 gives the live infra view (running state, CPU/RAM, disk, DB size, and request
-error rate / latency percentiles). A human-facing dashboard of all of this is
-served at /analytics/dashboard.
+error rate / latency percentiles). A human-facing dashboard of all of this runs
+as its own frontend-only app at https://dashboard-coolify.bogdanripa.com (open it
+with ?key=<an admin key>).
 
 If a Telegram bot is configured on the box, the platform also messages you when
 an app goes down, recovers, or starts throwing 5xx errors; alerts_test confirms
@@ -252,6 +255,11 @@ app = FastAPI(
 # ends up in the connector config and in edge logs.
 app.add_middleware(PromoteKeyMiddleware)
 
+# The dashboard is its own app on its own hostname, so its fetch calls are
+# cross-origin. Narrow on purpose: read-only analytics/stats paths only, and it
+# never touches /mcp (see app/cors.py).
+app.add_middleware(CorsMiddleware, allow_origins=(DASHBOARD_ORIGIN,))
+
 
 # Router order controls how tools list at /mcp. operation_ids are prefixed by
 # group (apps_*, crons_*, db_*, env_*) so the flat MCP tool list reads as
@@ -266,11 +274,18 @@ app.include_router(env.shared_router)  # env_* — shared, account-wide variable
 app.include_router(refresh.router)     # POST /apps/{id}/refresh — unauth CI hook
 app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secrets
 app.include_router(analytics_router.router)  # analytics_* — cross-app visitor stats
-app.include_router(dashboard.router)   # GET /analytics/dashboard — HTML page (keyless)
 app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health snapshot
 app.include_router(alerts_router.router)  # alerts_test — Telegram alert wiring check
 app.include_router(frontend.router)    # apps_frontend_deploy / apps_frontend_write
 app.include_router(redirects_router.router)  # apps_redirects_list / _set
+
+
+@app.get("/analytics/dashboard", include_in_schema=False)
+async def dashboard_moved():
+    """The dashboard is its own app now (a frontend on the platform, rather than
+    HTML embedded in this control plane). Keep the old URL working."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(app_url("dashboard"), status_code=308)
 
 
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)

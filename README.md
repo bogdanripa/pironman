@@ -152,6 +152,41 @@ holds the routine. `apps_update_code` plus a scoped deploy key remain the
 *authenticated* path for explicit deploys/rollbacks — the control plane itself
 (`api`) still deploys that way and is opted out of auto-update.
 
+## The dashboard (dogfooding the frontend feature)
+
+The analytics dashboard used to be ~300 lines of HTML inside `dashboard.py`,
+served by the control plane. It is now a **frontend-only app on this platform**:
+`dashboard/` in this repo, published by `.github/workflows/deploy-dashboard.yml`
+to `https://dashboard-coolify.bogdanripa.com`. No image, no container — the
+shared static host serves it and the CDN caches it.
+
+It was deliberately *not* put on the control plane's own hostname. Publishing a
+frontend for `api` would route every request to it — the MCP connector, CI's
+`/refresh`, every tool call — through the static host, so `web` breaking would
+take the control plane with it, and the control plane is what you would use to
+fix `web`. A viewer is not worth that coupling.
+
+Being a separate origin, its `fetch` calls are cross-origin, so the control plane
+allows the dashboard's origin on the read-only `/analytics/*` and `/stats/*`
+paths (`app/cors.py`, `DASHBOARD_ORIGIN`). That middleware is narrow and pure
+ASGI on purpose: no write endpoint becomes browser-reachable from another origin,
+and it never touches `/mcp`, whose SSE stream is broken by response-rewriting
+middleware. Auth is unchanged — every one of those paths still needs the key.
+
+`GET /analytics/dashboard` on the API 308-redirects to the new app, so old links
+keep working.
+
+Setup, once:
+
+```bash
+# frontend-only app (no image)
+curl -sS -X POST https://api-coolify.bogdanripa.com/apps -H "Authorization: Bearer $K" \
+  -H 'Content-Type: application/json' -d '{"id":"dashboard"}'
+```
+
+Then install the returned `paas_key` as this repo's **DASHBOARD_PAAS_KEY** secret
+and push — CI publishes the bundle.
+
 ## Container names
 
 Coolify names containers `<resource-uuid>-<deploy-timestamp>`, which is
@@ -246,7 +281,7 @@ Read-only MCP tools, each `app_id`-optional (omit for the whole platform):
 per-app breakdown when global), `analytics_timeseries` (daily visitors/hits),
 `analytics_cohorts` (weekly retention), `analytics_agents` (top user-agents with
 bot flag), `analytics_recent` (live tail of recent HTTP requests). A human-facing
-dashboard of all of it is served at `/analytics/dashboard?key=<PAAS_KEY>`.
+dashboard of all of it runs as its own frontend-only app — see below.
 
 The ingester also fills request-health rollups (`analytics_perf`, per-app 4xx/5xx
 and summed latency) and a latency histogram (`analytics_latency`) from the same

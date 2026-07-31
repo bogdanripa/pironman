@@ -1,0 +1,42 @@
+name: deploy-dashboard
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dashboard/**'
+      - '.github/workflows/deploy-dashboard.yml'
+
+# Publishes the analytics dashboard, which is a frontend-only app on this
+# platform — no image, no container. It is the platform dogfooding its own
+# frontend feature: a zip of static files uploaded to the app's frontend
+# endpoint, served by the shared static host and cached at the CDN.
+#
+# Needs DASHBOARD_PAAS_KEY: the `dashboard` app's scoped deploy key, which can
+# only deploy that one app. Distinct from PAAS_KEY (scoped to `api`) and
+# WEB_PAAS_KEY (scoped to `web`).
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No build step: the dashboard is hand-written HTML/CSS/JS with no
+      # dependencies, so the bundle is the source.
+      - name: Package the bundle
+        run: cd dashboard && zip -qr ../site.zip .
+
+      - name: Publish
+        run: |
+          code=$(curl -s -o /tmp/out -w '%{http_code}' -X PUT \
+            -H "Authorization: Bearer ${{ secrets.DASHBOARD_PAAS_KEY }}" \
+            --data-binary @site.zip \
+            "https://api-coolify.bogdanripa.com/apps/dashboard/frontend" || echo 000)
+          cat /tmp/out; echo
+          case "$code" in
+            2*)  echo "published ($code)" ;;
+            404) echo "the 'dashboard' app does not exist yet — create it with"
+                 echo "apps_create (no image = frontend-only), then re-run."; exit 1 ;;
+            401) echo "set DASHBOARD_PAAS_KEY to the dashboard app's deploy key"; exit 1 ;;
+            *)   echo "publish failed ($code)"; exit 1 ;;
+          esac

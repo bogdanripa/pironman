@@ -279,13 +279,13 @@ async def create_app(body: CreateApp):
     so — the pipeline is how apps are built and shipped here; a manual build is
     only ever a one-off bootstrap of the control plane itself.
 
-    The response also includes **paas_key**, a deploy key scoped to this app. A
-    backend-only CI workflow does not need it — those deploys are secretless, the
-    box auto-updates and CI just calls the app's /refresh hook. It IS needed if
-    the app ships a frontend, whose upload is authenticated: install it as the
-    repo's PAAS_KEY secret with github_secret_set rather than asking the user to
-    paste it. It also authorises the manual deploy path (PUT /apps/<id>/code), e.g.
-    a rollback. Shown once; re-issue with apps_deploy_key.
+    The response also includes **paas_key**, a deploy key scoped to this app. CI
+    needs it for BOTH halves of a deploy — the backend's /refresh call and the
+    frontend upload both authenticate with it — so install it as the repo's
+    PAAS_KEY secret with github_secret_set rather than asking the user to paste
+    it. It also authorises the manual deploy path (PUT /apps/<id>/code), e.g. a
+    rollback. The key can only deploy this one app. Shown once; re-issue with
+    apps_deploy_key.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
@@ -387,10 +387,11 @@ async def create_app(body: CreateApp):
             "Actions workflow file and where it goes.",
             "2. Write that workflow verbatim to .github/workflows/deploy.yml in "
             "the app's repo and commit it (use your GitHub tools).",
-            "3. Push to main. CI builds and pushes the arm64 image and calls this "
-            "app's /refresh hook; the box redeploys the new image. This app "
-            "auto-updates, so no PAAS_KEY or deploy secret is required. Deploying "
-            "is CI's job — there is no tool to deploy by hand.",
+            "3. Install the paas_key above as the repo's PAAS_KEY secret with "
+            "github_secret_set — CI authenticates its deploy call with it.",
+            "4. Push to main. CI builds and pushes the arm64 image and calls this "
+            "app's /refresh hook; the box redeploys the new image. Deploying is "
+            "CI's job — there is no tool to deploy by hand.",
         ],
     }
 
@@ -642,8 +643,8 @@ async def set_autoupdate(app_id: str, body: AutoUpdate):
 
     On (the default for newly created apps): the platform watches the app's tag
     and redeploys it whenever the registry image changes — hourly, and instantly
-    when the app's CI workflow calls its /refresh hook after a push. This is what
-    lets a deploy pipeline work with no PAAS_KEY secret.
+    when the app's CI workflow calls its /refresh hook after a push — so a push
+    to that tag ships automatically, with no manual deploy step.
 
     Off: the app stays on whatever image it currently runs until you deploy it
     explicitly. Use this to hold a manual rollback, or for an app you don't want

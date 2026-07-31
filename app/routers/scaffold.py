@@ -280,7 +280,8 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
             "The frontend upload needs the app's scoped deploy key as the PAAS_KEY "
             "repository secret. Install it yourself rather than asking the user: "
             "apps_create returns the key as `paas_key` (apps_deploy_key re-issues "
-            "one), and github_secret_set writes it to the repo. A leaked copy can "
-            "only deploy this one app. Only the backend deploy is secretless.",
+            "one), and github_secret_set writes it to the repo. The same key "
+            "authenticates the backend's /refresh call, so one secret covers both "
+            "halves of a deploy, and a leaked copy can only deploy this one app.",
         ],
     }
