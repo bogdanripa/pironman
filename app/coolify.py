@@ -158,6 +158,43 @@ async def set_custom_labels(uuid: str, labels: list[str],
     return {"readonly": False}
 
 
+_DOCKER_OPTS_FIELDS = ("custom_docker_run_options", "docker_run_options")
+
+
+async def ensure_restart_policy(uuid: str, policy: str = "unless-stopped") -> dict:
+    """Add `--restart=<policy>` to an app's custom docker run options.
+
+    Why it matters: with Docker's default `always`, a container that Sablier
+    stopped is started again when the daemon comes up, so a reboot wakes every
+    sleeping app. `unless-stopped` leaves a deliberately-stopped container alone.
+
+    Reads the existing options and appends, rather than replacing — an app may
+    carry mounts or other flags it cannot lose (the control plane itself mounts
+    the docker socket and `pdb`). No-op if a --restart flag is already present.
+    Returns what happened; never raises for an unknown field name, since the
+    uptime re-settle in main.py already covers this case.
+    """
+    try:
+        app = await get_app(uuid)
+    except CoolifyError as e:
+        return {"restart_policy": False, "error": str(e)}
+
+    field = next((f for f in _DOCKER_OPTS_FIELDS if f in app), None)
+    if field is None:
+        return {"restart_policy": False, "error": "no docker-options field on this Coolify build"}
+
+    current = (app.get(field) or "").strip()
+    if "--restart" in current:
+        return {"restart_policy": True, "changed": False, "options": current}
+
+    merged = f"{current} --restart={policy}".strip()
+    try:
+        await _request("PATCH", f"/applications/{uuid}", json={field: merged})
+    except CoolifyError as e:
+        return {"restart_policy": False, "error": str(e)}
+    return {"restart_policy": True, "changed": True, "options": merged}
+
+
 async def deploy(uuid: str) -> None:
     """VERIFIED. POST /deploy?uuid= — confirmed both by hand and by the recursive
     self-deploy, which queued and completed a redeploy of paas-api."""

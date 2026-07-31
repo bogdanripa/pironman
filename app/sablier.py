@@ -115,6 +115,9 @@ async def enroll(uuid: str, app_id: str) -> None:
         raise RuntimeError(
             "no running container to read labels from — deploy the app once first")
     await coolify.set_custom_labels(uuid, _as_list(enrolled_labels(labels, app_id)))
+    # Without this, Docker restarts the container at daemon start even though
+    # Sablier stopped it, so a reboot wakes every sleeping app.
+    await coolify.ensure_restart_policy(uuid)
     await coolify.deploy(uuid)
 
 

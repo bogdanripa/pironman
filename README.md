@@ -154,8 +154,13 @@ holds the routine. `apps_update_code` plus a scoped deploy key remain the
 
 ## Reboots and scale-to-zero
 
-Docker restarts containers when the daemon starts, including ones Sablier
-stopped, so a reboot would bring every app back awake. On startup `paas-api`
+Docker's default `restart: always` starts containers when the daemon starts,
+including ones Sablier stopped, so a reboot would bring every app back awake.
+Enrolling an app now also appends **`--restart=unless-stopped`** to its docker
+run options (existing options are read and appended to, never replaced), so
+Docker leaves a stopped container alone.
+
+As a backstop for apps enrolled before that, on startup `paas-api`
 checks the **host** uptime (`/proc/uptime`, not namespaced) and, if the box
 booted within the last 10 minutes, stops every enrolled sleep-enabled app again
 — so apps that scale to zero come back **asleep** and start on first request.
