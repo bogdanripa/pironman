@@ -193,10 +193,11 @@ stripped by replacing the URL with `/`, so it does not remain in the address bar
 in history, or in a referrer header. A rejected key (401/403) is discarded and
 the prompt returns, and "forget key" clears it.
 
-This reduces exposure but does not fix the underlying issue: the dashboard needs
-an **admin** key, because the platform has no read-only scope. A key that can
-read analytics can also delete apps. A read-only key type — limited to the paths
-CORS already whitelists — is the proper fix and is not built yet.
+That key is an **admin** key — the platform has no read-only scope, so a key that
+reads analytics can also delete apps. This is an accepted trade on a single-owner
+box: the key stays in browser storage, is never in a URL, and CORS only exposes
+the read-only paths to the browser anyway. A read-only key scope would be the
+stricter answer if this ever had more than one user.
 
 ## Container names
 
