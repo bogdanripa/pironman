@@ -60,21 +60,26 @@ jobs:
       # existing yet, so the first build can publish the image before it is
       # created. If this call fails the hourly sweep still deploys the image, so a
       # failure here delays the deploy rather than losing it.
-      # Only 2xx is success. An earlier version treated 404 as "the app does not
-      # exist yet, that's fine" and exited 0 — so a transient 404 (the control
-      # plane mid-redeploy) made the job green while nothing deployed, which hid
-      # a broken image through several releases.
+      # The control plane redeploys itself often, and during that window Traefik
+      # has no backend for it and answers 404 — the same transient that once made
+      # this job green while nothing deployed. So retry briefly before believing
+      # any answer, and only then decide.
       - name: Trigger deploy on the Pi
         run: |
-          code=$(curl -sS -o /tmp/out -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer ${{ secrets.WEB_PAAS_KEY }}" \
-            "https://api-coolify.bogdanripa.com/apps/web/refresh" || echo 000)
+          for i in $(seq 1 10); do
+            code=$(curl -sS -o /tmp/out -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer ${{ secrets.WEB_PAAS_KEY }}" \
+              "https://api-coolify.bogdanripa.com/apps/web/refresh" || echo 000)
+            case "$code" in
+              2*) cat /tmp/out; echo; echo "deployed and verified ($code)"; exit 0 ;;
+              404|000|502|503|504)
+                  echo "attempt $i: $code — control plane may be restarting, retrying"
+                  sleep 10 ;;
+              401) echo "unauthorized — WEB_PAAS_KEY must be the 'web' app's deploy key"; exit 1 ;;
+              *)   cat /tmp/out; echo; echo "refresh failed ($code)"; exit 1 ;;
+            esac
+          done
           cat /tmp/out; echo
-          case "$code" in
-            2*)  echo "deployed and verified ($code)" ;;
-            401) echo "unauthorized — WEB_PAAS_KEY must be the 'web' app's deploy key"; exit 1 ;;
-            404) echo "no 'web' app on the platform — create it with apps_create"; exit 1 ;;
-            502) echo "the deploy rolled back: the new container never became healthy."
-                 echo "The previous version is still serving. Check: apps_logs web"; exit 1 ;;
-            *)   echo "refresh failed ($code)"; exit 1 ;;
-          esac
+          echo "gave up after 10 attempts (last: $code)."
+          echo "502 means the deploy rolled back — check: apps_logs web"
+          exit 1

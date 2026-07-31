@@ -84,12 +84,28 @@ def _workflow(app_id: str, repo_name: str) -> str:
               # The box watches :latest and redeploys when the digest moves. This
               # asks it to check now instead of waiting for the hourly sweep, and
               # authenticates with this app's scoped deploy key (PAAS_KEY), which
-              # can only deploy this one app.
+              # can only deploy this one app. A 2xx means the new container came
+              # up healthy — the platform verifies that before answering, so a
+              # rolled-back deploy fails this step instead of going green.
+              # The control plane redeploys itself often and answers 404 while it
+              # restarts, so transient codes are retried rather than believed.
               - name: Trigger deploy on the Pi
                 run: |
-                  curl -fsS -X POST \\
-                    -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
-                    "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh"
+                  for i in $(seq 1 10); do
+                    code=$(curl -sS -o /tmp/out -w '%{{http_code}}' -X POST \\
+                      -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
+                      "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh" || echo 000)
+                    case "$code" in
+                      2*) cat /tmp/out; echo; exit 0 ;;
+                      404|000|503|504) echo "attempt $i: $code, retrying"; sleep 10 ;;
+                      401) echo "PAAS_KEY is not this app's deploy key"; exit 1 ;;
+                      502) cat /tmp/out; echo
+                           echo "deploy rolled back — the new container never became healthy"
+                           echo "check: apps_logs {app_id}"; exit 1 ;;
+                      *)  cat /tmp/out; echo; echo "refresh failed ($code)"; exit 1 ;;
+                    esac
+                  done
+                  echo "gave up after 10 attempts"; exit 1
 
               # /refresh verifies the deploy server-side and returns non-2xx if
               # the container failed and Coolify rolled it back, so this step is a
