@@ -273,6 +273,21 @@ done
 
 `apps_get` also reports the live policy in `backend.runtime.restart_policy`.
 
+### Is the first request after a quiet night slow?
+
+Two flags describe sleeping and neither answers that on its own.
+`sleep_when_idle` is what the app asked for; `sablier_enrolled` is whether the
+middleware is actually stamped on its container. Auto-enrolment is gated
+(`SABLIER_AUTO_ENROLL`, off by default), so `sleep_when_idle: true` with
+`sablier_enrolled: false` is a normal, indefinite state — an app that is *marked*
+to sleep and never does.
+
+So `apps_get` reports a derived `backend.sleeps` (both flags true) and a plain
+`backend.first_request_after_idle` alongside the raw pair, and `apps_create`
+answers the same question in its `idle_behaviour` field — at create time, before
+there is any app to inspect, which is when anyone handing a URL to friends
+actually asks it.
+
 ## What an app is made of
 
 `apps_create` takes no image and no repository. It registers an id, hands it a
@@ -286,8 +301,32 @@ is the only thing that knows what it built, so it reports it. That is why
 `apps_update_code` takes an image and `apps_create` does not. `apps_adopt` also
 takes one, since it describes an app that already exists in Coolify.
 
-`health_path` is recorded at create time and applied when the container is
-eventually created.
+### One health path
+
+`health_path` is recorded at create time, applied to the app's Coolify
+configuration when the container is eventually created, and changeable
+afterwards with `apps_update` (which rewrites the Coolify config immediately; the
+running container keeps the check it started with until the next deploy).
+`apps_get` echoes it back under `backend.health_path`, so it can be confirmed
+rather than guessed at.
+
+It is the **only** health path, and three things read it:
+
+- the container healthcheck Coolify runs, which is what a silent rollback is
+  decided on;
+- the `HEALTHCHECK` line in the app's Dockerfile, which should name the same
+  path — that instruction is a fallback for the case where the Coolify
+  configuration did not land, not a second, independent setting. Two different
+  paths is the one combination to avoid, because whichever check actually runs is
+  then testing a route nobody meant;
+- the deploy workflow's *wait for healthy* step, which requests it and requires a
+  2xx.
+
+For an app that ships a **frontend as well as a backend**, leaving it at `/` makes
+that last check meaningless: `/` is answered by the static bundle straight from
+the CDN, with no container in the path, so the step goes green with a dead API
+behind it. Give such an app a path its backend owns — `/api/health` — and the
+check tests something.
 
 ## Deploys are verified, not assumed
 
@@ -338,6 +377,16 @@ Two scopes, both stored in `_paas` and injected into the container on deploy:
 
 An app's effective environment is *shared, overlaid by app-specific*, plus the
 platform-managed `DATABASE_URL` (reserved — it cannot be set as a variable).
+
+`DATABASE_URL` — and the identical `db_url` returned by `apps_create`,
+`apps_attach_db` and `apps_get` — names an **internal Docker container**, not a
+routable host. It resolves from inside the app's own network and nowhere else:
+not from a laptop, not from CI, not from a local dev server. There is no exposed
+port and no tunnel, and nothing about the string itself says so, which is exactly
+why it reads like a URL you could point `psql` at. To touch the database from
+outside, use `db_run_script`; to develop locally, run your own database and let
+`DATABASE_URL` differ between environments. Each of those tools now returns the
+caveat alongside the URL.
 Setting or removing a variable pushes it to Coolify and redeploys the affected
 app(s) so it reaches the running container; a shared change redeploys every app.
 Pass `redeploy=false` to stage a batch and let the next code deploy apply it.

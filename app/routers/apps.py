@@ -11,6 +11,19 @@ from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
 
+# The host in a db_url is a Docker container name on the box, not a routable
+# address — it resolves only from inside the app's own network. Said wherever a
+# db_url is handed out, because the string looks like an ordinary connection URL
+# and reads as one you could point a laptop at.
+DB_URL_NOTE = (
+    "The hostname in db_url is an internal Docker container name: it resolves "
+    "only from inside the app's own network, so this string works from the "
+    "deployed container and from nowhere else. It is not reachable from your "
+    "machine, from CI, or from a local dev server — there is no exposed port and "
+    "no tunnel. To read or write this database from outside, use db_run_script; "
+    "to develop locally, run your own database and let DATABASE_URL differ "
+    "between environments.")
+
 
 class CreateApp(BaseModel):
     id: str = Field(
@@ -34,9 +47,20 @@ class CreateApp(BaseModel):
     health_path: str = Field(
         default="/",
         description="Path the container healthcheck requests, e.g. '/health'. Must "
-                    "return HTTP 200 without authentication. Leave as '/' unless "
-                    "the app has a dedicated health endpoint or its root path "
-                    "requires a login.")
+                    "return HTTP 200 without authentication. This is the app's ONE "
+                    "health path: the platform configures the container's "
+                    "healthcheck from it when the container is first created, a "
+                    "failing check is what gets a deploy rolled back, and the "
+                    "deploy workflow's 'wait for healthy' step requests it. Any "
+                    "HEALTHCHECK line in the Dockerfile should name the same path "
+                    "— it is only a fallback for the case where that configuration "
+                    "did not land, and pointing the two at different paths means "
+                    "whichever runs is testing a route you did not mean. Leave as "
+                    "'/' unless the app has a dedicated health endpoint or its "
+                    "root path requires a login — but an app that also ships a "
+                    "frontend should ALWAYS set a backend-owned path such as "
+                    "'/api/health', because '/' is answered by the static bundle "
+                    "with no container in the path.")
     spa: bool = Field(
         default=False,
         description="Set true only for a single-page app whose client-side router "
@@ -102,6 +126,16 @@ class UpdateApp(BaseModel):
                     "a single-page app's deep links work. False (the default) makes "
                     "them a 404, and the bundle's own 404.html is used if it has "
                     "one. Takes effect immediately — no redeploy.")
+    health_path: str | None = Field(
+        default=None,
+        description="Path the container healthcheck requests. Use this to correct "
+                    "a health_path chosen at create time — e.g. to move an app "
+                    "that also serves a frontend off '/', which the static bundle "
+                    "answers without involving the container, onto a path its "
+                    "backend actually owns. Must return HTTP 200 without "
+                    "authentication. Written to the app's Coolify configuration "
+                    "at once; the running container keeps its current check until "
+                    "the next deploy.")
 
 
 class Sleep(BaseModel):
@@ -155,6 +189,35 @@ async def list_apps():
     return out
 
 
+def _sleep_summary(row) -> dict:
+    """The two scale-to-zero flags, plus the answer they only imply together.
+
+    `sleep_when_idle` is what the app asked for; `sablier_enrolled` is whether
+    the middleware is actually stamped on the container. Sleeping is real only
+    when both are true — auto-enrolment is gated (SABLIER_AUTO_ENROLL), so an app
+    can sit at requested-but-not-enrolled indefinitely. Read either flag alone and
+    you get the wrong answer to the question anyone actually has, which is whether
+    the first request after a quiet night is slow.
+    """
+    wants, enrolled = bool(row["sleep_when_idle"]), bool(row["sablier_enrolled"])
+    sleeps = wants and enrolled
+    return {
+        "sleep_when_idle": row["sleep_when_idle"],
+        "sablier_enrolled": row["sablier_enrolled"],
+        "sleeps": sleeps,
+        "first_request_after_idle": (
+            "a few seconds — the container is stopped when idle and this request "
+            "wakes it. Turn it off with apps_update sleep_when_idle=false."
+            if sleeps else
+            "immediate — this app stays running and does not scale to zero."
+            + ("" if wants or enrolled else
+               " (sleep_when_idle is off.)")
+            + (" It is marked sleep_when_idle=true but is not enrolled in the "
+               "scale-to-zero middleware, so nothing stops it." if wants and not enrolled
+               else "")),
+    }
+
+
 @router.get("/{app_id}", operation_id="apps_get",
             summary="Get one app's full configuration, including database credentials")
 async def get_app(app_id: str):
@@ -200,8 +263,11 @@ async def get_app(app_id: str):
             "auto_update": row["watch_tag"] is not None,
             "watch_tag": row["watch_tag"],
             "deployed_digest": row["deployed_digest"],
-            "sleep_when_idle": row["sleep_when_idle"],
-            "sablier_enrolled": row["sablier_enrolled"],
+            # The path the container healthcheck requests, and what a rollback is
+            # decided on. Echoed so it can be confirmed rather than guessed at;
+            # change it with apps_update.
+            "health_path": row["health_path"],
+            **_sleep_summary(row),
             # Live: running / asleep / stopped, plus current CPU and memory.
             "runtime": await stats.app_runtime(row["coolify_uuid"],
                                                bool(row["sleep_when_idle"])),
@@ -223,6 +289,7 @@ async def get_app(app_id: str):
     if row["db_engine"]:
         out["db_url"] = await provision.compose_url(
             row["db_engine"], row["db_user"], row["db_password"], row["db_name"])
+        out["db_url_note"] = DB_URL_NOTE
         try:
             size = await provision.db_size(row["db_engine"], row["db_name"],
                                            row["db_user"], row["db_password"])
@@ -301,6 +368,23 @@ async def create_app(body: CreateApp):
         "url": app_url(body.id),
         "kind": "registered — no code deployed yet",
         "paas_key": key,
+        "health_path": body.health_path,
+        # "Is the first request after a quiet night slow?" is a first-class
+        # question for anything handed to other people, and the two flags that
+        # answer it (sleep_when_idle, sablier_enrolled) only exist once there is a
+        # container. Answer it here, where the app is being created.
+        "idle_behaviour": (
+            "A backend is marked sleep_when_idle when its container is first "
+            f"created, so {body.id} will be a candidate for scaling to zero. "
+            "Sleeping only actually happens once it is also enrolled in the "
+            "scale-to-zero middleware, which is gated platform-wide — apps_get "
+            "reports both flags plus a plain `first_request_after_idle` answer, "
+            "so check there rather than assuming. When it is sleeping, the first "
+            "request after an idle period waits a few seconds for the container "
+            "to start; every request after that is normal speed until it goes "
+            "idle again. Turn it off with apps_update sleep_when_idle=false for "
+            "an app where that first-hit delay is not acceptable. A frontend is "
+            "never affected: it has no container and is always warm."),
         "deploy": [
             "The app now owns its hostname. What it becomes is decided by what "
             "its pipeline ships: a frontend if CI uploads a bundle, a backend if "
@@ -318,6 +402,7 @@ async def create_app(body: CreateApp):
         out["db_url"] = await provision.compose_url(
             body.db_engine, db_info["user"], db_info["password"],
             db_info["database"])
+        out["db_url_note"] = DB_URL_NOTE
     return out
 
 
@@ -424,6 +509,8 @@ async def update_app(app_id: str, body: UpdateApp):
     - **spa** — whether an unmatched path is a client-side route (serve
       index.html) or a 404. Only turn it on for an app with a client-side router;
       it applies at once, with no redeploy.
+    - **health_path** — the path the container healthcheck requests, for
+      correcting the one chosen at create time.
 
     To give an app a *frontend*, publish one (apps_frontend_write, or a CI upload)
     — there is nothing to configure here for that.
@@ -439,9 +526,43 @@ async def update_app(app_id: str, body: UpdateApp):
         changed.update(await set_sleep(app_id, Sleep(enabled=body.sleep_when_idle)))
     if body.spa is not None:
         changed.update(await _set_spa(app_id, body.spa))
+    if body.health_path is not None:
+        changed.update(await _set_health_path(app_id, body.health_path))
     if len(changed) == 1:
         raise HTTPException(400, "nothing to update — pass at least one field")
     return changed
+
+
+async def _set_health_path(app_id: str, path: str) -> dict:
+    """Record a new health path and push it to Coolify.
+
+    Recording it matters even for an app with no container yet: apply_image reads
+    health_path when it creates one. For an app that already has a container,
+    Coolify is updated now but the running container keeps the healthcheck it was
+    started with, so the change lands with the next deploy — say so rather than
+    let a caller read the new value back and assume it is in force.
+    """
+    if not path.startswith("/"):
+        raise HTTPException(422, "health_path must start with '/'")
+    async with pool().acquire() as c:
+        await c.execute("UPDATE apps SET health_path = $1 WHERE id = $2",
+                        path, app_id)
+        uuid = await c.fetchval(
+            "SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
+
+    out = {"health_path": path}
+    if not uuid:
+        return {**out, "in_force": "on the first deploy, which creates the "
+                                   "container"}
+    try:
+        await coolify.set_healthcheck(uuid, path)
+    except Exception as e:
+        # Recorded either way: the next container creation reads it from here.
+        return {**out, "in_force": f"recorded, but Coolify rejected the update "
+                                   f"({e}) — it will be applied when the "
+                                   f"container is next recreated"}
+    return {**out, "in_force": "on the next deploy — the running container keeps "
+                               "the healthcheck it started with"}
 
 
 async def _set_spa(app_id: str, enabled: bool) -> dict:
@@ -506,7 +627,8 @@ async def attach_db(app_id: str, body: AttachDb):
     return {"id": app_id, "db_engine": body.db_engine,
             "db_url": await provision.compose_url(
                 body.db_engine, db_info["user"], db_info["password"],
-                db_info["database"])}
+                db_info["database"]),
+            "db_url_note": DB_URL_NOTE}
 
 
 @router.delete("/{app_id}/db", operation_id="apps_detach_db",

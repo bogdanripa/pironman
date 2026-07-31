@@ -1,7 +1,11 @@
-# Copy into each managed app's repo as .github/workflows/deploy.yml
+# Reference only — a minimal illustration of the shape. Get the real thing from
+# apps_deploy_workflow, which fills in the app id, the branch to deploy from, the
+# app's health path and the verified-deploy retry logic that this file omits.
 name: deploy
 on:
   push:
+    # The branch that deploys. Not always main: a feature branch wired to main
+    # builds nothing, and the run that looks missing is one that never triggered.
     branches: [main]
 
 jobs:

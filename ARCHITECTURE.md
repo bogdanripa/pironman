@@ -299,10 +299,18 @@ is worse than one that races.
 
 **CI needs the same guarantee one level up.** Every run pushes the same `:latest`
 tag, so two overlapping runs race and the one that *finishes* last wins,
-regardless of which commit is newer — and an arm64 build takes ~15 minutes under
-QEMU, so a quick follow-up commit can easily land first and then be undone by its
-predecessor. Every workflow this repo ships or scaffolds carries a `concurrency`
-group with `cancel-in-progress`.
+regardless of which commit is newer — and an arm64 build under QEMU emulation can
+take anywhere from a minute or two for a small `node:*-slim`-style image to 15+
+minutes for a large one or one that compiles native dependencies, so a quick
+follow-up commit can easily land first and then be undone by its predecessor.
+Every workflow this repo ships or scaffolds carries a `concurrency` group with
+`cancel-in-progress`.
+
+That spread is worth stating both ways round, because the old flat "~15 minutes"
+figure was also quoted in `apps_deploy_workflow`'s output, and a caller who
+believes it builds a twenty-minute polling loop around a run that finishes in
+under two. Neither number is a default to plan against: watch the run, or time
+the app's first build and use that.
 
 ---
 
