@@ -7,9 +7,16 @@ files it actually has.**
 
   1. not GET/HEAD                    -> backend (a bundle cannot answer writes)
   2. a file in the bundle            -> serve it ("/" resolves to index.html)
-  3. not a file, and no backend      -> index.html (it is a client-side route)
+  3. not a file, and no backend      -> nothing has it: see _not_found
   4. not a file, backend exists      -> backend, and its answer stands
-  5. backend said 404 + navigation   -> index.html after all
+  5. backend said 404                -> nothing has it: see _not_found
+
+**A path nobody has is a 404.** If the bundle ships `404.html` that page is
+served, with a 404 status. An app whose client-side router owns those paths opts
+in (`spa` in the manifest) and gets its entrypoint instead — which is the older
+behaviour, and was the default until it became clear what it costs: every typo
+answering 200 with the homepage, no app able to show its own 404 page, and a
+broken link indistinguishable from a working one.
 
 Step 5 needs the backend to have actually answered. A backend that could not be
 reached is a 502, never a fallback — see _proxy.
@@ -20,12 +27,10 @@ backend like any other request. An earlier design intercepted those as
 "navigations", served index.html, and then needed a per-app list of exceptions to
 undo itself — the exceptions existed only because the heuristic created them.
 
-Step 5 is the one heuristic left, and it is bounded: it applies solely to a
-request the backend has already rejected, and only when the caller is a browser
-navigating. Anything that wanted data keeps the backend's real 404 rather than
-being handed HTML. The cost is one round trip to the backend before a client-side
-deep link falls back — paid only on paths the backend does not serve, and only by
-apps that have a backend at all.
+What remains after step 5 is bounded by the same principle: only a request the
+backend has already rejected is reconsidered, and only a caller rendering a page
+can be given one. Anything that wanted data keeps the backend's real 404 rather
+than being handed HTML.
 
 Backend proxying goes back through Traefik rather than straight to the container,
 so service discovery keeps working across redeploys (container names carry a
@@ -85,6 +90,11 @@ WAKE_RETRY_DELAY = 1.5
 # it costs nothing and avoids a site that looks empty for a puzzling reason.
 INDEX_FILES = ("index.html", "index.htm")
 
+# A bundle can ship its own not-found page. Conventional name, no configuration:
+# if it is there it is used, and it is served with a 404 status rather than the
+# 200 a soft-404 would give.
+NOT_FOUND_FILE = "404.html"
+
 _HASHED = re.compile(r"[.-][0-9a-f]{8,}\.[a-z0-9]+$", re.I)
 IMMUTABLE = "public, max-age=31536000, immutable"
 NO_CACHE = "no-cache"
@@ -101,6 +111,9 @@ def _app_id(host: str) -> str | None:
     return aid if aid and "/" not in aid and "." not in aid else None
 
 
+MANIFEST = ".pironman.json"
+
+
 def _manifest(aid: str) -> dict:
     """Per-app config written by paas-api next to the bundle. Absent/broken means
     'static only, no backend', which is the safe reading."""
@@ -108,9 +121,6 @@ def _manifest(aid: str) -> dict:
         return json.loads((ROOT / aid / MANIFEST).read_text())
     except (OSError, ValueError):
         return {}
-
-
-MANIFEST = ".pironman.json"
 
 
 def _safe_file(aid: str, path: str) -> Path | None:
@@ -189,7 +199,11 @@ def _stream(client: httpx.AsyncClient, r: httpx.Response) -> StreamingResponse:
             await r.aclose()
             await client.aclose()
 
-    return StreamingResponse(body(), status_code=r.status_code, headers=out)
+    response = StreamingResponse(body(), status_code=r.status_code, headers=out)
+    # So a caller that decides not to use this response can still close what is
+    # behind it — see _release.
+    response.upstream = (client, r)
+    return response
 
 
 async def _wake(aid: str) -> bool:
@@ -292,6 +306,54 @@ def _index_of(aid: str):
     return None
 
 
+async def _release(resp: Response) -> None:
+    """Close the upstream connection behind a proxied response we are discarding.
+
+    A StreamingResponse only closes its upstream when its body is iterated, and
+    a response we replace never is — so dropping one silently holds an httpx
+    connection open until garbage collection.
+    """
+    upstream = getattr(resp, "upstream", None)
+    if upstream:
+        client, r = upstream
+        await r.aclose()
+        await client.aclose()
+
+
+async def _not_found(aid: str, mf: dict, request: Request,
+                     backend: Response | None = None) -> Response:
+    """Answer a path that neither the bundle nor the backend has.
+
+    In order:
+      1. the app is a **single-page app** — the path belongs to its client-side
+         router, so serve the entrypoint (200: the page really is the app);
+      2. the bundle ships **404.html** and the caller is rendering a page — serve
+         it, with a 404 status, so the app owns how "not found" looks;
+      3. otherwise the backend's own 404 if it answered one, else a plain 404.
+
+    Step 2 is gated on the caller wanting HTML because an API client asking for
+    JSON is better served by the backend's real error than by a web page.
+    """
+    if mf.get("spa"):
+        index = _index_of(aid)
+        if index:
+            if backend is not None:
+                await _release(backend)
+            return _serve(index, "/")
+
+    if "text/html" in request.headers.get("accept", ""):
+        page = _safe_file(aid, "/" + NOT_FOUND_FILE)
+        if page:
+            if backend is not None:
+                await _release(backend)
+            return FileResponse(page, status_code=404,
+                                headers={"Cache-Control": NO_CACHE})
+
+    if backend is not None:
+        return backend
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
 @app.api_route("/{_path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH",
                                          "DELETE", "OPTIONS"])
 async def resolve(request: Request, _path: str = ""):
@@ -338,12 +400,10 @@ async def resolve(request: Request, _path: str = ""):
     if f:
         return _serve(f, path)
 
-    # 3. Not a file. With no backend there is nobody else to ask, so this is a
-    #    client-side route: serve the SPA entrypoint.
+    # 3. Not a file. With no backend there is nobody else to ask, so nothing has
+    #    this path — unless the app says its router owns it.
     if not has_backend:
-        index = _index_of(aid)
-        return _serve(index, "/") if index else JSONResponse(
-            {"error": "not found"}, status_code=404)
+        return await _not_found(aid, mf, request)
 
     # 4. There is a backend, so it gets the request — and its answer stands.
     #    This is what makes OAuth callbacks, download links and server-rendered
@@ -351,14 +411,10 @@ async def resolve(request: Request, _path: str = ""):
     #    not files, so they reach the backend like everything else.
     resp = await _proxy(request, aid)
 
-    # 5. Only if the backend also says "no such thing", and the caller is a
-    #    browser navigating, is this a client-side route after all — serve the
-    #    entrypoint. Requests that wanted data (fetch/XHR, Accept: application/
-    #    json) keep the backend's real 404 instead of being handed HTML. Status
-    #    is known as soon as the backend's headers arrive, so this costs nothing
-    #    for a streamed response.
-    if resp.status_code == 404 and "text/html" in request.headers.get("accept", ""):
-        index = _index_of(aid)
-        if index:
-            return _serve(index, "/")
+    # 5. The backend has also said "no such thing", so nothing has this path.
+    #    Its own 404 is the default answer and is what an API client keeps; the
+    #    bundle only gets to speak for a page. Status is known as soon as the
+    #    backend's headers arrive, so this costs nothing for a streamed response.
+    if resp.status_code == 404:
+        return await _not_found(aid, mf, request, backend=resp)
     return resp

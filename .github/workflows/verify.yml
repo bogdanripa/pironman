@@ -48,12 +48,17 @@ jobs:
           test "$code" = "200" || { echo "::error::dashboard returned $code"; exit 1; }
           case "$type" in text/html*) ;; *) echo "::error::served $type"; exit 1 ;; esac
 
-      - name: A client-side deep link falls back to the entrypoint
+      - name: A path nobody has is a 404, not the homepage
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-            -H 'Accept: text/html' "https://dashboard$SUFFIX/some/spa/route")
-          echo "GET /some/spa/route -> $code"
-          test "$code" = "200" || { echo "::error::SPA fallback broken ($code)"; exit 1; }
+          # The dashboard has no client-side router, so an unknown path must not
+          # answer 200 with the homepage — a soft 404 makes a broken link
+          # indistinguishable from a working one. An app that DOES route
+          # client-side opts in with apps_update spa=true; check that one by
+          # hand rather than asserting one answer for both shapes here.
+          code=$(curl -s -o /tmp/b -w '%{http_code}' --max-time 20 \
+            -H 'Accept: text/html' "https://dashboard$SUFFIX/no/such/path")
+          echo "GET /no/such/path -> $code"; head -c 120 /tmp/b; echo
+          test "$code" = "404" || { echo "::error::expected 404, got $code"; exit 1; }
 
       - name: A frontend+backend app serves the bundle at /
         run: |

@@ -26,8 +26,14 @@ ROOT = Path(tempfile.mkdtemp())
 (ROOT / "web" / "index.html").write_text("<h1>SHOULD NEVER BE SERVED</h1>")
 (ROOT / "static-only").mkdir()
 (ROOT / "static-only" / "index.html").write_text("<h1>STATIC</h1>")
+(ROOT / "static-only" / "404.html").write_text("<h1>CUSTOM 404</h1>")
 (ROOT / "static-only" / ".pironman.json").write_text(json.dumps(
     {"has_backend": False, "redirects": []}))
+# The same site with client-side routing turned on.
+(ROOT / "spa-app").mkdir()
+(ROOT / "spa-app" / "index.html").write_text("<h1>SPA SHELL</h1>")
+(ROOT / "spa-app" / ".pironman.json").write_text(json.dumps(
+    {"has_backend": False, "redirects": [], "spa": True}))
 
 
 def free_port():
@@ -148,7 +154,9 @@ async def main():
         check("backend sees the REAL public host",
               STATE["seen_host"] == "demo-test.local", STATE["seen_host"])
         r = await c.get(base + "/deep/link", headers={**H, "Accept": "text/html"})
-        check("browser deep link falls back to index", "MARKETING PAGE" in r.text)
+        check("a browser deep link is a 404, not the homepage",
+              r.status_code == 404 and "MARKETING PAGE" not in r.text,
+              f"{r.status_code} {r.text[:40]}")
         r = await c.get(base + "/deep/link", headers={**H, "Accept": "application/json"})
         check("json client keeps the backend's 404", r.status_code == 404, r.text[:60])
         r = await c.get(base + "/.pironman.json", headers=H)
@@ -166,7 +174,7 @@ async def main():
         print("\n[backend asleep, browser navigation]")
         STATE["up"] = False; STATE["wakes"] = 0
         r = await c.get(base + "/api/thing", headers={**H, "Accept": "text/html"})
-        check("navigation to an API path still wakes rather than serving the page",
+        check("navigation to an API path still wakes the backend",
               r.status_code == 200 and "MARKETING" not in r.text, r.text[:60])
 
         print("\n[wake fails]")
@@ -213,12 +221,34 @@ async def main():
         r = await c.get(f"http://127.0.0.1:{WEB_PORT}/_health")
         check("its own healthcheck still answers", r.status_code == 200, r.text[:40])
 
-        print("\n[frontend-only app]")
+        print("\n[frontend-only app: a missing path is a 404]")
         H2 = {"Host": "static-only-test.local"}
-        r = await c.get(base + "/anything", headers=H2)
-        check("client-side route serves index", "STATIC" in r.text)
+        r = await c.get(base + "/anything", headers={**H2, "Accept": "text/html"})
+        check("an unknown path serves the app's 404.html, with a 404 status",
+              r.status_code == 404 and "CUSTOM 404" in r.text,
+              f"{r.status_code} {r.text[:40]}")
+        check("it is not the homepage", "STATIC" not in r.text)
+        r = await c.get(base + "/anything", headers={**H2, "Accept": "application/json"})
+        check("a json client gets a plain 404, not a web page",
+              r.status_code == 404 and "CUSTOM 404" not in r.text, r.text[:60])
+        r = await c.get(base + "/", headers=H2)
+        check("the homepage itself still serves", "STATIC" in r.text)
         r = await c.post(base + "/anything", headers=H2, json={})
         check("write with no backend is 404", r.status_code == 404, r.status_code)
+
+        print("\n[spa=true: unmatched paths are client-side routes]")
+        H3 = {"Host": "spa-app-test.local"}
+        r = await c.get(base + "/deep/route", headers={**H3, "Accept": "text/html"})
+        check("a deep link serves the shell with a 200",
+              r.status_code == 200 and "SPA SHELL" in r.text,
+              f"{r.status_code} {r.text[:40]}")
+
+        print("\n[spa=true with a backend: the shell wins over the backend 404]")
+        STATE["up"] = True
+        r = await c.get(base + "/deep/route", headers={**H, "Accept": "text/html"})
+        check("without spa, the backend's own 404 stands",
+              r.status_code == 404 and "MARKETING" not in r.text,
+              f"{r.status_code} {r.text[:40]}")
 
     print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
     return 1 if fails else 0

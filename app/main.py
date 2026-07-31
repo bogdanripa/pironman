@@ -116,9 +116,10 @@ With both, requests resolve with one rule and nothing to configure: a file in th
 bundle is served (with "/" resolving to index.html), and everything else — every
 write, and every path the bundle does not contain — goes to the backend. So an
 API under /api works, but so does any other path: OAuth callbacks, downloads and
-server-rendered pages are simply paths the bundle does not have. A client-side
-route the backend also rejects falls back to index.html, so SPA deep links work
-too.
+server-rendered pages are simply paths the bundle does not have. A path nobody
+has at all is a 404 — the bundle's own 404.html if it ships one. A
+single-page app whose router owns such paths sets apps_update spa=true and gets
+index.html instead, so its deep links work.
 
 Any app can also carry **redirect rules** (apps_redirects_list / apps_redirects_set)
 — ordered, first match wins, applied ahead of files and the backend. They support

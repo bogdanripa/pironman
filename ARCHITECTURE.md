@@ -337,9 +337,17 @@ reads, and only for files it actually has.
 
 1. not GET/HEAD → backend (a bundle cannot answer writes)
 2. a file in the bundle → serve it (`/` resolves to `index.html`/`index.htm`)
-3. not a file, no backend → `index.html` (a client-side route)
+3. not a file, no backend → nothing has it (below)
 4. not a file, backend exists → **backend, and its answer stands**
-5. backend said 404 *and* the caller is a browser navigating → `index.html`
+5. backend said 404 → nothing has it (below)
+
+**A path nobody has is a 404.** If the bundle ships a `404.html` it is served,
+with a 404 status, so an app owns how "not found" looks; a caller asking for JSON
+keeps the backend's real error instead. An app whose **client-side router** owns
+those paths opts in with `apps_update spa=true` and gets `index.html` back — no
+redeploy, it is a manifest flag. That was the default once, and the cost was
+steep: every typo answered 200 with the homepage, no app could show its own 404
+page, and a broken link was indistinguishable from a working one.
 
 OAuth callbacks, download links and server-rendered pages need no declaration:
 they are simply GETs the bundle does not have, so they reach the backend like

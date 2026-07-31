@@ -20,13 +20,14 @@ router = APIRouter(prefix="/apps", tags=["frontend"],
 
 async def _sync_manifest(c, app_id: str) -> dict:
     row = await c.fetchrow(
-        "SELECT image, has_frontend, redirects FROM apps WHERE id = $1", app_id)
+        "SELECT image, has_frontend, redirects, spa FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
     has_backend = bool(row["image"])
-    # Rewrite the whole manifest, redirects included — a frontend deploy must not
-    # drop rules the static host is relying on.
-    frontends.write_manifest(app_id, has_backend, list(row["redirects"] or []))
+    # Rewrite the whole manifest — redirects and the SPA flag included — since a
+    # frontend deploy must not drop settings the static host is relying on.
+    frontends.write_manifest(app_id, has_backend, list(row["redirects"] or []),
+                             spa=bool(row["spa"]))
     # Make sure the static host actually has a route for this hostname. A no-op
     # once the route exists, so repeat deploys don't restart the shared host.
     try:
@@ -91,8 +92,9 @@ async def write_frontend(app_id: str, body: FrontendFiles):
     images), have the app's CI upload a zip instead — see apps_deploy_workflow.
 
     Replaces the whole site: files not included here are removed. Include
-    index.html; it is what a browser navigation resolves to, so SPA-style deep
-    links work automatically.
+    index.html; it is what "/" resolves to. Add a 404.html and it is served for
+    paths the site does not have. If the site is a single-page app whose router
+    owns those paths, set apps_update spa=true so they serve index.html instead.
     """
     async with app_lock(app_id), pool().acquire() as c:
         if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):

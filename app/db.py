@@ -58,6 +58,12 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS backend_routes text[] NOT NU
 -- order decides which rule wins.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS redirects jsonb NOT NULL DEFAULT '[]'::jsonb;
 
+-- Single-page app: a path the bundle does not contain is a client-side route,
+-- so the entrypoint is served instead of a 404. Off by default — a typo should
+-- be a 404, not a 200 showing the homepage — and only an app whose router
+-- actually owns those paths should turn it on.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS spa boolean NOT NULL DEFAULT false;
+
 -- The path the container healthcheck requests. Recorded at create time and
 -- applied when the container is first created, which happens on the app's first
 -- CI deploy rather than at creation — the platform does not know an app's image

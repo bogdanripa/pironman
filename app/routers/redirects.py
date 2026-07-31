@@ -86,9 +86,10 @@ async def _apply(c, app_id: str) -> dict:
     sure its hostname is routed there (an app can have redirects without a
     frontend)."""
     row = await c.fetchrow(
-        "SELECT image, redirects FROM apps WHERE id = $1", app_id)
+        "SELECT image, redirects, spa FROM apps WHERE id = $1", app_id)
     rules = list(row["redirects"] or [])
-    frontends.write_manifest(app_id, bool(row["image"]), rules)
+    frontends.write_manifest(app_id, bool(row["image"]), rules,
+                             spa=bool(row["spa"]))
     try:
         routed = await routing.sync_frontend_routes(c)
     except Exception as e:

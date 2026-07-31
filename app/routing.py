@@ -163,7 +163,8 @@ def is_fronted(row) -> bool:
 #   - it has redirect rules, which the static host applies even with no bundle;
 #   - it has a backend that sleeps, and so needs something that is awake to hold
 #     its route and start it.
-_FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle FROM apps "
+_FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle, spa "
+            "FROM apps "
             "WHERE id <> $1 AND (has_frontend = true "
             "  OR jsonb_array_length(redirects) > 0 "
             "  OR (coolify_uuid IS NOT NULL AND sleep_when_idle = true)) "
@@ -213,7 +214,8 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
     for r in rows:
         try:
             frontends.write_manifest(r["id"], bool(r["image"]),
-                                     list(r["redirects"] or []))
+                                     list(r["redirects"] or []),
+                                     spa=bool(r["spa"]))
         except OSError:
             pass  # the volume will be there on the next sync; routing is unharmed
 

@@ -307,7 +307,9 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
             "enforces it: OAuth callbacks, downloads and server-rendered pages "
             "work wherever they live, because they are simply paths the bundle "
             "does not have. A client-side route the backend also rejects falls "
-            "back to index.html, so SPA deep links work too.",
+            "not have. A path nobody has is a 404, and the bundle\'s own "
+            "404.html is used if it ships one; a single-page app whose router "
+            "owns those paths sets apps_update spa=true to get index.html back.",
             "The frontend upload needs the app's scoped deploy key as the PAAS_KEY "
             "repository secret. Install it yourself rather than asking the user: "
             "apps_create returns the key as `paas_key` (apps_deploy_key re-issues "

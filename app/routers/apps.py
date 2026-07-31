@@ -37,6 +37,14 @@ class CreateApp(BaseModel):
                     "return HTTP 200 without authentication. Leave as '/' unless "
                     "the app has a dedicated health endpoint or its root path "
                     "requires a login.")
+    spa: bool = Field(
+        default=False,
+        description="Set true only for a single-page app whose client-side router "
+                    "owns paths that are not files (React Router, Vue Router and "
+                    "the like). Then any unmatched path serves index.html so deep "
+                    "links work. Left false, an unmatched path is a 404 — which is "
+                    "what it should be for a typo or a dead link, and what lets the "
+                    "app ship its own 404.html.")
 
 
 class UpdateCode(BaseModel):
@@ -87,6 +95,13 @@ class UpdateApp(BaseModel):
         description="Whether this app scales to zero when idle, waking on the next "
                     "request (which then takes a few seconds). Has no effect on a "
                     "frontend-only app: it has no container to stop.")
+    spa: bool | None = Field(
+        default=None,
+        description="Whether unmatched paths are client-side routes. True serves "
+                    "index.html for any path the bundle and backend do not have, so "
+                    "a single-page app's deep links work. False (the default) makes "
+                    "them a 404, and the bundle's own 404.html is used if it has "
+                    "one. Takes effect immediately — no redeploy.")
 
 
 class Sleep(BaseModel):
@@ -198,6 +213,10 @@ async def get_app(app_id: str):
         # Ordered redirect rules, first match wins (apps_redirects_list/_set).
         "redirects": list(row["redirects"] or []),
 
+        # Whether a path neither the bundle nor the backend has serves index.html
+        # (a client-side route) or 404s. See apps_update.
+        "spa": row["spa"],
+
         "crons": [dict(c) for c in crons],
         "env": [{"key": r["key"], "preview": envs.mask(r["value"])} for r in env],
     }
@@ -260,13 +279,14 @@ async def create_app(body: CreateApp):
         async with pool().acquire() as c:
             await c.execute(
                 "INSERT INTO apps (id, image, coolify_uuid, db_engine, "
-                "db_user, db_password, db_name, health_path, sleep_when_idle) "
-                "VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, false)",
+                "db_user, db_password, db_name, health_path, sleep_when_idle, "
+                "spa) "
+                "VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, false, $7)",
                 body.id, body.db_engine,
                 db_info["user"] if db_info else None,
                 db_info["password"] if db_info else None,
                 db_info["database"] if db_info else None,
-                body.health_path)
+                body.health_path, body.spa)
             key = await mint_key(c, f"ci-{body.id}", app_id=body.id)
     except Exception:
         if db_info:
@@ -401,6 +421,9 @@ async def update_app(app_id: str, body: UpdateApp):
 
     - **auto_update** — whether the box redeploys when the watched tag moves.
     - **sleep_when_idle** — whether the app scales to zero when idle.
+    - **spa** — whether an unmatched path is a client-side route (serve
+      index.html) or a 404. Only turn it on for an app with a client-side router;
+      it applies at once, with no redeploy.
 
     To give an app a *frontend*, publish one (apps_frontend_write, or a CI upload)
     — there is nothing to configure here for that.
@@ -414,9 +437,23 @@ async def update_app(app_id: str, body: UpdateApp):
         changed.update(await set_autoupdate(app_id, AutoUpdate(enabled=body.auto_update)))
     if body.sleep_when_idle is not None:
         changed.update(await set_sleep(app_id, Sleep(enabled=body.sleep_when_idle)))
+    if body.spa is not None:
+        changed.update(await _set_spa(app_id, body.spa))
     if len(changed) == 1:
         raise HTTPException(400, "nothing to update — pass at least one field")
     return changed
+
+
+async def _set_spa(app_id: str, enabled: bool) -> dict:
+    """Turn client-side routing on or off. Only the manifest the static host reads
+    changes, so it takes effect on the next request — nothing is redeployed."""
+    async with pool().acquire() as c:
+        await c.execute("UPDATE apps SET spa = $1 WHERE id = $2", enabled, app_id)
+        row = await c.fetchrow(
+            "SELECT image, redirects FROM apps WHERE id = $1", app_id)
+    frontends.write_manifest(app_id, bool(row["image"]),
+                             list(row["redirects"] or []), spa=enabled)
+    return {"spa": enabled}
 
 
 async def _apply_image(app_id: str, image: str) -> dict:

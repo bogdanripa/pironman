@@ -165,9 +165,11 @@ def deploy_files(app_id: str, files: dict[str, str]) -> dict:
 
 
 def write_manifest(app_id: str, has_backend: bool,
-                   redirects: list[dict] | None = None) -> None:
+                   redirects: list[dict] | None = None,
+                   spa: bool = False) -> None:
     """What the static host needs and cannot see on disk: whether this app has a
-    backend to forward unmatched requests to, and its ordered redirect rules.
+    backend to forward unmatched requests to, its ordered redirect rules, and
+    whether unmatched paths are client-side routes.
 
     Creates the directory if absent, so an app with redirects but no bundle is
     still served by the static host.
@@ -177,6 +179,7 @@ def write_manifest(app_id: str, has_backend: bool,
     (d / ".pironman.json").write_text(json.dumps({
         "has_backend": has_backend,
         "redirects": redirects or [],
+        "spa": spa,
     }))
 
 
