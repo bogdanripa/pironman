@@ -58,12 +58,6 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS backend_routes text[] NOT NU
 -- order decides which rule wins.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS redirects jsonb NOT NULL DEFAULT '[]'::jsonb;
 
--- Repair rows written before the jsonb codec landed: a double-encoded value is
--- stored as a JSON *string* ("[]") rather than an array, which reads back as
--- text and iterates into ['[', ']']. jsonb_typeof identifies them precisely.
-UPDATE apps SET redirects = redirects #>> '{}'
- WHERE jsonb_typeof(redirects) = 'string';
-
 -- The path the container healthcheck requests. Recorded at create time and
 -- applied when the container is first created, which happens on the app's first
 -- CI deploy rather than at creation — the platform does not know an app's image
@@ -153,6 +147,19 @@ CREATE TABLE IF NOT EXISTS analytics_latency (
 """
 
 
+# Best-effort data repairs, run after the schema and each independently. These
+# are not structural: if one fails the platform still works, so a bad repair must
+# never stop the control plane from booting. One did exactly that — an UPDATE
+# assigning text (#>>) to a jsonb column has no implicit cast, so ensure_schema
+# raised, the lifespan died and uvicorn exited 3 in a crash loop.
+_REPAIRS = [
+    # Rows written before the jsonb codec landed were double-encoded, stored as a
+    # JSON *string* ("[]") rather than an array, and read back as text.
+    """UPDATE apps SET redirects = (redirects #>> '{}')::jsonb
+        WHERE jsonb_typeof(redirects) = 'string'""",
+]
+
+
 async def _init_conn(conn: asyncpg.Connection) -> None:
     """Decode jsonb to Python objects instead of raw strings.
 
@@ -173,8 +180,17 @@ async def init_pool() -> None:
                                       init=_init_conn)
 
 async def ensure_schema() -> None:
+    """Structural schema first — that must succeed, since nothing works without
+    it. Then each repair on its own, swallowed: a data fix that fails leaves the
+    platform working, whereas letting it raise here takes the control plane down
+    and prevents the deploy that would fix it."""
     async with _pool.acquire() as c:
         await c.execute(_SCHEMA)
+        for repair in _REPAIRS:
+            try:
+                await c.execute(repair)
+            except Exception:
+                pass
 
 async def close_pool() -> None:
     if _pool:
