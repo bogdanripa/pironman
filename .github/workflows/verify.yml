@@ -1,0 +1,124 @@
+name: verify
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'An app with BOTH a frontend and a backend, to check the split'
+        default: 'smartbill-mcp'
+
+# End-to-end checks against the LIVE box, from outside it.
+#
+# Every failure this repo has spent real time on shared one shape: something
+# reported success while serving the wrong thing. A rolled-back deploy left the
+# old container answering; a backend moved to an internal hostname kept serving
+# JSON while advertising URLs nobody could reach; a dead backend was papered over
+# with the site's homepage; a compressed response was handed to the browser
+# labelled as text. None of those show up as an error anywhere — you have to go
+# and look, from the outside, at what a real client actually receives.
+#
+# So this asserts the platform's externally visible invariants. It is
+# workflow_dispatch only: it is a diagnostic to reach for after a change, not
+# something to run on every push.
+
+concurrency:
+  group: verify
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      SUFFIX: -coolify.bogdanripa.com
+      APP: ${{ inputs.app || 'smartbill-mcp' }}
+    steps:
+      - name: The static host serves no site of its own
+        run: |
+          code=$(curl -s -o /tmp/b -w '%{http_code}' --max-time 20 "https://web$SUFFIX/")
+          echo "GET https://web$SUFFIX/ -> $code"; head -c 200 /tmp/b; echo
+          # It hosts other apps' sites and never one of its own, which is why its
+          # healthcheck is on /_health. A 200 here means a stray bundle is being
+          # served on the platform's own infrastructure hostname.
+          test "$code" = "404" || { echo "::error::expected 404, got $code"; exit 1; }
+
+      - name: A frontend-only app serves its bundle
+        run: |
+          code=$(curl -s -o /tmp/b -w '%{http_code}' --max-time 20 "https://dashboard$SUFFIX/")
+          type=$(curl -s -o /dev/null -w '%{content_type}' --max-time 20 "https://dashboard$SUFFIX/")
+          echo "GET https://dashboard$SUFFIX/ -> $code ($type)"
+          test "$code" = "200" || { echo "::error::dashboard returned $code"; exit 1; }
+          case "$type" in text/html*) ;; *) echo "::error::served $type"; exit 1 ;; esac
+
+      - name: A client-side deep link falls back to the entrypoint
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+            -H 'Accept: text/html' "https://dashboard$SUFFIX/some/spa/route")
+          echo "GET /some/spa/route -> $code"
+          test "$code" = "200" || { echo "::error::SPA fallback broken ($code)"; exit 1; }
+
+      - name: A frontend+backend app serves the bundle at /
+        run: |
+          type=$(curl -s -o /tmp/b -w '%{content_type}' --max-time 30 \
+            -H 'Accept: text/html' "https://$APP$SUFFIX/")
+          echo "GET https://$APP$SUFFIX/ -> $type"
+          # JSON here means the backend still owns the public hostname and the
+          # bundle is not in front of it.
+          case "$type" in text/html*) ;; *) echo "::error::/ served $type, not the bundle"; exit 1 ;; esac
+
+      - name: Its backend answers on the PUBLIC hostname
+        run: |
+          code=$(curl -s -o /tmp/h -w '%{http_code}' --max-time 60 "https://$APP$SUFFIX/health")
+          echo "GET /health -> $code"; head -c 200 /tmp/h; echo
+          test "$code" = "200" || { echo "::error::backend unreachable ($code)"; exit 1; }
+
+      - name: Nothing advertises an internal hostname
+        run: |
+          # The failure this catches serves perfectly valid metadata that no
+          # client can act on, so a presence check passes and everything looks
+          # fine right up until a real connection attempt.
+          for path in /.well-known/oauth-authorization-server /.well-known/oauth-protected-resource; do
+            code=$(curl -s -o /tmp/m -w '%{http_code}' --max-time 20 "https://$APP$SUFFIX$path")
+            echo "GET $path -> $code"; head -c 300 /tmp/m; echo
+            [ "$code" = "404" ] && continue   # app does not do OAuth; not a failure
+            test "$code" = "200" || { echo "::error::$path returned $code"; exit 1; }
+            if grep -Eqi '\.internal|localhost|127\.0\.0\.1' /tmp/m; then
+              echo "::error::$path advertises an unreachable host"; cat /tmp/m; exit 1
+            fi
+            grep -q "$APP$SUFFIX" /tmp/m \
+              || { echo "::error::$path does not mention the public host"; cat /tmp/m; exit 1; }
+          done
+
+      - name: A proxied response is not served as an undecodable blob
+        run: |
+          # Traefik's gzip middleware compresses backend responses over ~1KB. If
+          # the proxy forwards those bytes while dropping content-encoding, the
+          # client renders a gzip stream as text — which is what an OAuth consent
+          # page looked like. Small responses were unaffected, so this checks the
+          # bytes rather than trusting the status code.
+          for path in / /authorize /health; do
+            curl -s --max-time 30 -H 'Accept-Encoding: gzip, br' \
+              -o /tmp/raw "https://$APP$SUFFIX$path" || continue
+            magic=$(head -c 2 /tmp/raw | od -An -tx1 | tr -d ' \n')
+            echo "$path -> first bytes: ${magic:-empty}"
+            case "$magic" in
+              1f8b) echo "::error::$path served raw gzip to a client that must decode it"; exit 1 ;;
+            esac
+          done
+
+      - name: An unauthenticated MCP call is challenged, not swallowed
+        run: |
+          code=$(curl -s -D /tmp/hdr -o /tmp/body -w '%{http_code}' --max-time 30 \
+            -X POST "https://$APP$SUFFIX/mcp" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')
+          echo "POST /mcp -> $code"; head -c 200 /tmp/body; echo
+          # 200/401/403 are all real answers from the app. A 404 or 502 means the
+          # request never reached it, and an HTML body means it was answered with
+          # the site's homepage instead.
+          case "$code" in
+            200|401|403) ;;
+            *) echo "::error::/mcp returned $code — the backend did not answer"; cat /tmp/hdr; exit 1 ;;
+          esac
+          if head -c 200 /tmp/body | grep -qi '<!doctype\|<html'; then
+            echo "::error::/mcp was answered with HTML — the frontend swallowed an API call"; exit 1
+          fi
