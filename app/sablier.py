@@ -25,7 +25,7 @@ import json
 
 from . import autoupdate, coolify
 from .config import (SABLIER_URL, SABLIER_SESSION_DURATION, SABLIER_STRATEGY,
-                     SABLIER_EXCLUDE)
+                     SABLIER_BLOCKING_TIMEOUT, SABLIER_EXCLUDE)
 
 
 def excluded(app_id: str) -> bool:
@@ -85,10 +85,12 @@ def enrolled_labels(labels: dict[str, str], app_id: str) -> dict[str, str]:
     d[f"{p}.sablierUrl"] = SABLIER_URL
     d[f"{p}.group"] = app_id
     d[f"{p}.sessionDuration"] = SABLIER_SESSION_DURATION
-    if SABLIER_STRATEGY == "blocking":
-        d[f"{p}.blocking.timeout"] = "1m"
-    else:
+    # Blocking (the default): the caller's request is held until the app answers,
+    # so waking looks like one slow request rather than an HTML interstitial.
+    if SABLIER_STRATEGY == "dynamic":
         d[f"{p}.dynamic.displayName"] = app_id
+    else:
+        d[f"{p}.blocking.timeout"] = SABLIER_BLOCKING_TIMEOUT
 
     # Prepend the middleware to every existing router chain (Coolify always emits
     # a .middlewares label per router — gzip — so there is one to prepend to).

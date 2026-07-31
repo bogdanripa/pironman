@@ -39,7 +39,13 @@ ALERT_5XX_THRESHOLD = int(os.environ.get("ALERT_5XX_THRESHOLD", "5"))
 #     keep it false until enrollment is verified on one app (apps_sablier).
 SABLIER_URL              = os.environ.get("SABLIER_URL", "http://sablier:10000")
 SABLIER_SESSION_DURATION = os.environ.get("SABLIER_SESSION_DURATION", "5m")
-SABLIER_STRATEGY         = os.environ.get("SABLIER_STRATEGY", "dynamic")  # or blocking
+# "blocking" holds the request until the app is up and then returns the app's own
+# response — a caller just sees a slow first request. "dynamic" instead answers
+# with Sablier's HTML waiting page, which is wrong for anything a program calls
+# (an API client or MCP server gets HTML where it expected JSON), so blocking is
+# the default here. SABLIER_BLOCKING_TIMEOUT bounds the wait.
+SABLIER_STRATEGY         = os.environ.get("SABLIER_STRATEGY", "blocking")
+SABLIER_BLOCKING_TIMEOUT = os.environ.get("SABLIER_BLOCKING_TIMEOUT", "60s")
 SABLIER_EXCLUDE          = set(
     x.strip() for x in os.environ.get("SABLIER_EXCLUDE", "api").split(",") if x.strip())
 SABLIER_AUTO_ENROLL      = os.environ.get("SABLIER_AUTO_ENROLL", "").lower() in (
