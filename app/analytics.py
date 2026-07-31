@@ -35,6 +35,10 @@ _log = logging.getLogger("pironman.analytics")
 # treated as a stall rather than a quiet box.
 _STALL_AFTER = 15 * 60
 
+# The most log we will ask Docker for in one pass. Bounds the work whatever state
+# the cursor is in — see _read_since.
+MAX_WINDOW = 60 * 60
+
 
 _CURSOR_KEY = "accesslog_cursor"
 
@@ -143,20 +147,48 @@ def _parse_line(line: str) -> dict | None:
 
 
 async def _read_since(cursor: str | None) -> str:
-    """Raw access-log text from the proxy container, limited to roughly the
-    window we still need. `--since` takes a container-log timestamp; we pass the
-    cursor (an RFC3339 StartUTC) so Docker hands back only recent lines, then the
-    caller drops any at/before the cursor by StartUTC. First run bootstraps a day.
+    """Raw access-log text from the proxy container, for a **bounded** window.
 
-    Docker gets a plain whole-second RFC3339 stamp (2026-07-30T14:31:17Z), not the
-    cursor's nanosecond precision, which some Docker versions reject on --since.
-    Dropping the sub-second part only widens the window slightly; the exact,
-    full-precision `start <= cursor` check in ingest_once drops the boundary line
-    already counted, so nothing is double-counted.
+    `--since` takes a container-log timestamp; we pass the cursor (an RFC3339
+    StartUTC) so Docker hands back only recent lines, then the caller drops any
+    at/before the cursor by StartUTC. Docker gets a plain whole-second stamp
+    (2026-07-30T14:31:17Z), not the cursor's nanosecond precision, which some
+    Docker versions reject. Dropping the sub-second part only widens the window
+    slightly; the exact check in ingest_once drops the boundary line already
+    counted, so nothing is double-counted.
+
+    Two things here are load-bearing, and their absence froze every analytic on
+    this box for twelve hours:
+
+    **The window is capped.** If the cursor is further back than MAX_WINDOW, we
+    read the cap instead and skip the gap. Otherwise a single failed pass is
+    permanent: the cursor does not advance, so the next pass asks for a larger
+    window, which fails more easily, which... The gap is a few missing rows; the
+    alternative is never ingesting again.
+
+    **The exit code is checked.** `_docker` reports a timeout by *returning*
+    (124, "docker timed out"). Ignoring that yields a string with no JSON in it,
+    which is indistinguishable from a quiet log — zero lines counted, no error,
+    cursor pinned. That is exactly how this failed.
     """
-    since = (cursor[:19] + "Z") if cursor else "24h"
-    _, out = await autoupdate._docker(
+    behind = _behind(cursor)
+    skipped = None
+    if cursor and (behind is None or behind > MAX_WINDOW):
+        skipped = behind
+        since = f"{int(MAX_WINDOW)}s"
+    else:
+        since = (cursor[:19] + "Z") if cursor else "24h"
+
+    rc, out = await autoupdate._docker(
         "logs", "--since", since, ANALYTICS_PROXY, timeout=120)
+    if rc != 0:
+        _log.warning("analytics: could not read %s logs (rc=%s): %s",
+                     ANALYTICS_PROXY, rc, out.strip()[:200])
+        return ""
+    if skipped:
+        _log.warning("analytics: cursor was %.0f minutes behind; read only the "
+                     "last %d minutes and skipped the gap",
+                     skipped / 60, MAX_WINDOW // 60)
     return out
 
 
