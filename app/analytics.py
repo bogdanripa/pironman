@@ -31,6 +31,11 @@ from .db import pool
 
 _log = logging.getLogger("pironman.analytics")
 
+# How far the cursor may fall behind before a pass that counted nothing is
+# treated as a stall rather than a quiet box.
+_STALL_AFTER = 15 * 60
+
+
 _CURSOR_KEY = "accesslog_cursor"
 
 # Upper edges (ms) of the latency histogram buckets; a request lands in the first
@@ -74,6 +79,14 @@ def _moment(start: str) -> datetime | None:
         return datetime.fromisoformat(_FRACTION.sub(r"\1", start).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _behind(cursor: str | None) -> float | None:
+    """Seconds between the cursor and now, or None if it will not parse."""
+    if not cursor:
+        return 0.0
+    at = _moment(cursor)
+    return None if at is None else (datetime.now(timezone.utc) - at).total_seconds()
 
 
 def _visitor(ip: str, ua: str) -> str:
@@ -266,6 +279,22 @@ async def ingest_once() -> dict:
                 "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
                 _CURSOR_KEY, newest)
 
+    # Say what happened. A pass that counts nothing is normal on a quiet box and
+    # indistinguishable from one that is stuck — which is exactly the state that
+    # left "last accessed" empty with no error anywhere. So the quiet case is
+    # silent only while the cursor is keeping up; once it falls behind, that is a
+    # stall and it says so.
+    if seen:
+        _log.info("analytics: counted %d lines, cursor now %s", seen, newest)
+    else:
+        behind = _behind(cursor)
+        if behind is None:
+            _log.warning("analytics: no lines counted and the cursor %r cannot be "
+                         "parsed — nothing will ever advance", cursor)
+        elif behind > _STALL_AFTER:
+            _log.warning("analytics: no lines counted; cursor is %.0f minutes "
+                         "behind (%s). Log lines are being read but none accepted.",
+                         behind / 60, cursor)
     return {"lines_counted": seen, "cursor": newest or None}
 
 
