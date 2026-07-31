@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import require_key
 from ..db import pool
+from ..locks import app_lock
 from .. import autoupdate
 
 router = APIRouter(prefix="/apps", tags=["refresh"],
@@ -31,7 +32,11 @@ router = APIRouter(prefix="/apps", tags=["refresh"],
 @router.post("/{app_id}/refresh", operation_id="apps_refresh",
              summary="Pull the app's watched tag and redeploy if the image changed")
 async def refresh(app_id: str):
-    async with pool().acquire() as c:
+    # Serialised against this app's other deploy paths: an app that ships a
+    # frontend and a backend runs both CI jobs at once, and a frontend upload can
+    # redeploy the app too (routing labels). Overlapping Coolify deploys of one
+    # app do not queue — they fight.
+    async with app_lock(app_id), pool().acquire() as c:
         app = await c.fetchrow(
             f"SELECT {autoupdate.APP_COLS} FROM apps WHERE id = $1", app_id)
         if not app:

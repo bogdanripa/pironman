@@ -52,6 +52,15 @@ def _workflow(app_id: str, repo_name: str) -> str:
           push:
             branches: [main]
 
+        # Every run pushes the same :latest tag and the box deploys whatever that
+        # points at, so two overlapping runs race and the one that FINISHES last
+        # wins regardless of which commit is newer — an arm64 build takes ~15
+        # minutes under QEMU, so a quick follow-up commit can easily land first
+        # and then be undone by its predecessor. One run at a time, newest wins.
+        concurrency:
+          group: deploy-${{{{ github.ref }}}}
+          cancel-in-progress: true
+
         jobs:
           deploy:
             runs-on: ubuntu-latest

@@ -4,7 +4,7 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool, pool
-from . import autoupdate, analytics, alerts, routing
+from . import autoupdate, analytics, alerts, routing, sablier
 from .cors import CorsMiddleware
 from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
@@ -225,10 +225,15 @@ async def _autoupdate_loop():
             await autoupdate.check_all()
         except Exception:
             pass  # a bad sweep must never take the control plane down
-        # Same cadence: repair any routing the static host lost to a label
-        # regeneration, so a frontend never stays unreachable for longer than the
-        # sweep interval.
+        # Same cadence: repair anything a Coolify label regeneration undid — the
+        # static host's per-app routers, and each app's Sablier enrollment. Both
+        # fail silently (a hostname resolves nowhere; an app quietly stops
+        # sleeping), so nothing but a sweep would find them.
         await _sync_routes("hourly sweep")
+        try:
+            await sablier.reconcile()
+        except Exception:
+            pass
 
 
 async def _analytics_loop():
@@ -298,7 +303,7 @@ app.include_router(env.app_router)    # apps_env_* — per-app env, part of the 
 app.include_router(crons.router)
 app.include_router(query.router)
 app.include_router(env.shared_router)  # env_* — shared, account-wide variables
-app.include_router(refresh.router)     # POST /apps/{id}/refresh — unauth CI hook
+app.include_router(refresh.router)     # POST /apps/{id}/refresh — CI deploy hook
 app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secrets
 app.include_router(analytics_router.router)  # analytics_* — cross-app visitor stats
 app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health snapshot

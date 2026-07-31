@@ -345,27 +345,69 @@ through the static host so they work for backend-only apps too.
 Because it is same-origin, the frontend calls its API with a relative path: no
 CORS, no API base URL, no cookie-domain juggling.
 
-**Routing.** A frontend-only app has no container, so nothing would claim its
-hostname. `app/routing.py` derives one Traefik router per frontend app from the
-database and writes them onto the **static host's** Coolify custom labels, so the
-app's Host resolves to the shared static host. It re-syncs after every frontend
-deploy and after an app is deleted, and is a no-op when unchanged (a frontend
-deploy must stay a one-second file swap, not a restart of the shared host).
+**Routing — the static host is the front door.** `app/routing.py` derives one
+Traefik router per fronted app from the database and writes them onto the **static
+host's** Coolify custom labels, so the app's Host resolves to `web`. An app is
+fronted when it has a bundle, or redirect rules, or **a backend that sleeps** (see
+§9c). It re-syncs after every frontend deploy, after an app is deleted, at startup
+and hourly, and is a no-op when unchanged (a frontend deploy must stay a
+one-second file swap, not a restart of the shared host).
+
+An app that has both a frontend and a backend would then have two routers on one
+hostname. They are told apart by a **marker header** (`X-Pironman-Backend`) that
+only the static host sends: the backend's own router rule gains
+`&& Header(...)` plus an explicit priority, so a browser matches the frontend
+router and a forwarded request matches the backend's. The app therefore keeps its
+**real hostname end to end**.
+
+> That last point is not cosmetic. An earlier design renamed the backend's router
+> to `Host: <app-id>.internal`. Traefik rewrites `X-Forwarded-Host` on that hop,
+> so the backend computed its own public origin as `https://<app-id>.internal` and
+> emitted it in OAuth discovery metadata, `WWW-Authenticate` challenges and
+> redirects — none of which resolve. An app must not be able to tell it is behind
+> the static host.
+
+The order of the two writes is deliberate: the static host's routers first, then
+the backends are scoped, and only after the static host has verifiably come back
+up. Scoping a backend is what stops it answering its hostname unconditionally, so
+doing it first — or into a host still restarting — leaves the app answering
+nowhere. Reversed, the worst case is that both routers match, the backend's longer
+rule wins, and the app serves exactly as it did before.
 
 > Coolify here rejects the readonly-labels flag (`422 … field is not allowed`),
 > so the routers are written **unprotected** — a Coolify label regeneration can
-> drop them. They come back on the next frontend deploy, since the label set is
-> derived from the database. Symptom to recognise: a frontend that suddenly 404s;
-> re-publish it to restore the route.
+> drop them. The startup and hourly re-syncs put them back, since the label set is
+> derived from the database.
 
 *Verified end to end:* frontend-only app created with no image → files published
 → route created automatically → served over HTTPS.
 
-**Waking a sleeping backend:** the static host proxies **back through Traefik**
-with `Host: <app-id>.internal` (an internal-only router carrying the Sablier
-middleware) rather than straight to the container — a direct container connection
-would bypass Sablier and fail against a sleeping app. Using the public host would
-loop, since that host's catch-all points at the static host.
+## 9c. Waking a sleeping app
+
+**Traefik's Docker provider only sees running containers.** When Sablier stops
+one, its router disappears — and so does the Sablier middleware that was supposed
+to wake it. The only route to a sleeping app exists exactly when the app does not
+need it. Requests 404, nothing starts the container, and because "stopped" is also
+what a healthy idle app looks like, nothing reports it: an app can be dead for
+days and read as working-as-designed.
+
+That is why every sleeping app is fronted by the static host, which never sleeps
+(hard-excluded in `sablier.excluded`, not merely by config). The route always
+exists because it lives on a container that is always up.
+
+The static host forwards to the backend through Traefik, with the marker header
+and the app's real Host. If the backend is stopped, Traefik has no router for it,
+so the forwarded request matches the *frontend* router and arrives back at the
+static host. It recognises its own marker, answers `503` + `X-Pironman-Backend-Down`,
+and the forwarding side reads that as "asleep": it calls **Sablier's blocking API
+directly** (`GET /api/strategies/blocking?names=<app>`), which starts the container
+and returns when it is ready, then retries. Sablier's own Docker provider lists
+stopped containers, so it can always find the group — it is only Traefik that
+cannot. The caller sees one slow request; there is no interstitial.
+
+The one thing the static host must never do here is fall through to `index.html`.
+An unreachable backend that answers with the site's homepage looks like a working
+site — that is precisely how the failure above stayed invisible. It is a 502.
 
 **CDN caching** is defended in layers, because a mis-cached API response is the
 one failure that really hurts:

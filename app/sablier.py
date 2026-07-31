@@ -25,11 +25,14 @@ import json
 
 from . import autoupdate, coolify
 from .config import (SABLIER_URL, SABLIER_SESSION_DURATION, SABLIER_STRATEGY,
-                     SABLIER_BLOCKING_TIMEOUT, SABLIER_EXCLUDE)
+                     SABLIER_BLOCKING_TIMEOUT, SABLIER_EXCLUDE, STATIC_HOST_APP)
 
 
 def excluded(app_id: str) -> bool:
-    return app_id in SABLIER_EXCLUDE
+    """Apps that must never sleep. The static host is hard-coded rather than left
+    to SABLIER_EXCLUDE: it is the thing that wakes everything else, so if it ever
+    slept, every app behind it would be unreachable and nothing could start it."""
+    return app_id in SABLIER_EXCLUDE or app_id == STATIC_HOST_APP
 
 
 def _mw(app_id: str) -> str:
@@ -127,6 +130,47 @@ async def enroll(uuid: str, app_id: str) -> dict:
         uuid, _as_list(enrolled_labels(labels, app_id)), app_id=app_id)
     await coolify.deploy(uuid)
     return {"labels_readonly": lab.get("readonly", False)}
+
+
+def is_enrolled(labels: dict[str, str], app_id: str) -> bool:
+    """Whether these labels actually carry this app's enrollment — the Sablier
+    group Sablier discovers it by, and the middleware that refreshes its session."""
+    mw = f"traefik.http.middlewares.{_mw(app_id)}."
+    return (labels.get("sablier.group") == app_id
+            and any(k.startswith(mw) for k in labels))
+
+
+async def reconcile() -> list[dict]:
+    """Re-enroll any app whose Sablier labels have gone missing.
+
+    The enrollment is written as Coolify custom labels marked read-only, but this
+    Coolify build rejects the read-only flag, so a deploy can regenerate the label
+    block and drop the middleware. Nothing would notice: `sablier_enrolled` stays
+    true in the database, the app simply stops sleeping and runs for ever. This
+    compares the database's belief against the container's actual labels — the
+    same shape of drift repair the static host's routers already get.
+    """
+    from .db import pool
+    out: list[dict] = []
+    async with pool().acquire() as c:
+        apps = await c.fetch(
+            "SELECT id, coolify_uuid FROM apps "
+            "WHERE sleep_when_idle = true AND coolify_uuid IS NOT NULL ORDER BY id")
+        for app in apps:
+            if excluded(app["id"]):
+                continue
+            try:
+                labels = await _current_labels(app["coolify_uuid"])
+                if not labels or is_enrolled(labels, app["id"]):
+                    continue
+                await enroll(app["coolify_uuid"], app["id"])
+                await c.execute(
+                    "UPDATE apps SET sablier_enrolled = true WHERE id = $1",
+                    app["id"])
+                out.append({"id": app["id"], "re_enrolled": True})
+            except Exception as e:
+                out.append({"id": app["id"], "error": str(e)})
+    return out
 
 
 async def unenroll(uuid: str, app_id: str) -> None:

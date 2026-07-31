@@ -48,6 +48,11 @@ SABLIER_STRATEGY         = os.environ.get("SABLIER_STRATEGY", "blocking")
 SABLIER_BLOCKING_TIMEOUT = os.environ.get("SABLIER_BLOCKING_TIMEOUT", "60s")
 SABLIER_EXCLUDE          = set(
     x.strip() for x in os.environ.get("SABLIER_EXCLUDE", "api").split(",") if x.strip())
+
+# The shared static host's app id. It fronts every app that sleeps — it is what
+# wakes them — so it must never sleep itself, and that is not left to
+# SABLIER_EXCLUDE being spelled correctly: app/sablier.py excludes it outright.
+STATIC_HOST_APP = os.environ.get("STATIC_HOST_APP", "web")
 SABLIER_AUTO_ENROLL      = os.environ.get("SABLIER_AUTO_ENROLL", "").lower() in (
     "1", "true", "yes")
 

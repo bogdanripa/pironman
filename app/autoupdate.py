@@ -216,6 +216,12 @@ async def _maybe_enroll_sablier(conn, app) -> None:
         await sablier.enroll(app["coolify_uuid"], app["id"])
         await conn.execute(
             "UPDATE apps SET sablier_enrolled = true WHERE id = $1", app["id"])
+        # It can sleep from now on, so it needs the static host in front of it
+        # before it does: Traefik drops a stopped container's router, and nothing
+        # would be left to wake it. Once per app — this branch is guarded by
+        # sablier_enrolled.
+        from . import routing
+        await routing.sync_frontend_routes(conn)
     except Exception:
         pass  # container may not be up yet; a later sweep retries
 

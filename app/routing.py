@@ -1,9 +1,25 @@
-"""Traefik routing for frontend apps.
+"""Traefik routing: the static host as every sleeping app's front door.
+
+Two problems have the same answer.
 
 A frontend-only app has no container of its own, so nothing claims its hostname
-and Traefik has nowhere to send it. This module puts that route on the **static
-host** instead: for every frontend app, a router on the `web` container matching
-that app's Host and pointing at the static host's own service.
+and Traefik has nowhere to send it.
+
+An app that **sleeps** has the same problem intermittently, and it is worse.
+Traefik's Docker provider only sees running containers, so when Sablier stops one
+its router disappears — along with the Sablier middleware that was supposed to
+wake it. The only route to the app exists exactly when the app does not need it.
+A stopped app therefore stays stopped for ever: requests 404, nothing wakes it,
+and because being stopped is also what a healthy idle app looks like, nothing
+reports it. That is not a corner case, it is every enrolled app, five minutes
+after its last request.
+
+So both get a router on the **static host** (`web`), which never sleeps: a router
+on the `web` container matching that app's Host and pointing at the static host's
+own service. `web` serves the bundle if there is one and forwards everything else
+to the backend, waking it through Sablier's API first if it is stopped — see
+web/server.py. Traefik is no longer asked to route to a container that isn't
+there.
 
 The routers are written into `web`'s Coolify custom labels (read-only, like the
 Sablier enrollment) so a redeploy of the static host cannot regenerate them away.
@@ -12,16 +28,37 @@ of which apps have frontends — no drift.
 
 An app that has **both** a frontend and a backend needs one extra step: its own
 container already claims the public hostname, and two routers matching the same
-Host is ambiguous. So the backend's router is rewritten to match
-`<app-id>.internal` instead, freeing the public host for the static host — which
-proxies back to that internal name through Traefik (and therefore through
-Sablier, so a sleeping backend still wakes). See ARCHITECTURE.md §9b.
-"""
-from . import coolify, sablier
-from .config import DOMAIN_SUFFIX
+Host is ambiguous. So the backend's router keeps the public Host and gains one
+extra condition — a marker header that only the static host sends. A request from
+a browser matches the frontend router; the same request forwarded by the static
+host matches the backend router. See ARCHITECTURE.md §9b.
 
-WEB_APP_ID = "web"
+An earlier version renamed the backend's router to `<app-id>.internal` instead.
+That worked for plain JSON APIs and quietly broke everything else: Traefik
+rewrites `X-Forwarded-Host` on the internal hop, so the backend computed its own
+public origin as `https://<app-id>.internal` and emitted that in OAuth discovery
+metadata, `WWW-Authenticate` challenges and redirects — none of which resolve.
+Keeping the real hostname end-to-end means an app cannot tell it is behind the
+static host, which is the only way absolute URLs can be right.
+"""
+from . import coolify, frontends, sablier
+from .config import DOMAIN_SUFFIX, STATIC_HOST_APP
+from .locks import ROUTING_LOCK
+
+WEB_APP_ID = STATIC_HOST_APP
 _PREFIX = "traefik.http.routers.fe-"
+
+# The static host stamps this on requests it forwards to a backend, and the
+# backend's router requires it. It is a routing discriminator, not a credential:
+# it decides which of two routers on the same hostname wins, and an outside caller
+# who sets it reaches the backend directly — exactly what it could already do
+# before the app had a frontend.
+BACKEND_HEADER = "X-Pironman-Backend"
+BACKEND_TOKEN = "1"
+
+# Traefik ranks equal-priority routers by rule length, which would already favour
+# the (longer) backend rule. Stating it beats relying on that.
+BACKEND_PRIORITY = "100"
 
 
 def _service_of(labels: dict[str, str]) -> str | None:
@@ -55,29 +92,42 @@ def build_labels(current: dict[str, str], app_ids: list[str]) -> dict[str, str]:
     return base
 
 
-def internal_host(app_id: str) -> str:
-    return f"{app_id}.internal"
+def _marker_term() -> str:
+    return f"Header(`{BACKEND_HEADER}`, `{BACKEND_TOKEN}`)"
 
 
-def internalized(labels: dict[str, str], app_id: str) -> dict[str, str]:
-    """The backend's labels with its public Host rule swapped for the internal
-    one. Only the Host(...) term is rewritten — any other condition Coolify put
-    in the rule (PathPrefix, etc.) is preserved."""
+def scoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
+    """The backend's labels with the marker-header condition added to every router
+    rule, so the public hostname is shared with the static host's router rather
+    than surrendered.
+
+    Only the Host(...) term is touched — any other condition Coolify put in the
+    rule (PathPrefix, etc.) is preserved. Idempotent, and it also migrates a rule
+    left on `<app-id>.internal` by the earlier scheme back onto the public host.
+    """
     public = f"Host(`{app_id}{DOMAIN_SUFFIX}`)"
-    internal = f"Host(`{internal_host(app_id)}`)"
-    return {k: (v.replace(public, internal)
-                if k.startswith("traefik.http.routers.") and k.endswith(".rule")
-                else v)
-            for k, v in labels.items()}
+    legacy = f"Host(`{app_id}.internal`)"
+    marker = _marker_term()
+    out: dict[str, str] = {}
+    for k, v in labels.items():
+        if k.startswith("traefik.http.routers.") and k.endswith(".rule"):
+            v = v.replace(legacy, public)
+            if marker not in v and public in v:
+                v = v.replace(public, f"{public} && {marker}", 1)
+            if marker in v:
+                out[k[: -len(".rule")] + ".priority"] = BACKEND_PRIORITY
+        out[k] = v
+    return out
 
 
-async def _internalize_backend(app_id: str, uuid: str) -> bool:
-    """Move a linked backend off the public hostname. No-op (and no redeploy) if
-    it is already internal, so this is safe to call on every frontend deploy."""
+async def _scope_backend(app_id: str, uuid: str) -> bool:
+    """Add the marker condition to a linked backend's routers. No-op (and no
+    redeploy) if it is already scoped, so this is safe to call on every frontend
+    deploy."""
     labels = await sablier._current_labels(uuid)
     if not labels:
         return False
-    desired = internalized(labels, app_id)
+    desired = scoped(labels, app_id)
     if desired == labels:
         return False
     await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()],
@@ -86,52 +136,96 @@ async def _internalize_backend(app_id: str, uuid: str) -> bool:
     return True
 
 
+# Apps the static host must front:
+#   - it has a bundle to serve;
+#   - it has redirect rules, which the static host applies even with no bundle;
+#   - it has a backend that sleeps, and so needs something that is awake to hold
+#     its route and start it.
+_FRONTED = ("SELECT id, coolify_uuid, image, redirects FROM apps "
+            "WHERE id <> $1 AND (has_frontend = true "
+            "  OR jsonb_array_length(redirects) > 0 "
+            "  OR (coolify_uuid IS NOT NULL AND sleep_when_idle = true)) "
+            "ORDER BY id")
+
+
 async def sync_frontend_routes(conn) -> dict:
-    """Make the static host's routers match the frontend apps in the database.
+    """Serialised entry point — the body computes one label set for the shared
+    static host from the whole apps table, so two concurrent syncs would each
+    write a set the other has already invalidated."""
+    async with ROUTING_LOCK:
+        return await _sync(conn)
+
+
+async def _sync(conn) -> dict:
+    """Make the static host's routers match the apps that need fronting.
 
     Redeploys the static host **only when the label set actually changes** — a
     frontend deploy is meant to be a one-second file swap, so it must not restart
     the shared host on every upload.
+
+    Order matters and is the opposite of the obvious one. The static host's
+    routers are written **first**, then each backend is scoped. Scoping a backend
+    is what stops it answering its public hostname unconditionally, so doing it
+    before the static host has a route for that hostname leaves the app reachable
+    by nobody. This way the worst case is the reverse: both routers match, the
+    backend's longer rule wins, and the app serves as it did before — degraded,
+    not dark. The next sync finishes the job.
     """
     web = await conn.fetchrow(
         "SELECT coolify_uuid FROM apps WHERE id = $1", WEB_APP_ID)
     if not web or not web["coolify_uuid"]:
-        return {"routed": [], "reason": "no 'web' static host app is set up"}
+        return {"routed": [], "reason": f"no '{WEB_APP_ID}' static host app is set up"}
 
-    # Every app the static host must see is routed to it: one with a frontend, or
-    # one with redirect rules (which the static host applies even when there is no
-    # bundle). Apps that also have a backend get their own router moved to
-    # <app>.internal first, so the two do not both claim the public hostname. The
-    # static host is excluded: it serves its own hostname directly.
-    rows = await conn.fetch(
-        "SELECT id, coolify_uuid FROM apps "
-        "WHERE (has_frontend = true OR jsonb_array_length(redirects) > 0) "
-        "AND id <> $1 ORDER BY id", WEB_APP_ID)
-    app_ids, internalized_ids = [], []
+    rows = [r for r in await conn.fetch(_FRONTED, WEB_APP_ID)
+            if not sablier.excluded(r["id"])]
+    app_ids = [r["id"] for r in rows]
+
+    # The manifest is how the static host knows an app has a backend at all. An
+    # app fronted only because it sleeps has no bundle and so no directory, and
+    # without one every request to it would 404 before reaching the proxy.
     for r in rows:
-        app_ids.append(r["id"])
-        if r["coolify_uuid"]:
-            try:
-                if await _internalize_backend(r["id"], r["coolify_uuid"]):
-                    internalized_ids.append(r["id"])
-            except Exception:
-                # Leave this app's public router alone rather than half-move it;
-                # the next sync retries. Its frontend simply isn't live yet.
-                app_ids.remove(r["id"])
+        try:
+            frontends.write_manifest(r["id"], bool(r["image"]),
+                                     list(r["redirects"] or []))
+        except OSError:
+            pass  # the volume will be there on the next sync; routing is unharmed
 
     current = await sablier._current_labels(web["coolify_uuid"])
     if not current:
         return {"routed": [], "reason": "static host has no running container yet"}
 
     desired = build_labels(current, app_ids)
-    if desired == current:
-        return {"routed": app_ids, "changed": False,
-                "internalized": internalized_ids}
+    changed = desired != current
+    readonly = None
+    if changed:
+        from . import autoupdate  # lazy: keeps the import graph one-directional
+        before = await autoupdate._container_started_at(web["coolify_uuid"])
+        res = await coolify.set_custom_labels(
+            web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()],
+            app_id=WEB_APP_ID)
+        await coolify.deploy(web["coolify_uuid"])
+        readonly = res.get("readonly", False)
+        # Wait for the new routers to actually exist before taking any backend
+        # off its public hostname. Scoping into a static host that is still
+        # restarting is the one ordering that leaves an app answering nowhere.
+        landed = await autoupdate.verify_deploy(web["coolify_uuid"], before)
+        if not landed.get("verified"):
+            return {"routed": app_ids, "changed": True, "scoped": [],
+                    "labels_readonly": readonly,
+                    "reason": "static host did not come back up; backends left on "
+                              "their public hostname"}
 
-    res = await coolify.set_custom_labels(
-        web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()],
-        app_id=WEB_APP_ID)
-    await coolify.deploy(web["coolify_uuid"])
-    return {"routed": app_ids, "changed": True,
-            "internalized": internalized_ids,
-            "labels_readonly": res.get("readonly", False)}
+    scoped_ids = []
+    for r in rows:
+        if not r["coolify_uuid"]:
+            continue
+        try:
+            if await _scope_backend(r["id"], r["coolify_uuid"]):
+                scoped_ids.append(r["id"])
+        except Exception:
+            pass  # leave its public router alone; the next sync retries
+
+    out = {"routed": app_ids, "changed": changed, "scoped": scoped_ids}
+    if readonly is not None:
+        out["labels_readonly"] = readonly
+    return out

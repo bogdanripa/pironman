@@ -24,7 +24,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The static host is the front door for every app that sleeps, so a regression
+  # here takes the whole box down rather than one app. The test stands up the
+  # real server against a fake Traefik and a fake Sablier and drives the paths
+  # that have actually broken: a woken backend, a dead one (which must 502, not
+  # quietly serve the homepage), SPA fallback, and SSE streaming.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install fastapi==0.115.6 httpx==0.28.1 uvicorn==0.34.0
+      - run: python web/tests/test_server.py
+
   deploy:
+    needs: [test]
     runs-on: ubuntu-latest
     permissions:
       contents: read

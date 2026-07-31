@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from ..auth import require_key
 from ..db import pool
+from ..locks import app_lock
 from ..config import app_url
 from .. import cdn, frontends, routing
 
@@ -52,7 +53,9 @@ async def deploy_frontend(app_id: str, request: Request):
     This is the call an app's CI makes after `npm run build`; it needs the app's
     scoped deploy key, unlike the backend's unauthenticated /refresh hook.
     """
-    async with pool().acquire() as c:
+    # Serialised: this can rewrite routing labels and redeploy, and an app's CI
+    # ships its frontend and its backend at the same time.
+    async with app_lock(app_id), pool().acquire() as c:
         if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
             raise HTTPException(404, "no such app")
         body = await request.body()
@@ -93,7 +96,7 @@ async def write_frontend(app_id: str, body: FrontendFiles):
     index.html; it is what a browser navigation resolves to, so SPA-style deep
     links work automatically.
     """
-    async with pool().acquire() as c:
+    async with app_lock(app_id), pool().acquire() as c:
         if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
             raise HTTPException(404, "no such app")
         try:

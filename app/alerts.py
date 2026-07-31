@@ -78,8 +78,14 @@ async def check_once() -> dict:
                 # genuine recovery message.
                 alerted_down = False
 
-                # 5xx: baseline is the prior count only within the same day (the
-                # counter resets each day, so a day rollover baselines from 0).
+            # 5xx: baseline is the prior count only within the same day (the
+            # counter resets each day, so a day rollover baselines from 0). This
+            # runs for EVERY app, and must: it is the only cover a sleeping app
+            # has — it is never reported down, so if it fails to wake or crashes
+            # on start, this is what says so. It spent its whole life nested in
+            # the branch above, which meant it fired only for an app that both
+            # sleeps and had previously been alerted down: in practice, never.
+            if prev is not None:
                 baseline = prev["err_server"] if prev["err_day"] == date.today() else 0
                 delta = err - baseline
                 if delta >= ALERT_5XX_THRESHOLD:

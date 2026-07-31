@@ -435,11 +435,15 @@ bundle directory, which is the only part Coolify has to be told about:
    `/data/pironman/frontends` on the other puts the bundle one level too deep and
    every site answers `{"error":"no frontend for this host"}`. Verify with:
    `docker inspect <container> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'`
-3. Keep `web` **always warm** — add it to `SABLIER_EXCLUDE` alongside `api`. A
-   sleeping frontend host would put a cold start on every app's first paint.
-4. Point each frontend app's Traefik route at `web`, and give each linked backend
-   its internal router (`Host: <app-id>.internal`) so the static host can proxy to
-   it through Sablier.
+3. `web` is **hard-excluded** from scale-to-zero in code — it fronts every app
+   that sleeps and is what wakes them, so it sleeping would strand all of them
+   with nothing able to start anything.
+4. Give `web` `SABLIER_URL` (default `http://sablier:10000`) and make sure it can
+   reach that container — it calls Sablier's blocking API to start a sleeping
+   backend, because Traefik cannot route to a stopped one. Routing itself is
+   automatic: `app/routing.py` writes a router per fronted app onto `web`'s
+   labels and adds the `X-Pironman-Backend` marker condition to each linked
+   backend's own router.
 
 Until that exists, `apps_frontend_deploy` still accepts and stores bundles — they
 simply aren't served yet.
