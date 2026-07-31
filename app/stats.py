@@ -184,9 +184,16 @@ async def app_runtime(uuid: str | None, sleeps: bool = False) -> dict:
                          "not running — the deploy failed, was rolled back, or it "
                          "crashed. apps_logs shows why")}
     s = stats[cname]
+    # Ground truth from Docker, not what we asked Coolify for: 'unless-stopped'
+    # is what keeps a slept app from waking on reboot, so report what is actually
+    # in force rather than leaving it to be inferred.
+    _, policy = await autoupdate._docker(
+        "inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", cname,
+        timeout=20)
     return {"state": "running", "container": cname,
             "cpu_pct": s.get("cpu_pct"), "mem_mb": s.get("mem_mb"),
-            "mem_pct": s.get("mem_pct")}
+            "mem_pct": s.get("mem_pct"),
+            "restart_policy": policy.strip() or None}
 
 
 async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:

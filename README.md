@@ -162,6 +162,14 @@ stopped container alone and scale-to-zero apps come back from a reboot asleep.
 
 `api` and `web` are excluded from sleeping and always start.
 
+**Verifying it took.** The Coolify field that carries docker run options is not
+identical across builds, so the flag can be rejected. Two places report the truth
+rather than the intent: `apps_update` returns `restart_policy` (false plus a
+reason if Coolify refused the field), and `apps_get`'s `backend.runtime` reports
+`restart_policy` read straight from Docker (`unless-stopped` is what you want).
+The raw check is
+`docker inspect <container> --format '{{.HostConfig.RestartPolicy.Name}}'`.
+
 ## Deploy keys
 
 Two kinds of API key, both stored only as sha256 in `api_keys`:

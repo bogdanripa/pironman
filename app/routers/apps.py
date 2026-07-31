@@ -685,9 +685,10 @@ async def set_sleep(app_id: str, body: Sleep):
                 400, "this is a frontend-only app: it has no container to sleep. "
                      "Its assets are served by the shared frontend host, which "
                      "stays warm.")
+        applied = {}
         try:
             if body.enabled:
-                await sablier.enroll(row["coolify_uuid"], app_id)
+                applied = await sablier.enroll(row["coolify_uuid"], app_id)
             else:
                 await sablier.unenroll(row["coolify_uuid"], app_id)
         except RuntimeError as e:
@@ -695,7 +696,9 @@ async def set_sleep(app_id: str, body: Sleep):
         await c.execute(
             "UPDATE apps SET sleep_when_idle = $1, sablier_enrolled = $1 "
             "WHERE id = $2", body.enabled, app_id)
-    return {"id": app_id, "sleep_when_idle": body.enabled}
+    # `restart_policy` reports whether Coolify accepted the --restart flag: false
+    # means this build rejected the field, and the app will wake on reboot.
+    return {"id": app_id, "sleep_when_idle": body.enabled, **applied}
 
 
 async def _rollback(uuid: str, app_id: str, engine: str | None) -> None:

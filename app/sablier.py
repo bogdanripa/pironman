@@ -106,19 +106,25 @@ def _as_list(d: dict[str, str]) -> list[str]:
     return [f"{k}={v}" for k, v in d.items()]
 
 
-async def enroll(uuid: str, app_id: str) -> None:
+async def enroll(uuid: str, app_id: str) -> dict:
     """Write the app's Sablier enrollment into Coolify (read-only labels) and
     redeploy so it takes effect. Raises if the app has no running container to
-    read the base labels from (deploy it once first)."""
+    read the base labels from (deploy it once first).
+
+    Returns what each step achieved, because both of them depend on Coolify field
+    names this build may not accept — a caller that gets no report back cannot
+    tell a working enrollment from a half-applied one.
+    """
     labels = await _current_labels(uuid)
     if not labels:
         raise RuntimeError(
             "no running container to read labels from — deploy the app once first")
-    await coolify.set_custom_labels(uuid, _as_list(enrolled_labels(labels, app_id)))
+    lab = await coolify.set_custom_labels(uuid, _as_list(enrolled_labels(labels, app_id)))
     # Without this, Docker restarts the container at daemon start even though
     # Sablier stopped it, so a reboot wakes every sleeping app.
-    await coolify.ensure_restart_policy(uuid)
+    pol = await coolify.ensure_restart_policy(uuid)
     await coolify.deploy(uuid)
+    return {"labels_readonly": lab.get("readonly", False), **pol}
 
 
 async def unenroll(uuid: str, app_id: str) -> None:
