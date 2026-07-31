@@ -144,15 +144,23 @@ function renderResources(data) {
   }
   const win = data.traffic_window_days;
   const ms = v => v != null ? v + '' : '<span class="muted">—</span>';
-  let head = '<table><tr><th>App</th><th>Status</th><th class="n">CPU</th>' +
-    '<th class="n">RAM</th><th class="n">Disk</th><th class="n">DB size</th>' +
+  let head = '<table><tr><th>App</th><th>Parts</th><th>Status</th>' +
+    '<th class="n">CPU</th><th class="n">RAM</th><th class="n">Disk</th>' +
+    '<th>Database</th><th class="n">DB size</th>' +
     `<th class="n">Req ${win}d</th><th class="n">Err %</th>` +
     '<th class="n">p50 ms</th><th class="n">p95 ms</th></tr>';
   const rows = apps.map(a => {
     const t = a.traffic || {};
     const errCls = (t.server_error_pct > 0) ? 'bad' : (t.error_pct > 5 ? 'warn' : '');
+    // kind is backend | frontend | both — show each half explicitly rather than
+    // making the reader decode one word.
+    const kind = a.kind || (a.running === null ? 'frontend' : 'backend');
+    const has = p => kind === 'both' || kind === p;
+    const part = (on, label) =>
+      `<span class="tag ${on ? 'on' : 'off'}">${label}</span>`;
     return '<tr>' +
       `<td>${esc(a.id)}</td>` +
+      `<td style="white-space:nowrap">${part(has('frontend'), 'FE')}${part(has('backend'), 'BE')}</td>` +
       `<td>${({
           static:  '<span class="muted">static</span>',
           running: '<span class="dot up"></span>running',
@@ -162,6 +170,7 @@ function renderResources(data) {
       `<td class="n">${a.cpu_pct != null ? a.cpu_pct + '%' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${a.mem_mb != null ? a.mem_mb.toLocaleString() + ' MB' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${fmtMb(a.disk_rw_mb)}</td>` +
+      `<td>${a.db_engine ? esc(a.db_engine) : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${a.db_engine ? fmtMb(a.db_size_mb) : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${(t.requests || 0).toLocaleString()}</td>` +
       `<td class="n ${errCls}">${(t.error_pct || 0)}%</td>` +
@@ -171,7 +180,7 @@ function renderResources(data) {
   }).join('');
   $('resources').innerHTML =
     '<div style="overflow-x:auto">' + head +
-    (apps.length ? rows : '<tr><td colspan="8" class="muted">No apps.</td></tr>') +
+    (apps.length ? rows : '<tr><td colspan="12" class="muted">No apps.</td></tr>') +
     '</table></div>';
 }
 function renderBots(byAgent) {
