@@ -67,6 +67,11 @@ BACKEND_TOKEN = "1"
 # request back — i.e. Traefik had no backend router to send it to.
 DOWN_HEADER = "x-pironman-backend-down"
 
+# This server's own app id. It hosts other apps' sites, never one of its own, so
+# its hostname answers 404 — which is also why its healthcheck is on /_health. A
+# bundle left in its directory (a stray test upload) must not change that.
+SELF_APP_ID = os.environ.get("STATIC_HOST_APP", "web")
+
 SABLIER_URL = os.environ.get("SABLIER_URL", "http://sablier:10000").rstrip("/")
 SABLIER_SESSION_DURATION = os.environ.get("SABLIER_SESSION_DURATION", "5m")
 WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT_SECONDS", "60"))
@@ -289,7 +294,7 @@ async def resolve(request: Request, _path: str = ""):
         return JSONResponse({"error": "backend has no route", "app": aid},
                             status_code=503, headers={DOWN_HEADER: "1"})
 
-    if not aid or not (ROOT / aid).is_dir():
+    if not aid or aid == SELF_APP_ID or not (ROOT / aid).is_dir():
         return JSONResponse({"error": "no frontend for this host"}, status_code=404)
 
     mf = _manifest(aid)

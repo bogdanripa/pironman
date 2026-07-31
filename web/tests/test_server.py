@@ -20,6 +20,10 @@ ROOT = Path(tempfile.mkdtemp())
 (ROOT / "demo" / "index.html").write_text("<h1>MARKETING PAGE</h1>")
 (ROOT / "demo" / ".pironman.json").write_text(json.dumps(
     {"has_backend": True, "redirects": []}))
+# A stray bundle in the static host's own directory: it must still 404 its own
+# hostname rather than serve whatever was left there.
+(ROOT / "web").mkdir()
+(ROOT / "web" / "index.html").write_text("<h1>SHOULD NEVER BE SERVED</h1>")
 (ROOT / "static-only").mkdir()
 (ROOT / "static-only" / "index.html").write_text("<h1>STATIC</h1>")
 (ROOT / "static-only" / ".pironman.json").write_text(json.dumps(
@@ -183,6 +187,14 @@ async def main():
         check("events stream rather than arriving in one buffered blob",
               len(marks) == 3 and marks[-1] - marks[0] > 0.5,
               [round(m, 2) for m in marks])
+
+        print("\n[the static host's own hostname]")
+        r = await c.get(base + "/", headers={"Host": "web-test.local"})
+        check("serves no site of its own, even with a bundle present",
+              r.status_code == 404 and "NEVER" not in r.text,
+              f"{r.status_code} {r.text[:60]}")
+        r = await c.get(f"http://127.0.0.1:{WEB_PORT}/_health")
+        check("its own healthcheck still answers", r.status_code == 200, r.text[:40])
 
         print("\n[frontend-only app]")
         H2 = {"Host": "static-only-test.local"}
