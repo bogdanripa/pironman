@@ -84,6 +84,7 @@ def deploy_bundle(app_id: str, data: bytes) -> dict:
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
     written = 0
+    paths: list[str] = []   # what was published, so the CDN copies can be purged
     for m in members:
         name = m.filename.replace("\\", "/")
         rel = name[len(root):] if root and name.startswith(root) else name
@@ -94,6 +95,7 @@ def deploy_bundle(app_id: str, data: bytes) -> dict:
         with zf.open(m) as src, open(dest, "wb") as out:
             shutil.copyfileobj(src, out)
         written += 1
+        paths.append(rel)
 
     if not any((staging / n).is_file() for n in INDEX_FILES):
         shutil.rmtree(staging, ignore_errors=True)
@@ -111,7 +113,7 @@ def deploy_bundle(app_id: str, data: bytes) -> dict:
         target.rename(old)
     staging.rename(target)
     shutil.rmtree(old, ignore_errors=True)
-    return {"files": written}
+    return {"files": written, "paths": paths}
 
 
 def deploy_files(app_id: str, files: dict[str, str]) -> dict:
@@ -159,7 +161,7 @@ def deploy_files(app_id: str, files: dict[str, str]) -> dict:
         target.rename(old)
     staging.rename(target)
     shutil.rmtree(old, ignore_errors=True)
-    return {"files": len(cleaned)}
+    return {"files": len(cleaned), "paths": sorted(cleaned)}
 
 
 def write_manifest(app_id: str, has_backend: bool,

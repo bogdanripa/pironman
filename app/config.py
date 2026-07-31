@@ -90,6 +90,13 @@ PAAS_DB = dict(
     database=os.environ.get("PAAS_DB_NAME", "_paas"),
 )
 
+# Cloudflare cache invalidation (app/cdn.py). Both must be set for a frontend
+# deploy to purge the URLs it just published; without them the platform still
+# works, but unhashed assets stay cached at the edge until their TTL expires.
+# The token needs the Zone.Cache Purge permission on this zone only.
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ZONE_ID   = os.environ.get("CLOUDFLARE_ZONE_ID", "")
+
 # This control plane's own app id. It cannot verify its own deploy — the request
 # is served by the container being replaced — so that one path skips the check.
 CONTROL_PLANE_APP = os.environ.get("CONTROL_PLANE_APP", "api")

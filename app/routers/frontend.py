@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from ..auth import require_key
 from ..db import pool
 from ..config import app_url
-from .. import frontends, routing
+from .. import cdn, frontends, routing
 
 router = APIRouter(prefix="/apps", tags=["frontend"],
                    dependencies=[Depends(require_key)])
@@ -64,7 +64,9 @@ async def deploy_frontend(app_id: str, request: Request):
             raise HTTPException(400, str(e))
         await c.execute("UPDATE apps SET has_frontend = true WHERE id = $1", app_id)
         cfg = await _sync_manifest(c, app_id)
-    return {"id": app_id, "deployed": True, "url": app_url(app_id), **res, **cfg}
+    purged = await cdn.purge(app_id, res.pop("paths", []))
+    return {"id": app_id, "deployed": True, "url": app_url(app_id),
+            **res, **cfg, "cdn": purged}
 
 
 class FrontendFiles(BaseModel):
@@ -100,4 +102,6 @@ async def write_frontend(app_id: str, body: FrontendFiles):
             raise HTTPException(400, str(e))
         await c.execute("UPDATE apps SET has_frontend = true WHERE id = $1", app_id)
         cfg = await _sync_manifest(c, app_id)
-    return {"id": app_id, "deployed": True, "url": app_url(app_id), **res, **cfg}
+    purged = await cdn.purge(app_id, res.pop("paths", []))
+    return {"id": app_id, "deployed": True, "url": app_url(app_id),
+            **res, **cfg, "cdn": purged}
