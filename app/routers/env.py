@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..auth import require_key
 from ..db import pool
+from ..locks import app_lock
 from .. import coolify, envs
 
 # Columns sync_env needs to recompose an app's environment and redeploy it.
@@ -37,12 +38,23 @@ class EnvValue(BaseModel):
                     "several changes and let the next code deploy pick them up.")
 
 
+# Only an app with a container has an environment to push into. A frontend-only
+# app has no Coolify application at all, so every call here would 404 against
+# uuid NULL — and a shared-variable change, which walks every app, would abort
+# partway through on the first one it met.
+_WITH_CONTAINER = "coolify_uuid IS NOT NULL"
+
+
 async def _apply(conn, row, redeploy: bool) -> None:
-    """Recompose one app's full environment in Coolify, then optionally deploy."""
-    await envs.sync_env(conn, row["coolify_uuid"], row["id"], row["db_engine"],
-                        row["db_user"], row["db_password"], row["db_name"])
-    if redeploy:
-        await coolify.deploy(row["coolify_uuid"])
+    """Recompose one app's full environment in Coolify, then optionally deploy.
+
+    Serialised per app: an env change redeploys, and two overlapping Coolify
+    deploys of one app fight rather than queue."""
+    async with app_lock(row["id"]):
+        await envs.sync_env(conn, row["coolify_uuid"], row["id"], row["db_engine"],
+                            row["db_user"], row["db_password"], row["db_name"])
+        if redeploy:
+            await coolify.deploy(row["coolify_uuid"])
 
 
 # --- shared: env_* ---------------------------------------------------------
@@ -85,7 +97,8 @@ async def env_set(key: str, body: EnvValue):
             "INSERT INTO shared_env (key, value) VALUES ($1, $2) "
             "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
             key, body.value)
-        apps = await c.fetch(f"SELECT {_APP_COLS} FROM apps ORDER BY id")
+        apps = await c.fetch(
+            f"SELECT {_APP_COLS} FROM apps WHERE {_WITH_CONTAINER} ORDER BY id")
         for app in apps:
             await _apply(c, app, body.redeploy)
 
@@ -106,7 +119,8 @@ async def env_delete(key: str, redeploy: bool = True):
         gone = await c.execute("DELETE FROM shared_env WHERE key = $1", key)
         if gone.endswith("0"):
             raise HTTPException(404, "no such shared variable")
-        apps = await c.fetch(f"SELECT {_APP_COLS} FROM apps ORDER BY id")
+        apps = await c.fetch(
+            f"SELECT {_APP_COLS} FROM apps WHERE {_WITH_CONTAINER} ORDER BY id")
         for app in apps:
             # Drop it, then re-sync: an app with its own override gets that value
             # back, an app without one is left without the key.
@@ -119,10 +133,15 @@ async def env_delete(key: str, redeploy: bool = True):
 
 # --- per-app: apps_env_* ---------------------------------------------------
 
-async def _require_app_row(conn, app_id: str):
+async def _require_app_row(conn, app_id: str, needs_container: bool = False):
     row = await conn.fetchrow(f"SELECT {_APP_COLS} FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
+    if needs_container and not row["coolify_uuid"]:
+        raise HTTPException(
+            400, "this is a frontend-only app: it has no container, so it has no "
+                 "environment to set. Static files are served as they are — put "
+                 "configuration in the bundle, or give the app a backend.")
     return row
 
 
@@ -164,7 +183,7 @@ async def apps_env_set(app_id: str, key: str, body: EnvValue):
         raise HTTPException(422, str(e))
 
     async with pool().acquire() as c:
-        row = await _require_app_row(c, app_id)
+        row = await _require_app_row(c, app_id, needs_container=True)
         await c.execute(
             "INSERT INTO app_env (app_id, key, value) VALUES ($1, $2, $3) "
             "ON CONFLICT (app_id, key) DO UPDATE SET value = $3, updated_at = now()",
@@ -184,7 +203,7 @@ async def apps_env_delete(app_id: str, key: str, redeploy: bool = True):
     key entirely.
     """
     async with pool().acquire() as c:
-        row = await _require_app_row(c, app_id)
+        row = await _require_app_row(c, app_id, needs_container=True)
         gone = await c.execute(
             "DELETE FROM app_env WHERE app_id = $1 AND key = $2", app_id, key)
         if gone.endswith("0"):
