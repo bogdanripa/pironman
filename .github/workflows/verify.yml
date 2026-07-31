@@ -89,18 +89,22 @@ jobs:
 
       - name: A proxied response is not served as an undecodable blob
         run: |
-          # Traefik's gzip middleware compresses backend responses over ~1KB. If
-          # the proxy forwards those bytes while dropping content-encoding, the
-          # client renders a gzip stream as text — which is what an OAuth consent
-          # page looked like. Small responses were unaffected, so this checks the
-          # bytes rather than trusting the status code.
+          # Traefik and Cloudflare both compress responses. If the proxy forwards
+          # those bytes while dropping content-encoding, the client renders a gzip
+          # stream as text — which is what an OAuth consent page looked like.
+          #
+          # --compressed is the whole point: curl advertises the encodings it can
+          # handle and decodes based on the RESPONSE header. So compressed bytes
+          # still on the wire after this are compressed bytes nobody declared —
+          # exactly the bug, and nothing else. Checking the raw body instead would
+          # flag a correctly-labelled compressed response, which is not a fault.
           for path in / /authorize /health; do
-            curl -s --max-time 30 -H 'Accept-Encoding: gzip, br' \
+            curl -s --compressed --max-time 30 \
               -o /tmp/raw "https://$APP$SUFFIX$path" || continue
             magic=$(head -c 2 /tmp/raw | od -An -tx1 | tr -d ' \n')
-            echo "$path -> first bytes: ${magic:-empty}"
+            echo "$path -> first bytes: ${magic:-empty}  ($(head -c 40 /tmp/raw | tr -d '\0' | tr '\n' ' '))"
             case "$magic" in
-              1f8b) echo "::error::$path served raw gzip to a client that must decode it"; exit 1 ;;
+              1f8b) echo "::error::$path is compressed but not declared as such — a client cannot decode it"; exit 1 ;;
             esac
           done
 
