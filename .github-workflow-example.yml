@@ -24,9 +24,11 @@ jobs:
           platforms: linux/arm64        # the Pi is aarch64 — without this the
           push: true                    # image builds amd64 and will not start
           tags: ghcr.io/bogdanripa/${{ github.event.repository.name }}:latest
-      # No secret: the box watches :latest and redeploys when the image changes.
-      # This just triggers it now instead of waiting for the hourly poll.
+      # The box watches :latest and redeploys when the digest moves; this triggers
+      # the check now instead of waiting for the hourly sweep. PAAS_KEY is the
+      # app's scoped deploy key — it can only deploy this one app.
       - name: Trigger deploy
         run: |
           curl -fsS -X POST \
+            -H "Authorization: Bearer ${{ secrets.PAAS_KEY }}" \
             "https://api-coolify.bogdanripa.com/apps/${{ github.event.repository.name }}/refresh"

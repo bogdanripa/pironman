@@ -35,20 +35,25 @@ async def require_key(request: Request, authorization: str = Header(None)) -> st
         raise HTTPException(401, "invalid api key")
 
     # A per-app deploy key (app_id set) is least-privilege: it may only ship its
-    # own app — redeploy the backend (PUT /apps/<id>/code) or upload that app's
-    # frontend bundle (PUT /apps/<id>/frontend) — and nothing else, on no other
-    # app. Unscoped keys (app_id NULL) are admin keys and pass through. Enforced
-    # here, centrally, so no endpoint can forget the check.
-    _DEPLOY_ROUTES = ("/apps/{app_id}/code", "/apps/{app_id}/frontend")
+    # own app — trigger its backend deploy (POST /apps/<id>/refresh), redeploy it
+    # explicitly (PUT /apps/<id>/code) or upload its frontend bundle
+    # (PUT /apps/<id>/frontend) — and nothing else, on no other app. Unscoped keys
+    # (app_id NULL) are admin keys and pass through. Enforced here, centrally, so
+    # no endpoint can forget the check.
+    _DEPLOY_ROUTES = {
+        ("PUT", "/apps/{app_id}/code"),
+        ("PUT", "/apps/{app_id}/frontend"),
+        ("POST", "/apps/{app_id}/refresh"),
+    }
     if row["app_id"] is not None:
         route = request.scope.get("route")
         route_path = getattr(route, "path", "")
         target = request.path_params.get("app_id")
-        if not (request.method == "PUT"
-                and route_path in _DEPLOY_ROUTES
+        if not ((request.method, route_path) in _DEPLOY_ROUTES
                 and target == row["app_id"]):
             raise HTTPException(
-                403, "this key is scoped to a single app and can only deploy it "
-                     "(PUT /apps/<id>/code or /apps/<id>/frontend)")
+                403, "this key is scoped to a single app and can only deploy that "
+                     "app (POST /apps/<id>/refresh, PUT /apps/<id>/code or "
+                     "PUT /apps/<id>/frontend)")
 
     return row["label"] or str(row["id"])

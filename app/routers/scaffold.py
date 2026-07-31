@@ -81,11 +81,14 @@ def _workflow(app_id: str, repo_name: str) -> str:
                     ghcr.io/bogdanripa/{repo_name}:latest
                     ghcr.io/bogdanripa/{repo_name}:${{{{ steps.tag.outputs.value }}}}
 
-              # No secret: the box watches :latest and redeploys the new image.
-              # This just asks it to do so now instead of at the next hourly poll.
+              # The box watches :latest and redeploys when the digest moves. This
+              # asks it to check now instead of waiting for the hourly sweep, and
+              # authenticates with this app's scoped deploy key (PAAS_KEY), which
+              # can only deploy this one app.
               - name: Trigger deploy on the Pi
                 run: |
                   curl -fsS -X POST \\
+                    -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
                     "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh"
 
               # /refresh only queues the deploy; poll the app until it actually
@@ -198,11 +201,15 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "Each push to main builds an arm64 image and pushes it to ghcr.io tagged "
         "':latest' (and with the commit sha for traceability), then calls this "
         "app's /refresh hook so the box redeploys the new image right away.",
-        "No PAAS_KEY, no deploy secret: the box auto-updates. It watches the "
-        "app's ':latest' tag — hourly, and immediately when /refresh is called — "
-        "and redeploys only when the image digest actually changes. The /refresh "
-        "call is unauthenticated on purpose; it takes no image, so a caller can "
-        "at most trigger that check.",
+        "The workflow needs ONE secret: PAAS_KEY, this app's scoped deploy key. "
+        "Set it yourself with github_secret_set — apps_create returns the key as "
+        "`paas_key` and apps_deploy_key re-issues one — rather than asking the "
+        "user to paste it. It is scoped to this app alone, so a leaked copy can "
+        "only redeploy this app to an image that is already in the registry.",
+        "The box never takes an image from the caller: /refresh only makes it "
+        "re-check the tag it already watches, and it redeploys solely when that "
+        "tag's digest actually changes. It also sweeps hourly, so a missed or "
+        "failed /refresh call delays a deploy rather than losing it.",
         "The app must already exist here before the first workflow run (create it "
         "with apps_create). New apps have auto-update on by default; toggle it "
         "with apps_autoupdate.",
@@ -226,8 +233,11 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "app_id": app_id,
         "url": app_url(app_id),
         "setup": [
-            "Drive this end to end with your GitHub tools — no secret, no human "
-            "step. Do not build the image locally.",
+            "Drive this end to end with your GitHub tools — including the secret. "
+            "No human step. Do not build the image locally.",
+            "0. Install PAAS_KEY in the app's repo with github_secret_set, using "
+            "the key from apps_create (or apps_deploy_key). Do this first: the "
+            "workflow's deploy step fails without it.",
             "1. Write `workflow` verbatim to `workflow_path` in the app's repo "
             "and commit it.",
             "2. Make sure the app's Dockerfile satisfies "
@@ -238,7 +248,14 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         ],
         "workflow_path": ".github/workflows/deploy.yml",
         "workflow": _workflow(app_id, repo),
-        "required_secrets": [],  # none — the box auto-updates, no deploy secret
+        # One secret, and the platform installs it itself (see the notes).
+        "required_secrets": [
+            {"name": "PAAS_KEY",
+             "value_from": "the app's scoped deploy key — apps_create returns it "
+                           "as `paas_key`, apps_deploy_key re-issues one",
+             "install_with": "github_secret_set",
+             "used_by": "both the backend /refresh call and the frontend upload"},
+        ],
         "dockerfile_requirements": DOCKERFILE_RULES,
         "notes": notes,
         "optional_frontend_job": _frontend_job(app_id),

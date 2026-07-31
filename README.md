@@ -127,16 +127,24 @@ sudo touch /opt/paas/app/__init__.py
 4. Add a cron for `* * * * *`, watch `/var/log/paas-cron.log`.
 5. `DELETE` both; confirm Coolify app, database and registry row are all gone.
 
-## Auto-update (secretless deploys)
+## Auto-update
 
-Apps deploy with **no repository secret**. CI builds and pushes `:latest`; the
-box watches that tag and redeploys when the image digest changes — **hourly** (an
-in-process loop, first run an hour after start) and **immediately** when CI POSTs
-the app's unauthenticated `POST /apps/<id>/refresh` hook. Digest resolution goes
-through the host Docker daemon (`docker pull` + `inspect`), reusing its existing
-pull credentials, and a redeploy only fires when the digest actually moved — so
-`/refresh` is safe to leave unauthenticated: it takes no image, so a caller can
-at most trigger a check.
+Apps deploy with **one repository secret**, `PAAS_KEY` — the app's scoped deploy
+key, which the platform installs itself (`apps_create` returns it,
+`github_secret_set` writes it), so wiring an app up still needs no human step.
+CI builds and pushes `:latest`; the box watches that tag and redeploys when the
+image digest changes — **hourly** (an in-process loop, first run an hour after
+start) and **immediately** when CI POSTs `/apps/<id>/refresh`. Digest resolution
+goes through the host Docker daemon (`docker pull` + `inspect`), reusing its
+existing pull credentials, and a redeploy fires only when the digest actually
+moved.
+
+`/refresh` was originally unauthenticated, on the grounds that it accepts no
+caller-supplied image. That was true but stopped being a good trade once the
+platform could install the secret itself: the only thing it bought was avoiding a
+human step, which is now free, while leaving an endpoint anyone could hit to make
+the box pull images. Both halves of a deploy — the backend trigger and the
+frontend upload — now use the same key.
 
 New apps have auto-update on, watching the tag they were created with;
 `apps_autoupdate` toggles it (off to hold a manual rollback). `app/autoupdate.py`
@@ -150,8 +158,10 @@ Two kinds of API key, both stored only as sha256 in `api_keys`:
 
 - **Admin keys** (`python -m app.cli create`, `app_id` NULL) — full access. The
   bootstrap key and the connector `?key=` are these.
-- **Deploy keys** (`app_id` set) — scoped to one app: they may only call
-  `PUT /apps/<id>/code` for that app, enforced centrally in `auth.require_key`.
+- **Deploy keys** (`app_id` set) — scoped to one app: they may only trigger that
+  app's deploy (`POST /apps/<id>/refresh`), redeploy it explicitly
+  (`PUT /apps/<id>/code`) or upload its frontend (`PUT /apps/<id>/frontend`),
+  enforced centrally in `auth.require_key`.
   `apps_create` returns one as `paas_key` the moment an app is created, and
   `apps_deploy_key` (re)issues one (revoking the previous). This is the app's
   `PAAS_KEY` CI secret — safe to hand out, since a leak can only redeploy that

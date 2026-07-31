@@ -1,19 +1,31 @@
-"""Unauthenticated deploy trigger for CI.
+"""Authenticated deploy trigger for CI.
 
-POST /apps/<id>/refresh pulls the app's watched tag and redeploys it if the
-image digest moved — a no-op otherwise. It is deliberately unauthenticated so
-the CI workflow can call it with no repo secret. That is safe because it takes
-no caller-supplied image: an unauthenticated caller can only make the app pull
-its own newest image (which only whoever can push to the registry controls), so
-the worst case is triggering a check. It is not exposed as an MCP tool — it is a
-pipeline hook, not a model action.
+POST /apps/<id>/refresh pulls the app's watched tag and redeploys it if the image
+digest moved — a no-op otherwise. It is what an app's CI workflow calls right
+after pushing a new image, so the deploy lands immediately instead of waiting for
+the hourly sweep.
+
+It requires the app's **scoped deploy key** (the PAAS_KEY repository secret), the
+same key the frontend upload uses. This endpoint was originally unauthenticated,
+on the reasoning that it takes no caller-supplied image and so a caller could at
+most trigger a digest check. That was true, but it stopped being a good trade
+once the platform could install the secret itself (apps_create returns the key,
+github_secret_set writes it to the repo): the only thing being bought was "no
+human step", which is now free, while the cost was an endpoint anyone could hit
+to make the box pull images. Authenticating both halves is simpler to explain and
+leaves nothing open.
+
+Not exposed as an MCP tool — it is a pipeline hook, not a model action. Deploys
+go through CI, and giving the model a manual-deploy button invites skipping it.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from ..auth import require_key
 from ..db import pool
 from .. import autoupdate
 
-router = APIRouter(prefix="/apps", tags=["refresh"])
+router = APIRouter(prefix="/apps", tags=["refresh"],
+                   dependencies=[Depends(require_key)])
 
 
 @router.post("/{app_id}/refresh", operation_id="apps_refresh",

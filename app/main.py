@@ -150,12 +150,19 @@ container; a shared change therefore redeploys everything. Values are write-only
 you can set and overwrite them but never read one back — listings show a masked
 preview only, so re-set a variable if you are unsure of its value.
 
-Deploys go through CI, not through hand-built images, and they need no secret.
-The right way to build and deploy an app is to wire its repository to GitHub
-Actions: each push to main builds the arm64 image, pushes it to ghcr.io tagged
-:latest, and calls the app's unauthenticated /refresh hook. The box watches that
-tag and redeploys the new image — on the /refresh call, and hourly regardless —
-so there is deliberately no tool here to deploy an app by hand. Do NOT build an
+Deploys go through CI, not through hand-built images. The right way to build and
+deploy an app is to wire its repository to GitHub Actions: each push to main
+builds the arm64 image, pushes it to ghcr.io tagged :latest, and calls the app's
+/refresh hook. The box watches that tag and redeploys the new image — on the
+/refresh call, and hourly regardless — so there is deliberately no tool here to
+deploy an app by hand.
+
+CI authenticates with one repository secret, PAAS_KEY: the app's own scoped
+deploy key, used by both the backend /refresh call and the frontend upload. Do
+not ask the user to create it — apps_create returns the key and github_secret_set
+installs it, so wiring an app up needs no human step. The key can only deploy
+that one app, and the box never accepts an image from the caller: /refresh just
+makes it re-check the tag it already watches. Do NOT build an
 image locally and push it to the registry yourself, and do not go looking for
 registry or deploy credentials to do so — that is the wrong path, it will not
 match the arm64 platform this platform expects, and it does not reproduce. To

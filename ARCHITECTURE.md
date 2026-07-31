@@ -11,7 +11,8 @@ as a mini-Heroku**. Each app is a Docker container with an automatic HTTPS URL.
 every operation as an **MCP server**, so an LLM (Claude, via a claude.ai
 connector) can deploy and operate the whole box conversationally. Traffic enters
 through Cloudflare → Traefik, apps scale to zero when idle (Sablier), deploys are
-secretless (CI pushes an image; the box notices and redeploys itself), and
+automated end to end (CI pushes an image; the box notices and redeploys
+itself), and
 traffic analytics are harvested automatically from the shared proxy log.
 
 ---
@@ -209,29 +210,31 @@ Effective env = shared, overlaid by app-specific, plus platform-managed
 
 ---
 
-## 8. Deploy pipeline (secretless)
+## 8. Deploy pipeline
 
-Apps deploy with **no repository secret**:
+Apps deploy with one repository secret, `PAAS_KEY`, which the platform installs
+itself:
 
 ```mermaid
 flowchart LR
     DEV[git push to main] --> GH[GitHub Actions]
     GH -->|build linux/arm64| IMG[image]
     IMG -->|push :latest + :sha| GHCR[ghcr.io]
-    GH -->|curl POST /apps/ID/refresh · unauthenticated| API[paas-api]
+    GH -->|curl POST /apps/ID/refresh · Bearer PAAS_KEY| API[paas-api]
     API -->|docker pull + inspect digest| GHCR
     API -->|digest changed → set_image + deploy| CO[Coolify]
     CO --> APP[new container]
 ```
 
 1. CI builds an **arm64** image, pushes to `ghcr.io` tagged `:latest` (+ `:sha`).
-2. CI calls the app's **unauthenticated** `POST /apps/<id>/refresh`.
+2. CI calls `POST /apps/<id>/refresh` with the app's scoped `PAAS_KEY`.
 3. `paas-api` pulls the watched tag through the host Docker daemon, and **only if
    the image digest actually moved** re-points Coolify at the new image and
    redeploys. Also runs **hourly** regardless.
 
-`/refresh` is safe to leave unauthenticated: it takes no caller-supplied image, so
-the worst a caller can do is trigger a digest check. `apps_deploy_workflow`
+`/refresh` accepts no caller-supplied image — it only makes the box re-check the
+tag it already watches — so the key is defence in depth rather than the only thing
+standing between a caller and an arbitrary deploy. `apps_deploy_workflow`
 returns the exact GitHub Actions YAML + Dockerfile rules to wire this up. A
 private-registry digest check needs one server-side credential
 (`GHCR_USER`/`GHCR_TOKEN`) — one platform credential, not a per-app secret.
@@ -350,11 +353,11 @@ one failure that really hurts:
 
 Verify with `CF-Cache-Status`: `DYNAMIC`/`BYPASS` on API paths, `HIT` on assets.
 
-**Auth asymmetry, on purpose:** the backend's `/refresh` hook is unauthenticated
-because it takes no caller content (it only makes the box pull an image the
-registry controls). A frontend upload *is* caller-supplied content served on the
-app's domain, so it requires the app's **scoped deploy key** (`PAAS_KEY`) — which
-can only touch that one app.
+**One key for both halves:** the backend `/refresh` trigger and the frontend
+upload both authenticate with the app's **scoped deploy key** (`PAAS_KEY`), which
+can only deploy that one app. `/refresh` was unauthenticated originally, since it
+takes no caller content; that was dropped once the platform could install the
+secret itself, making consistent auth free.
 
 ## 10. Analytics & observability
 
