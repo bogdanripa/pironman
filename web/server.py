@@ -124,9 +124,15 @@ async def resolve(request: Request, _path: str = ""):
             return await _proxy(request, aid) if has_backend else JSONResponse(
                 {"error": "no backend"}, status_code=404)
 
-    # 2. a real file in the bundle
+    # 2. a real file in the bundle. A directory path resolves to its index.html,
+    #    the way any web server serves "/" — without this, "/" matches no file and
+    #    falls through to the backend, so anything that is not a browser sending
+    #    Accept: text/html (curl, uptime monitors, link previewers, CI health
+    #    checks) gets the backend's 404 instead of the site's home page.
     if request.method in ("GET", "HEAD"):
         f = _safe_file(aid, path)
+        if f is None and path.endswith("/"):
+            f = _safe_file(aid, path + "index.html")
         if f:
             return _serve(f, path)
 
