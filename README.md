@@ -154,21 +154,22 @@ holds the routine. `apps_update_code` plus a scoped deploy key remain the
 
 ## Reboots and scale-to-zero
 
-Docker's default `restart: always` starts containers when the daemon starts,
-including ones Sablier stopped, so a reboot would bring every app back awake.
-Enrolling an app appends **`--restart=unless-stopped`** to its docker run options
-(existing options are read and appended to, never replaced), so Docker leaves a
-stopped container alone and scale-to-zero apps come back from a reboot asleep.
+Coolify already creates app containers with **`restart: unless-stopped`**
+(verified on the box — only Coolify's own infrastructure uses `always`), so a
+container Sablier stopped stays stopped when the daemon comes back, and one that
+was running restarts. Scale-to-zero apps therefore come back from a reboot
+**asleep** and start on their first request, with nothing for this codebase to
+do. `api` and `web` are excluded from sleeping and always start.
 
-`api` and `web` are excluded from sleeping and always start.
+Check it with:
 
-**Verifying it took.** The Coolify field that carries docker run options is not
-identical across builds, so the flag can be rejected. Two places report the truth
-rather than the intent: `apps_update` returns `restart_policy` (false plus a
-reason if Coolify refused the field), and `apps_get`'s `backend.runtime` reports
-`restart_policy` read straight from Docker (`unless-stopped` is what you want).
-The raw check is
-`docker inspect <container> --format '{{.HostConfig.RestartPolicy.Name}}'`.
+```bash
+docker ps -a --format '{{.Names}}' | while read c; do
+  printf '%-45s %s\n' "$c" "$(docker inspect "$c" --format '{{.HostConfig.RestartPolicy.Name}}')"
+done
+```
+
+`apps_get` also reports the live policy in `backend.runtime.restart_policy`.
 
 ## Deploy keys
 

@@ -272,14 +272,12 @@ Traefik router chain, and writes the whole set back as Coolify **read-only custo
 labels** (`is_container_label_readonly_enabled`) so Coolify stops regenerating
 them and the enrollment survives every redeploy.
 
-**On host reboot:** Docker's default `restart: always` starts containers again
-when the daemon comes up — including ones Sablier had stopped — so a reboot would
-otherwise wake every sleeping app. Enrolling an app therefore appends
-`--restart=unless-stopped` to its docker run options
-(`coolify.ensure_restart_policy`), which tells Docker to leave a deliberately
-stopped container alone. Existing options are read and appended to, never
-replaced, since an app may carry mounts it cannot lose. Apps that scale to zero
-come back from a reboot **asleep**, and start on their first request.
+**On host reboot:** nothing special is needed. Coolify creates app containers
+with `restart: unless-stopped` (only Coolify's own containers use `always`), so
+Docker leaves a container Sablier deliberately stopped alone and restarts the
+ones that were running. Sleeping apps come back asleep and wake on their first
+request. `apps_get` reports the live policy in `backend.runtime.restart_policy`
+if it ever needs checking.
 
 - **Default: every app sleeps** when idle (`apps.sleep_when_idle`, default true).
 - **`api` is hard-excluded** (`SABLIER_EXCLUDE`) — it runs the ingester,

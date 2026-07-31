@@ -696,8 +696,6 @@ async def set_sleep(app_id: str, body: Sleep):
         await c.execute(
             "UPDATE apps SET sleep_when_idle = $1, sablier_enrolled = $1 "
             "WHERE id = $2", body.enabled, app_id)
-    # `restart_policy` reports whether Coolify accepted the --restart flag: false
-    # means this build rejected the field, and the app will wake on reboot.
     return {"id": app_id, "sleep_when_idle": body.enabled, **applied}
 
 

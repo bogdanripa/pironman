@@ -111,20 +111,21 @@ async def enroll(uuid: str, app_id: str) -> dict:
     redeploy so it takes effect. Raises if the app has no running container to
     read the base labels from (deploy it once first).
 
-    Returns what each step achieved, because both of them depend on Coolify field
-    names this build may not accept — a caller that gets no report back cannot
+    Returns what the label write achieved, since it depends on a Coolify field
+    name this build may not accept — a caller that gets no report back cannot
     tell a working enrollment from a half-applied one.
+
+    Nothing here touches the restart policy: Coolify already creates app
+    containers with `unless-stopped`, so a container Sablier stopped stays stopped
+    across a reboot without any help from us (verified on the box).
     """
     labels = await _current_labels(uuid)
     if not labels:
         raise RuntimeError(
             "no running container to read labels from — deploy the app once first")
     lab = await coolify.set_custom_labels(uuid, _as_list(enrolled_labels(labels, app_id)))
-    # Without this, Docker restarts the container at daemon start even though
-    # Sablier stopped it, so a reboot wakes every sleeping app.
-    pol = await coolify.ensure_restart_policy(uuid)
     await coolify.deploy(uuid)
-    return {"labels_readonly": lab.get("readonly", False), **pol}
+    return {"labels_readonly": lab.get("readonly", False)}
 
 
 async def unenroll(uuid: str, app_id: str) -> None:
