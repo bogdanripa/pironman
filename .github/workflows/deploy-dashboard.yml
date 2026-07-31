@@ -5,6 +5,10 @@ on:
     paths:
       - 'dashboard/**'
       - '.github/workflows/deploy-dashboard.yml'
+  # Republish without a code change — the bundle is the source, so re-uploading
+  # it is always safe, and it is how to recover if a publish failed for a reason
+  # outside the repo (a missing secret, the app not existing yet).
+  workflow_dispatch:
 
 # Publishes the analytics dashboard, which is a frontend-only app on this
 # platform — no image, no container. It is the platform dogfooding its own
