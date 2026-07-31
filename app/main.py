@@ -50,8 +50,9 @@ of scheduled jobs. Creating an app gives it a public HTTPS URL automatically at
 https://<id>-coolify.bogdanripa.com — there is no DNS, certificate or proxy step
 to perform.
 
-What you can do here: list what is deployed, create a new app from a docker
-image, adopt an app that already exists in Coolify but was made by hand, change
+What you can do here: list what is deployed, create a new app (a static frontend,
+a backend docker image, or both), publish or update an app's frontend, adopt an
+app that already exists in Coolify but was made by hand, change
 an app's image, attach or drop an app's database, read an app's container logs
 and status, see live resource use (whether each app is running, its CPU/RAM
 right now, its database size and recent request health) via apps_stats, delete an
@@ -81,6 +82,40 @@ that wiring.
 Apps scale to zero when idle (Sablier): they stop after a few idle minutes and
 start again on the next request. apps_sablier turns this on or off per app; the
 control plane itself never sleeps.
+
+**Choose the app's shape first.** An app has up to three parts — a static
+frontend, a backend container, and a database — and picking the right combination
+matters more than any other decision here:
+
+- **Frontend only** (create it with NO image): a static site, an SPA, a browser
+  game, a landing page. There is no container at all, so nothing to keep running,
+  no cold start, and the assets are CDN-cacheable. Ship it by uploading built
+  files.
+- **Backend only** (create it with an image): an API, an MCP server, a worker —
+  anything with no browser UI of its own.
+- **Both** (create with an image, then upload a frontend — or create frontend-only
+  and add a backend later with apps_set_image): the usual web app. They share one
+  hostname, so the frontend calls its API with a relative path — no CORS, no API
+  base URL to configure.
+
+Default to **splitting** a UI-plus-API app into both rather than baking the UI
+into the backend container: the assets then come from the shared static host and
+the CDN instead of the container. So "a game with a leaderboard", "a to-do app",
+"a dashboard with an API" are all frontend + backend + database.
+
+With both, requests resolve automatically: a real file in the bundle is served, a
+browser navigation gets index.html (so client-side routes work), and everything
+else goes to the backend. Serving the API under /api is a good convention and
+what to suggest, but nothing enforces it. Only declare paths with
+apps_backend_routes when that automatic split guesses wrong — an OAuth callback,
+a download link or a server-rendered page, which look like page loads but must
+reach the backend.
+
+Frontends deploy by upload, not by image: apps_frontend_write publishes a small
+site from inline files (no build, no repo — good for a landing page), while a
+real build ships from CI, which zips the build output and uploads it with the
+app's deploy key. apps_deploy_workflow returns both halves — the backend job and
+an optional frontend job — so an app can use either or both.
 
 Three rules govern almost every mistake:
 
