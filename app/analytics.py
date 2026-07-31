@@ -192,6 +192,22 @@ async def _read_since(cursor: str | None) -> str:
     return out
 
 
+def _diagnose(t: dict) -> str:
+    """Turn the tally into the thing to go and check."""
+    if not t["lines"]:
+        return (f"The {ANALYTICS_PROXY} container produced no log output at all.")
+    if not t["json"]:
+        return ("None of it is JSON, so Traefik is not writing a JSON access log. "
+                "Those proxy flags are a hand-edit and Coolify regenerates them "
+                "away on a proxy restart — re-apply them.")
+    if not t["app"]:
+        return (f"JSON is being written but no line is a request to a "
+                f"*{DOMAIN_SUFFIX}* host with a usable client identity — check "
+                "that the access log still keeps RequestHost, User-Agent and "
+                "Cf-Connecting-Ip.")
+    return "Every line is older than the cursor, which is the normal quiet case."
+
+
 async def ingest_once() -> dict:
     """Fold new access-log lines into the rollup tables. Idempotent: only lines
     with StartUTC strictly greater than the stored cursor are counted, and the
@@ -217,11 +233,24 @@ async def ingest_once() -> dict:
         now = datetime.now(timezone.utc)
         newest = cursor or ""
         seen = 0
+        # Where lines are lost, so "counted nothing" can name its own cause.
+        # Each stage is a different fault: no lines at all means the proxy log is
+        # unreadable; lines but no JSON means Traefik is not writing a JSON access
+        # log (the one-time proxy flags are a hand-edit, and Coolify regenerates
+        # what Coolify generates); JSON but no app hosts means the log is missing
+        # RequestHost or the domain suffix changed; and everything older than the
+        # cursor is the only case that is actually normal.
+        tally = {"lines": 0, "json": 0, "app": 0, "old": 0}
         for line in raw.splitlines():
+            tally["lines"] += 1
+            if line.strip().startswith("{"):
+                tally["json"] += 1
             rec = _parse_line(line)
             if rec is None:
                 continue
+            tally["app"] += 1
             if cursor and rec["start"] <= cursor:
+                tally["old"] += 1
                 continue  # already counted in an earlier pass
             seen += 1
             if rec["start"] > newest:
@@ -324,9 +353,12 @@ async def ingest_once() -> dict:
             _log.warning("analytics: no lines counted and the cursor %r cannot be "
                          "parsed — nothing will ever advance", cursor)
         elif behind > _STALL_AFTER:
-            _log.warning("analytics: no lines counted; cursor is %.0f minutes "
-                         "behind (%s). Log lines are being read but none accepted.",
-                         behind / 60, cursor)
+            _log.warning(
+                "analytics: nothing counted and the cursor is %.0f minutes behind "
+                "(%s). Read %d log lines, %d were JSON, %d were requests to a "
+                "hosted app, %d of those older than the cursor. %s",
+                behind / 60, cursor, tally["lines"], tally["json"], tally["app"],
+                tally["old"], _diagnose(tally))
     return {"lines_counted": seen, "cursor": newest or None}
 
 
