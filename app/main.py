@@ -76,8 +76,8 @@ analytics_cohorts for retention, analytics_agents for the top user-agents, and
 analytics_recent for a live tail of the most recent HTTP requests. apps_stats
 gives the live infra view (running state, CPU/RAM, disk, DB size, and request
 error rate / latency percentiles). A human-facing dashboard of all of this runs
-as its own frontend-only app at https://dashboard-coolify.bogdanripa.com (open it
-with ?key=<an admin key>).
+as its own frontend-only app at https://dashboard-coolify.bogdanripa.com — it
+asks for an API key on first load and keeps it in the browser.
 
 If a Telegram bot is configured on the box, the platform also messages you when
 an app goes down, recovers, or starts throwing 5xx errors; alerts_test confirms

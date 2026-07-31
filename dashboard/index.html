@@ -9,6 +9,7 @@
 <body>
 <header>
   <h1>Pironman Analytics <span id="scopeLabel"></span></h1>
+  <a id="forget" class="link" style="display:none;margin-left:12px">forget key</a>
   <div class="controls">
     <select id="app"></select>
     <select id="days">
@@ -19,6 +20,19 @@
   </div>
 </header>
 <main id="root">
+  <div id="keyForm" class="panel" style="display:none;max-width:520px">
+    <h2>API key</h2>
+    <p class="muted" style="margin:0 0 14px">
+      This dashboard reads the platform API. Paste an API key — it is kept in this
+      browser only (localStorage) and never sent anywhere but the API.
+    </p>
+    <form id="keyEntry" style="display:flex;gap:8px;flex-wrap:wrap">
+      <input id="keyInput" type="password" autocomplete="off" spellcheck="false"
+             placeholder="paste key" style="flex:1;min-width:240px">
+      <button type="submit">Open</button>
+    </form>
+    <p id="keyError" class="bad" style="display:none;margin:12px 0 0"></p>
+  </div>
   <div id="msg" class="muted">Loading…</div>
   <div id="content" style="display:none">
     <div class="cards" id="cards"></div>

@@ -1,14 +1,50 @@
 const PARAMS = new URLSearchParams(location.search);
-const KEY = PARAMS.get('key') || '';
 
 // The dashboard is its own app, so the control plane is a different origin. The
 // base URL is overridable with ?api= for pointing a local copy at the live box.
 const API = (PARAMS.get('api') || 'https://api-coolify.bogdanripa.com').replace(/\/$/, '');
+
+// The key lives in this browser, not in the URL. A key arriving as ?key= is
+// stored and then removed by navigating to '/', so it does not sit in the
+// address bar, in history, or in a referrer header on the way to anywhere else.
+const KEY_STORE = 'pironman.key';
+let KEY = localStorage.getItem(KEY_STORE) || '';
+
+if (PARAMS.get('key')) {
+  KEY = PARAMS.get('key');
+  localStorage.setItem(KEY_STORE, KEY);
+  // Drop only the key, keeping anything else (?api=), and use replace() so the
+  // key-bearing URL does not stay in history either.
+  PARAMS.delete('key');
+  const rest = PARAMS.toString();
+  location.replace('/' + (rest ? '?' + rest : ''));
+}
+
+function forgetKey(message) {
+  KEY = '';
+  localStorage.removeItem(KEY_STORE);
+  askForKey(message);
+}
+
+function askForKey(message) {
+  $('content').style.display = 'none';
+  $('msg').style.display = 'none';
+  $('forget').style.display = 'none';
+  $('keyForm').style.display = '';
+  const err = $('keyError');
+  err.style.display = message ? '' : 'none';
+  err.textContent = message || '';
+  $('keyInput').value = '';
+  $('keyInput').focus();
+}
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
+class AuthError extends Error {}
+
 async function api(path) {
   const r = await fetch(API + path, { headers: { Authorization: 'Bearer ' + KEY } });
+  if (r.status === 401 || r.status === 403) throw new AuthError('key rejected');
   if (!r.ok) throw new Error(path + ' → ' + r.status + ' ' + r.statusText);
   return r.json();
 }
@@ -228,19 +264,38 @@ async function refresh() {
     loadAgents(days);
     loadRecent();
   } catch (e) {
+    if (e instanceof AuthError) { forgetKey('That key was rejected. Try another.'); return; }
     $('content').style.display = 'none';
     $('msg').className = 'err';
     $('msg').style.display = '';
-    $('msg').textContent = KEY
-      ? 'Could not load analytics: ' + e.message
-      : 'Add your API key to the URL: …/analytics/dashboard?key=YOUR_KEY';
+    $('msg').textContent = 'Could not load analytics: ' + e.message;
   }
 }
 
 $('app').onchange = refresh;
 $('days').onchange = refresh;
-(async () => {
-  if (!KEY) { refresh(); return; }
-  try { await loadApps(); } catch (e) { /* refresh() surfaces the error */ }
+$('forget').onclick = () => forgetKey('');
+
+$('keyEntry').onsubmit = e => {
+  e.preventDefault();
+  const v = $('keyInput').value.trim();
+  if (!v) return;
+  KEY = v;
+  localStorage.setItem(KEY_STORE, KEY);
+  boot();
+};
+
+async function boot() {
+  if (!KEY) { askForKey(''); return; }
+  $('keyForm').style.display = 'none';
+  $('forget').style.display = '';
+  $('msg').style.display = '';
+  $('msg').className = 'muted';
+  $('msg').textContent = 'Loading…';
+  try { await loadApps(); } catch (e) {
+    if (e instanceof AuthError) { forgetKey('That key was rejected. Try another.'); return; }
+  }
   refresh();
-})();
+}
+
+boot();

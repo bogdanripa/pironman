@@ -187,6 +187,17 @@ curl -sS -X POST https://api-coolify.bogdanripa.com/apps -H "Authorization: Bear
 Then install the returned `paas_key` as this repo's **DASHBOARD_PAAS_KEY** secret
 and push — CI publishes the bundle.
 
+**The key never stays in the URL.** Open the dashboard at `/` and it asks for an
+API key, keeping it in `localStorage`. A key passed as `?key=` is stored and then
+stripped by replacing the URL with `/`, so it does not remain in the address bar,
+in history, or in a referrer header. A rejected key (401/403) is discarded and
+the prompt returns, and "forget key" clears it.
+
+This reduces exposure but does not fix the underlying issue: the dashboard needs
+an **admin** key, because the platform has no read-only scope. A key that can
+read analytics can also delete apps. A read-only key type — limited to the paths
+CORS already whitelists — is the proper fix and is not built yet.
+
 ## Container names
 
 Coolify names containers `<resource-uuid>-<deploy-timestamp>`, which is
