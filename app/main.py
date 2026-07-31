@@ -3,8 +3,8 @@ from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 from fastapi import FastAPI
 
-from .db import init_pool, ensure_schema, close_pool
-from . import autoupdate, analytics, alerts
+from .db import init_pool, ensure_schema, close_pool, pool
+from . import autoupdate, analytics, alerts, routing
 from .cors import CorsMiddleware
 from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
@@ -198,6 +198,23 @@ unguarded pipe into that database — confirm both with the user first.\
 """
 
 
+async def _sync_routes(reason: str) -> None:
+    """Re-derive the static host's routers from the database.
+
+    Necessary because this Coolify build rejects the readonly-labels flag, so a
+    redeploy of the static host can regenerate its label block and drop the
+    per-app routers we wrote — after which a frontend app's hostname resolves
+    nowhere until something republishes it. The label set is a pure function of
+    the apps table and the write is skipped when nothing changed, so running this
+    routinely costs one label comparison and never restarts anything needlessly.
+    """
+    try:
+        async with pool().acquire() as c:
+            await routing.sync_frontend_routes(c)
+    except Exception:
+        pass  # routing drift must never take the control plane down
+
+
 async def _autoupdate_loop():
     """Hourly: redeploy every opted-in app whose watched image tag has moved.
     First run is an hour after startup, not on boot — this control plane
@@ -208,6 +225,10 @@ async def _autoupdate_loop():
             await autoupdate.check_all()
         except Exception:
             pass  # a bad sweep must never take the control plane down
+        # Same cadence: repair any routing the static host lost to a label
+        # regeneration, so a frontend never stays unreachable for longer than the
+        # sweep interval.
+        await _sync_routes("hourly sweep")
 
 
 async def _analytics_loop():
@@ -238,6 +259,7 @@ async def _alerts_loop():
 async def lifespan(_: FastAPI):
     await init_pool()
     await ensure_schema()  # create env tables if missing — no manual SQL on the Pi
+    await _sync_routes("startup")
     tasks = [asyncio.create_task(_autoupdate_loop()),
              asyncio.create_task(_analytics_loop()),
              asyncio.create_task(_alerts_loop())]
