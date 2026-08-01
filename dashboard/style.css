@@ -32,6 +32,8 @@
   th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
   th { color:var(--mut); font-weight:500; }
   td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  td.ip { white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+          font-size:12.5px; }
   .cohort td { text-align:center; border:1px solid var(--bg); border-radius:4px; }
   .cohort td.lbl { text-align:left; white-space:nowrap; color:var(--mut); }
   .legend { display:flex; gap:16px; font-size:12px; color:var(--mut);

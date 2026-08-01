@@ -269,10 +269,12 @@ function renderRecent() {
   const sc = s => (s >= 500) ? 'bad' : (s >= 400 ? 'warn' : '');
   const shown = rows.slice(0, _recentShown);
   const table =
-    `<div style="overflow-x:auto"><table><tr><th>Time · ${esc(TZ)}</th><th>App</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>` +
+    `<div style="overflow-x:auto"><table><tr><th>Time · ${esc(TZ)}</th><th>App</th><th>Client IP</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>` +
     shown.map(r =>
       `<tr><td class="muted" title="${esc(r.time || '')}">${esc(localTime(r.time))}</td>` +
       `<td>${esc(r.app || '')}</td>` +
+      // IPv6 is long enough to wrap mid-address and read as two addresses.
+      `<td class="ip" title="${esc(r.ip || '')}">${esc(r.ip || '—')}</td>` +
       `<td>${esc(r.method || '')}</td>` +
       `<td style="max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.path || '')}</td>` +
       `<td class="n ${sc(r.status)}">${r.status ?? ''}</td></tr>`).join('') +

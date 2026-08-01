@@ -139,7 +139,8 @@ counted as one person across apps. Use analytics_overview for headline numbers
 (unique visitors, DAU/WAU/MAU, a humans-vs-bots split, and a per-app breakdown
 when no app is given), analytics_timeseries for a daily line chart,
 analytics_cohorts for retention, analytics_agents for the top user-agents, and
-analytics_recent for a live tail of the most recent HTTP requests. apps_stats
+analytics_recent for a live tail of the most recent HTTP requests, each with the
+caller's real IP — the one place a raw address is reported. apps_stats
 gives the live infra view (running state, CPU/RAM, disk, DB size, and request
 error rate / latency percentiles). A human-facing dashboard of all of this runs
 as its own frontend-only app at https://dashboard-coolify.bogdanripa.com — it

@@ -15,6 +15,14 @@ global cohorts meaningful). Behind Cloudflare the real client IP arrives in the
 CF-Connecting-Ip header, so the access log must be configured to keep it (and
 User-Agent) — see the one-time proxy setup in the README.
 
+The one exception is recent_requests: a live tail of individual requests, read
+straight off the proxy log and never written anywhere, which reports the client
+IP as-is. Without it a tail cannot answer the question it exists for — who is
+hammering this app — since a truncated hash is not something you can block or
+look up. It stays a read of the log rather than a stored column: the rollups
+above still keep no raw IP, and the endpoint is behind the same API key as the
+rest of the platform.
+
 Ingestion is idempotent via a StartUTC cursor in analytics_state: each pass reads
 only log lines newer than the last one counted, so overlapping `docker logs`
 windows never double-count.
@@ -100,6 +108,20 @@ def _behind(cursor: str | None) -> float | None:
     return None if at is None else (datetime.now(timezone.utc) - at).total_seconds()
 
 
+def _client_ip(e: dict) -> str:
+    """The real client IP for one access-log entry, or "" if the log has none.
+
+    ClientHost alone is Cloudflare's edge (or the proxy's own docker-network peer
+    for internally-forwarded requests), so it is the last resort, not the first:
+    CF-Connecting-Ip is what Cloudflare puts the originating address in, and
+    X-Forwarded-For's first element covers anything arriving through some other
+    forwarder.
+    """
+    return (e.get("request_Cf-Connecting-Ip")
+            or (e.get("request_X-Forwarded-For") or "").split(",")[0]
+            or e.get("ClientHost") or "").strip()
+
+
 def _visitor(ip: str, ua: str) -> str:
     """Cookieless, stable-per-person id. Excludes app_id on purpose: the same
     (ip, ua) is one visitor across every app."""
@@ -129,9 +151,7 @@ def _parse_line(line: str) -> dict | None:
     if not app_id or "." in app_id:  # only flat <app> labels are real apps
         return None
 
-    ip = (e.get("request_Cf-Connecting-Ip")
-          or (e.get("request_X-Forwarded-For") or "").split(",")[0]
-          or e.get("ClientHost") or "").strip()
+    ip = _client_ip(e)
     ua = (e.get("request_User-Agent") or "").strip()
     if not ip and not ua:
         return None
@@ -528,8 +548,11 @@ async def top_agents(app_id: str | None = None, days: int = 30,
 
 async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
     """The most recent individual HTTP requests, newest first, read live from the
-    edge proxy log (not the rollups): time, app, method, path and status. A tail,
-    not history — only what is still in the proxy's log buffer."""
+    edge proxy log (not the rollups): time, app, client IP, method, path and
+    status. A tail, not history — only what is still in the proxy's log buffer.
+
+    The IP is the real client address (CF-Connecting-Ip behind Cloudflare), not
+    the hashed visitor id the rollups store — see the module docstring."""
     limit = max(1, min(limit, 200))
     _, out = await autoupdate._docker(
         "logs", "--tail", str(limit * 8 + 200), ANALYTICS_PROXY, timeout=60)
@@ -549,6 +572,7 @@ async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
         if not aid or "." in aid or (app_id and aid != app_id):
             continue
         items.append({"time": e.get("StartUTC"), "app": aid,
+                      "ip": _client_ip(e),
                       "method": e.get("RequestMethod"),
                       "path": e.get("RequestPath"),
                       "status": e.get("DownstreamStatus")})
