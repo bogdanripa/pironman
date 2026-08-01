@@ -268,6 +268,11 @@ async def ingest_once() -> dict:
         # nothing, and moved nothing again. On a quiet box that span only grows,
         # and the stall is invisible: every pass "succeeds" having counted zero.
         horizon = cursor or ""
+        # The newest stamp actually present in this read, tracked separately from
+        # `horizon` — which starts AT the cursor and so can never fall below it.
+        # Only an independent value can show the read handing back older data
+        # than we already have, which is the truncation signature.
+        newest_line = ""
         seen = 0
         # Where lines are lost, so "counted nothing" can name its own cause.
         # Each stage is a different fault: no lines at all means the proxy log is
@@ -281,6 +286,8 @@ async def ingest_once() -> dict:
             stamp = _stamp_of(line)
             if stamp > horizon:
                 horizon = stamp
+            if stamp > newest_line:
+                newest_line = stamp
             tally["lines"] += 1
             if line.strip().startswith("{"):
                 tally["json"] += 1
@@ -395,16 +402,21 @@ async def ingest_once() -> dict:
         if behind is None:
             _log.warning("analytics: no lines counted and the cursor %r cannot be "
                          "parsed — nothing will ever advance", cursor)
-        elif tally["lines"] >= MAX_LINES:
-            # The window was filled and still held nothing new. Either traffic
-            # genuinely outran a pass, or MAX_LINES has crossed the threshold
-            # where Docker starts returning the head of the log instead of the
-            # tail — the failure this constant exists to avoid.
+        elif newest_line and cursor and newest_line < cursor:
+            # The NEWEST line we were handed is older than the cursor. That
+            # cannot happen on a healthy tail — being caught up means the newest
+            # line equals the cursor, never precedes it — so the read returned
+            # the START of the log instead of the end. Lower MAX_LINES.
+            #
+            # Note the condition, which a first attempt got wrong: "the window
+            # was full and nothing in it was newer" is NOT this. The proxy log
+            # is permanently longer than MAX_LINES, so every window is full, and
+            # a quiet two minutes legitimately contains nothing newer. That
+            # version fired five times against a perfectly healthy ingester.
             _log.warning(
-                "analytics: read the full %d-line window and none of it was "
-                "newer than the cursor (%s). Either traffic outran a pass, or "
-                "the read is returning the START of the log rather than the "
-                "end — lower MAX_LINES.", MAX_LINES, cursor)
+                "analytics: the newest line read (%s) is OLDER than the cursor "
+                "(%s) — the read is returning the start of the log, not the "
+                "end. Lower MAX_LINES.", newest_line, cursor)
         elif behind > _STALL_AFTER:
             _log.warning(
                 "analytics: nothing counted and the cursor is %.0f minutes behind "
