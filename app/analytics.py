@@ -23,7 +23,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 from . import autoupdate
 from .config import ANALYTICS_PROXY, ANALYTICS_SALT, DOMAIN_SUFFIX
@@ -31,9 +31,14 @@ from .db import pool
 
 _log = logging.getLogger("pironman.analytics")
 
-# Ingestion runs every two minutes, so a cursor more than this far back
-# is not lag, it is a stall worth saying out loud.
-_CURSOR_LAG_WARN_MIN = 30
+# How far the cursor may fall behind before a pass that counted nothing is
+# treated as a stall rather than a quiet box.
+_STALL_AFTER = 15 * 60
+
+# The most log we will ask Docker for in one pass. Bounds the work whatever state
+# the cursor is in — see _read_since.
+MAX_WINDOW = 60 * 60
+
 
 _CURSOR_KEY = "accesslog_cursor"
 
@@ -78,6 +83,14 @@ def _moment(start: str) -> datetime | None:
         return datetime.fromisoformat(_FRACTION.sub(r"\1", start).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _behind(cursor: str | None) -> float | None:
+    """Seconds between the cursor and now, or None if it will not parse."""
+    if not cursor:
+        return 0.0
+    at = _moment(cursor)
+    return None if at is None else (datetime.now(timezone.utc) - at).total_seconds()
 
 
 def _visitor(ip: str, ua: str) -> str:
@@ -134,29 +147,65 @@ def _parse_line(line: str) -> dict | None:
 
 
 async def _read_since(cursor: str | None) -> str:
-    """Raw access-log text from the proxy container, limited to roughly the
-    window we still need. `--since` takes a container-log timestamp; we pass the
-    cursor (an RFC3339 StartUTC) so Docker hands back only recent lines, then the
-    caller drops any at/before the cursor by StartUTC. First run bootstraps a day.
+    """Raw access-log text from the proxy container, for a **bounded** window.
 
-    Docker gets a plain whole-second RFC3339 stamp (2026-07-30T14:31:17Z), not the
-    cursor's nanosecond precision, which some Docker versions reject on --since.
-    Dropping the sub-second part only widens the window slightly; the exact,
-    full-precision `start <= cursor` check in ingest_once drops the boundary line
-    already counted, so nothing is double-counted.
+    `--since` takes a container-log timestamp; we pass the cursor (an RFC3339
+    StartUTC) so Docker hands back only recent lines, then the caller drops any
+    at/before the cursor by StartUTC. Docker gets a plain whole-second stamp
+    (2026-07-30T14:31:17Z), not the cursor's nanosecond precision, which some
+    Docker versions reject. Dropping the sub-second part only widens the window
+    slightly; the exact check in ingest_once drops the boundary line already
+    counted, so nothing is double-counted.
+
+    Two things here are load-bearing, and their absence froze every analytic on
+    this box for twelve hours:
+
+    **The window is capped.** If the cursor is further back than MAX_WINDOW, we
+    read the cap instead and skip the gap. Otherwise a single failed pass is
+    permanent: the cursor does not advance, so the next pass asks for a larger
+    window, which fails more easily, which... The gap is a few missing rows; the
+    alternative is never ingesting again.
+
+    **The exit code is checked.** `_docker` reports a timeout by *returning*
+    (124, "docker timed out"). Ignoring that yields a string with no JSON in it,
+    which is indistinguishable from a quiet log — zero lines counted, no error,
+    cursor pinned. That is exactly how this failed.
     """
-    since = (cursor[:19] + "Z") if cursor else "24h"
-    code, out = await autoupdate._docker(
+    behind = _behind(cursor)
+    skipped = None
+    if cursor and (behind is None or behind > MAX_WINDOW):
+        skipped = behind
+        since = f"{int(MAX_WINDOW)}s"
+    else:
+        since = (cursor[:19] + "Z") if cursor else "24h"
+
+    rc, out = await autoupdate._docker(
         "logs", "--since", since, ANALYTICS_PROXY, timeout=120)
-    # Check the exit code. Discarding it makes a FAILED read indistinguishable
-    # from a quiet hour: both hand back text with no parseable request lines, the
-    # pass counts nothing, the cursor never advances, and every number on the
-    # dashboard silently stops moving while the loop reports success for ever.
-    # _docker folds stderr into stdout, so `out` is the error text here.
-    if code != 0:
-        raise RuntimeError(
-            f"docker logs {ANALYTICS_PROXY} failed ({code}): {out.strip()[:300]}")
+    if rc != 0:
+        _log.warning("analytics: could not read %s logs (rc=%s): %s",
+                     ANALYTICS_PROXY, rc, out.strip()[:200])
+        return ""
+    if skipped:
+        _log.warning("analytics: cursor was %.0f minutes behind; read only the "
+                     "last %d minutes and skipped the gap",
+                     skipped / 60, MAX_WINDOW // 60)
     return out
+
+
+def _diagnose(t: dict) -> str:
+    """Turn the tally into the thing to go and check."""
+    if not t["lines"]:
+        return (f"The {ANALYTICS_PROXY} container produced no log output at all.")
+    if not t["json"]:
+        return ("None of it is JSON, so Traefik is not writing a JSON access log. "
+                "Those proxy flags are a hand-edit and Coolify regenerates them "
+                "away on a proxy restart — re-apply them.")
+    if not t["app"]:
+        return (f"JSON is being written but no line is a request to a "
+                f"*{DOMAIN_SUFFIX}* host with a usable client identity — check "
+                "that the access log still keeps RequestHost, User-Agent and "
+                "Cf-Connecting-Ip.")
+    return "Every line is older than the cursor, which is the normal quiet case."
 
 
 def _stamp_of(line: str) -> str:
@@ -211,14 +260,27 @@ async def ingest_once() -> dict:
         # and the stall is invisible: every pass "succeeds" having counted zero.
         horizon = cursor or ""
         seen = 0
+        # Where lines are lost, so "counted nothing" can name its own cause.
+        # Each stage is a different fault: no lines at all means the proxy log is
+        # unreadable; lines but no JSON means Traefik is not writing a JSON access
+        # log (the one-time proxy flags are a hand-edit, and Coolify regenerates
+        # what Coolify generates); JSON but no app hosts means the log is missing
+        # RequestHost or the domain suffix changed; and everything older than the
+        # cursor is the only case that is actually normal.
+        tally = {"lines": 0, "json": 0, "app": 0, "old": 0}
         for line in raw.splitlines():
             stamp = _stamp_of(line)
             if stamp > horizon:
                 horizon = stamp
+            tally["lines"] += 1
+            if line.strip().startswith("{"):
+                tally["json"] += 1
             rec = _parse_line(line)
             if rec is None:
                 continue
+            tally["app"] += 1
             if cursor and rec["start"] <= cursor:
+                tally["old"] += 1
                 continue  # already counted in an earlier pass
             seen += 1
             if rec["start"] > newest:
@@ -312,16 +374,25 @@ async def ingest_once() -> dict:
                 "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
                 _CURSOR_KEY, mark)
 
-        # A cursor that keeps falling further behind is the signature of a stall,
-        # and it is the one thing a pass cannot notice about itself: counting
-        # zero looks identical to an idle box. Say it out loud instead.
-        lag = _moment(mark)
-        if lag and (now - lag) > timedelta(minutes=_CURSOR_LAG_WARN_MIN):
+    # Say what happened. A pass that counts nothing is normal on a quiet box and
+    # indistinguishable from one that is stuck — which is exactly the state that
+    # left "last accessed" empty with no error anywhere. So the quiet case is
+    # silent only while the cursor is keeping up; once it falls behind, that is a
+    # stall and it says so.
+    if seen:
+        _log.info("analytics: counted %d lines, cursor now %s", seen, mark)
+    else:
+        behind = _behind(cursor)
+        if behind is None:
+            _log.warning("analytics: no lines counted and the cursor %r cannot be "
+                         "parsed — nothing will ever advance", cursor)
+        elif behind > _STALL_AFTER:
             _log.warning(
-                "analytics: cursor is %d minutes behind (%s) after reading %d "
-                "app requests — ingestion is not keeping up",
-                int((now - lag).total_seconds() // 60), mark, seen)
-
+                "analytics: nothing counted and the cursor is %.0f minutes behind "
+                "(%s). Read %d log lines, %d were JSON, %d were requests to a "
+                "hosted app, %d of those older than the cursor. %s",
+                behind / 60, cursor, tally["lines"], tally["json"], tally["app"],
+                tally["old"], _diagnose(tally))
     return {"lines_counted": seen, "cursor": mark or None}
 
 

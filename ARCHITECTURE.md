@@ -183,7 +183,9 @@ purpose — a bad analytics pass cannot be allowed to take the control plane wit
 it — but a bare `pass` makes a broken ingester indistinguishable from a quiet
 one. That is exactly how "last accessed" read `never` for apps in daily use with
 nothing anywhere to say why. They log the traceback (`main._swallow`), which
-uvicorn captures, so `apps_logs api` shows it.
+uvicorn captures, so `apps_logs api` shows it — and the healthcheck's own
+successful access-log lines are filtered out, or the 10-second cadence would push
+that traceback out of `--tail` within about two minutes.
 
 ### Auth
 
@@ -537,6 +539,13 @@ flows through: the Traefik access log** — nothing is installed per app.
   visitor** = `sha256(salt | ip | user-agent)` — the app id is deliberately *not*
   in the hash, so one person across two apps is one visitor. Ingestion is
   idempotent via a `StartUTC` cursor.
+- **The read window is capped and the exit code is checked** (`MAX_WINDOW`, 1h).
+  Without both, one failed pass is permanent: `_docker` reports a timeout by
+  *returning* `(124, "docker timed out")`, and discarding that code leaves a
+  string with no JSON in it — indistinguishable from a quiet log. Zero lines
+  counted, no error, cursor pinned, and the next pass asks for a larger window,
+  which fails more easily. Every analytic on the box froze for twelve hours that
+  way. A pass that counts nothing while the cursor falls behind now warns.
 - Rollups in `_paas`: `analytics_visits` (per app/visitor/day, with an `is_bot`
   flag), `analytics_first_seen` (cohorts), `analytics_perf` (requests / 4xx /
   5xx / summed latency), `analytics_latency` (additive histogram → p50/p95

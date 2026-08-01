@@ -164,6 +164,24 @@ function exact(iso) {
   const d = new Date(iso);
   return isNaN(d) ? iso : d.toLocaleString();
 }
+
+// Everything the platform stores is UTC. Nothing is shown that way: a timestamp
+// you have to offset in your head is a timestamp you misread.
+function localTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleTimeString([], { hour12: false }) +
+         (d.toDateString() === new Date().toDateString()
+            ? '' : ' · ' + d.toLocaleDateString());
+}
+
+// The timezone the reader is actually in, for labelling a column once rather
+// than repeating it on every row.
+const TZ = (() => {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'local'; }
+  catch (e) { return 'local'; }
+})();
 function renderResources(data) {
   const apps = data.apps || [], h = data.host || {};
   if (h.mem_total_mb) {
@@ -251,9 +269,9 @@ function renderRecent() {
   const sc = s => (s >= 500) ? 'bad' : (s >= 400 ? 'warn' : '');
   const shown = rows.slice(0, _recentShown);
   const table =
-    '<div style="overflow-x:auto"><table><tr><th>Time (UTC)</th><th>App</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>' +
+    `<div style="overflow-x:auto"><table><tr><th>Time · ${esc(TZ)}</th><th>App</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>` +
     shown.map(r =>
-      `<tr><td class="muted">${esc((r.time || '').slice(0, 19).replace('T', ' '))}</td>` +
+      `<tr><td class="muted" title="${esc(r.time || '')}">${esc(localTime(r.time))}</td>` +
       `<td>${esc(r.app || '')}</td>` +
       `<td>${esc(r.method || '')}</td>` +
       `<td style="max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.path || '')}</td>` +

@@ -230,8 +230,8 @@ async def get_app(app_id: str):
     when it was last published) or is null if the app has no frontend.
 
     Use it to answer "does this app already have a frontend?", "is it
-    auto-updating?", "does it sleep when idle?" and "which paths does its backend
-    own?" without guessing or making changes to find out.
+    auto-updating?", "does it sleep when idle?" and "when was it last used?"
+    without guessing or making changes to find out.
 
     The database connection string is composed fresh on each call rather than
     stored, because the database container's hostname changes whenever the
@@ -282,6 +282,12 @@ async def get_app(app_id: str):
         # Whether a path neither the bundle nor the backend has serves index.html
         # (a client-side route) or 404s. See apps_update.
         "spa": row["spa"],
+
+        # When this app was last requested (any traffic, all time), or null if it
+        # has never been seen in the access log. apps_stats reports it for every
+        # app at once; it belongs here too, because "is anyone still using this?"
+        # is a question about one app as often as about all of them.
+        "last_seen": await stats.last_seen_of(app_id),
 
         "crons": [dict(c) for c in crons],
         "env": [{"key": r["key"], "preview": envs.mask(r["value"])} for r in env],
