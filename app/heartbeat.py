@@ -40,6 +40,38 @@ STALE_AFTER = {
 }
 
 
+async def register() -> None:
+    """Put a row in the table for every task that is SUPPOSED to run, at startup.
+
+    Without this the monitoring has the exact hole it exists to close. A task
+    that never beats has no row, a reader can only evaluate rows that exist, and
+    a loop that has never run once is therefore indistinguishable from a loop
+    that does not exist — so the watchdog cheerfully reports "all background work
+    current" while nothing is running. That is not hypothetical either: the host
+    dispatcher went unnoticed for exactly this reason, because the copy in
+    /usr/local/bin predated heartbeats and so never wrote a row.
+
+    Seeded with last_ok = now() rather than NULL, and never overwritten
+    (ON CONFLICT DO NOTHING). Both halves matter:
+
+    - now(), because a task gets its declared grace period from process start.
+      autoupdate_sweep does not run for an hour by design; seeding NULL would
+      flag it as stalled on every single deploy and teach everyone to ignore it.
+    - DO NOTHING, because a redeploy must not reset an existing row. Otherwise
+      restarting the control plane would erase the evidence of a stalled loop —
+      and for autoupdate_sweep, whose timer restarts on every deploy, frequent
+      redeploys would hide the very staleness worth seeing.
+    """
+    try:
+        async with pool().acquire() as c:
+            await c.executemany(
+                "INSERT INTO task_heartbeat (task, last_ok, stale_after_s) "
+                "VALUES ($1, now(), $2) ON CONFLICT (task) DO NOTHING",
+                list(STALE_AFTER.items()))
+    except Exception:
+        _log.exception("could not register background tasks")
+
+
 async def beat(task: str, error: str | None = None) -> None:
     """Record that `task` just finished. Pass `error` to record a failed run.
 

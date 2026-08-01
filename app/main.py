@@ -350,6 +350,11 @@ async def _alerts_loop():
 async def lifespan(_: FastAPI):
     await init_pool()
     await ensure_schema()  # create env tables if missing — no manual SQL on the Pi
+    # Declare the background tasks before starting them, so one that never runs
+    # is visible as a stale row rather than as no row at all — an absent task is
+    # invisible to every reader, which is how a dead cron dispatcher went
+    # unnoticed while the watchdog reported everything current.
+    await heartbeat.register()
     await _sync_routes("startup")
     tasks = [asyncio.create_task(_autoupdate_loop()),
              asyncio.create_task(_analytics_loop()),

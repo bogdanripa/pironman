@@ -63,6 +63,24 @@ If a claim already given to the user turns out to be wrong, correct it plainly
 and fix any commit message that carries it. Do not let a wrong explanation sit in
 the permanent record because the code happens to be right.
 
+## Facts about this box that are easy to get wrong
+
+- **DNS is a wildcard.** `*.bogdanripa.com` via Cloudflare, so there is never a
+  per-app DNS record to create, and never one to clean up after a deletion.
+  ARCHITECTURE §4 already said this; suggesting a DNS tidy-up after removing an
+  app contradicted the repo's own docs.
+- **Every app this platform creates is `<app-id>-coolify.bogdanripa.com`** —
+  the `-coolify` infix is not optional and is not derived from anything. So a
+  container answering on a *bare* host like `whoami.bogdanripa.com` was not
+  created here, whatever else it looks like. That is a reliable first
+  discriminator when deciding whether something is ours.
+- **Coolify-managed is not the same as platform-managed.** An app can be in
+  Coolify (`coolify.managed=true`, an `applications` row) and absent from the
+  `apps` table. Removing its container with `docker rm` leaves Coolify owning a
+  resource whose container is gone; the removal belongs in Coolify, or via
+  `apps_adopt` + `apps_delete`. Check both registries before concluding
+  something is stray.
+
 ## Destructive actions
 
 `host_run_script` is root on the machine the whole platform runs on, including
