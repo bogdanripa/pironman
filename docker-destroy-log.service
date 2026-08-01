@@ -1,0 +1,13 @@
+[Unit]
+Description=Record Docker container destroy events (forensics for vanished containers)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStart=/usr/local/bin/docker-destroy-log
+
+[Install]
+WantedBy=multi-user.target
