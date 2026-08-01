@@ -45,6 +45,11 @@ STATE_FILE = Path(os.environ.get("PAAS_WATCHDOG_STATE",
                                  "/var/lib/paas-watchdog/state.json"))
 ENV_FILE = Path(os.environ.get("PAAS_WATCHDOG_ENV", "/etc/paas-watchdog.env"))
 API_APP = os.environ.get("CONTROL_PLANE_APP", "api")
+# Apps that must be running whatever their sleep_when_idle column says. Both are
+# excluded from scale-to-zero in code (sablier.excluded), and the static host in
+# particular is what WAKES everything else — if it stopped, every sleeping app
+# behind it would be unreachable with nothing able to start it.
+ALWAYS_ON = {API_APP, os.environ.get("STATIC_HOST_APP", "web")}
 # Restarting the same container in a tight loop turns one fault into a different
 # fault. Two consecutive failing runs (~10 minutes) before trying again.
 RESTART_COOLDOWN_RUNS = 2
@@ -88,7 +93,7 @@ def query(container: str, sql: str) -> tuple[list[list[str]], str | None]:
             None)
 
 
-def telegram_config() -> tuple[str, str]:
+def telegram_config(api_uuid: str | None = None) -> tuple[str, str]:
     """Bot token and chat id.
 
     Preferred source is paas-api's own container config, so the secret is defined
@@ -106,7 +111,10 @@ def telegram_config() -> tuple[str, str]:
         if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
             return env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_CHAT_ID"]
 
-    name = container_for(API_APP, include_stopped=True)
+    # The uuid matters here for the same reason it does everywhere else: `api`
+    # carries no pironman.app label, so without it this finds nothing and the
+    # watchdog goes silent exactly when it has something to report.
+    name = container_for(API_APP, api_uuid, include_stopped=True)
     if name:
         code, out = sh("docker", "inspect", name, "--format", "{{json .Config.Env}}")
         if code == 0:
@@ -118,8 +126,8 @@ def telegram_config() -> tuple[str, str]:
     return "", ""
 
 
-def notify(text: str) -> None:
-    token, chat = telegram_config()
+def notify(text: str, api_uuid: str | None = None) -> None:
+    token, chat = telegram_config(api_uuid)
     if not token or not chat:
         print(f"[no telegram configured] {text}")
         return
@@ -136,10 +144,29 @@ def notify(text: str) -> None:
         print(f"could not send telegram: {e}")
 
 
-def container_for(app_id: str, include_stopped: bool = False) -> str | None:
-    """The container running `app_id`, found by the `pironman.app` label paas-api
-    stamps on it. Coolify names containers <uuid>-<timestamp>, which changes on
-    every deploy, so the label is the only stable handle."""
+def container_for(app_id: str, uuid: str | None = None,
+                  include_stopped: bool = False) -> str | None:
+    """The container for `app_id`.
+
+    By Coolify resource uuid FIRST, because that is the identity that always
+    exists. Coolify names containers <uuid>-<timestamp>: the timestamp changes on
+    every deploy, but the uuid prefix is stable and is what the apps table
+    stores.
+
+    The `pironman.app` label would be nicer, but it is only present on apps whose
+    labels this platform has rewritten — routing and Sablier do that, adoption
+    does not. On this box exactly one container carries it, and `api` is not that
+    container. A watchdog that looked the control plane up by label would report
+    it down for ever while it ran perfectly.
+    """
+    if uuid:
+        args = ["docker", "ps", "--filter", f"name=^{uuid}", "--format", "{{.Names}}"]
+        if include_stopped:
+            args.insert(2, "-a")
+        _, out = sh(*args)
+        names = [n for n in out.splitlines() if n.strip()]
+        if names:
+            return names[0]
     args = ["docker", "ps", "--filter", f"label=pironman.app={app_id}",
             "--format", "{{.Names}}"]
     if include_stopped:
@@ -157,24 +184,33 @@ def container_state(name: str) -> tuple[str, str]:
     return state, health
 
 
-def check(container: str) -> tuple[dict[str, str], list[str]]:
-    """Every current problem as {key: human description}, plus app ids that are
-    down and eligible for a restart."""
+def check(container: str) -> tuple[dict[str, str], list[str], dict[str, str]]:
+    """Every current problem as {key: human description}, the app ids that are
+    down and eligible for a restart, and each app's Coolify uuid — returned so
+    callers can resolve containers without querying again."""
     problems: dict[str, str] = {}
     restartable: list[str] = []
+    uuids: dict[str, str] = {}
 
     # 1. Apps that are not supposed to sleep. An app with sleep_when_idle = true
     #    being stopped is the feature working, not a fault — checking it would
     #    alert on every idle night and train everyone to ignore this.
     rows, err = query(container,
-                      "SELECT id FROM apps WHERE coolify_uuid IS NOT NULL "
-                      "AND sleep_when_idle = false ORDER BY id")
+                      "SELECT id, coolify_uuid, sleep_when_idle FROM apps "
+                      "WHERE coolify_uuid IS NOT NULL ORDER BY id")
     if err:
         problems["db:apps"] = f"cannot read the apps table from _paas: {err}"
         rows = []
-    for row in rows:
-        app = row[0]
-        name = container_for(app)
+    for app, uuid, sleeps in rows:
+        uuids[app] = uuid
+        # ALWAYS_ON wins over the flag. The control plane's row says
+        # sleep_when_idle = true on this box, yet sablier.excluded() refuses to
+        # enrol it and it must never stop — it runs the loops everything else
+        # depends on. Trusting the column alone would silently drop `api`, the
+        # one app whose being down matters most, out of the checks entirely.
+        if sleeps == "t" and app not in ALWAYS_ON:
+            continue
+        name = container_for(app, uuid)
         if not name:
             problems[f"down:{app}"] = f"{app} has no running container"
             restartable.append(app)
@@ -213,7 +249,7 @@ def check(container: str) -> tuple[dict[str, str], list[str]]:
             problems[f"stale:{task}"] = (
                 f"{task} last completed {age_i // 60}m ago "
                 f"(expected within {tol_i // 60}m) — last ok {last_ok}")
-    return problems, restartable
+    return problems, restartable, uuids
 
 
 def main() -> int:
@@ -227,7 +263,7 @@ def main() -> int:
 
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     pg = pg_container()
-    problems, restartable = check(pg)
+    problems, restartable, uuids = check(pg)
 
     try:
         state = json.loads(STATE_FILE.read_text())
@@ -250,7 +286,7 @@ def main() -> int:
             if strikes[app] < RESTART_COOLDOWN_RUNS:
                 print(f"{stamp} {app} down (strike {strikes[app]}) — waiting before restart")
                 continue
-            name = container_for(app, include_stopped=True)
+            name = container_for(app, uuids.get(app), include_stopped=True)
             if not name:
                 print(f"{stamp} {app} has no container to restart")
                 continue
@@ -265,10 +301,12 @@ def main() -> int:
 
     if not args.dry_run:
         if new:
-            notify("<b>pironman</b>\n" + "\n".join(f"• {problems[k]}" for k in sorted(new)))
+            notify("<b>pironman</b>\n" + "\n".join(f"• {problems[k]}" for k in sorted(new)),
+                   uuids.get(API_APP))
         if cleared:
             notify("<b>pironman — recovered</b>\n" +
-                   "\n".join(f"• {k.split(':', 1)[1]}" for k in sorted(cleared)))
+                   "\n".join(f"• {k.split(':', 1)[1]}" for k in sorted(cleared)),
+                   uuids.get(API_APP))
 
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
