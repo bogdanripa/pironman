@@ -63,6 +63,23 @@ If a claim already given to the user turns out to be wrong, correct it plainly
 and fix any commit message that carries it. Do not let a wrong explanation sit in
 the permanent record because the code happens to be right.
 
+## Close your own loops — set a timer, do not ask for a ping
+
+A change to `paas-api` is not finished when it is pushed. It has to build
+(emulated arm64, minutes) and redeploy before anything on the box changes, so
+"it should work now" is a prediction, not a result — and predictions made at
+this point in the loop have been wrong repeatedly here.
+
+**So schedule the verification instead of delegating it.** `send_later` puts a
+message back into this session; use it after any push that has to reach the box,
+and again if the build has not landed yet. Keep going until the thing is
+confirmed working or genuinely blocked. Never end a turn with "ping me when it
+deploys" — the user should not have to carry the loop.
+
+The check itself is the same discipline as everything else: read the running
+image tag first, because a stale image explains every other symptom and
+explaining a symptom that has not changed yet wastes the round.
+
 ## Facts about this box that are easy to get wrong
 
 - **DNS is a wildcard.** `*.bogdanripa.com` via Cloudflare, so there is never a
