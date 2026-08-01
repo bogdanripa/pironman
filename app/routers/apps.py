@@ -817,6 +817,14 @@ async def delete_app(app_id: str):
     async with pool().acquire() as c:
         await c.execute("DELETE FROM app_env WHERE app_id = $1", app_id)
         await c.execute("DELETE FROM api_keys WHERE app_id = $1", app_id)
+        # Crons too — this is not housekeeping, it is the difference between a
+        # deleted app and a deleted app that keeps making requests. The host
+        # dispatcher reads the crons table on its own and never joins apps, so a
+        # row left behind here fires every minute for ever, at a hostname whose
+        # app no longer exists. Nothing reports it: the app is gone from
+        # apps_list, its cron_count with it, and the traffic just accrues against
+        # a ghost id in the analytics.
+        await c.execute("DELETE FROM crons WHERE app_id = $1", app_id)
         await c.execute("DELETE FROM apps WHERE id = $1", app_id)
         try:  # drop its route from the static host, if it had one
             await routing.sync_frontend_routes(c)

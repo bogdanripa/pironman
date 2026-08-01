@@ -19,21 +19,47 @@ sys.path.insert(0, "/opt/paas")          # where app/cronmatch.py is mounted
 from app.cronmatch import due            # noqa: E402
 
 DOMAIN_SUFFIX = "-coolify.bogdanripa.com"
+# Joined to apps, not read from crons alone. A cron row can outlive its app —
+# anything that removes an app without clearing its jobs leaves one behind — and
+# an orphan fires every minute for ever at a hostname that routes nowhere. The
+# join makes the app's existence the condition for firing, so a stale row is
+# inert rather than a permanent source of traffic and 5xx.
 SQL = ("SELECT coalesce(json_agg(json_build_object("
        "'app_id', c.app_id, 'schedule', c.schedule, 'method', c.method, "
        "'path', c.path, 'body', c.body))::text, '[]') "
-       "FROM crons c WHERE c.enabled")
+       "FROM crons c JOIN apps a ON a.id = c.app_id WHERE c.enabled")
 
 
 def pg_container() -> str:
+    """The container holding the control plane's `_paas` database.
+
+    NOT simply the first `postgres:` image. Once any app has its own Postgres
+    there is more than one candidate, `docker ps` lists newest first, and a
+    freshly provisioned app database quietly becomes the answer — `psql` then
+    exits 2 against a `_paas` that does not exist there, this script dies, and
+    every scheduled job on the box silently stops firing. That is not
+    hypothetical: it is how the dispatcher broke.
+
+    So probe for the database instead of guessing from the image tag. A wrong
+    guess is indistinguishable from a healthy run here, because a minute with no
+    due job prints nothing either way.
+    """
     out = subprocess.run(
         ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"],
         capture_output=True, text=True, check=True).stdout
-    for line in out.splitlines():
-        name, _, image = line.partition("\t")
-        if image.startswith("postgres:") and name != "coolify-db":
+    candidates = [
+        name for name, _, image in (l.partition("\t") for l in out.splitlines())
+        if image.startswith("postgres:") and name != "coolify-db"
+    ]
+    for name in candidates:
+        probe = subprocess.run(
+            ["docker", "exec", "-i", name,
+             "psql", "-U", "postgres", "-d", "_paas", "-tAc", "SELECT 1"],
+            capture_output=True, text=True)
+        if probe.returncode == 0:
             return name
-    raise SystemExit("no app postgres container")
+    raise SystemExit(
+        f"no postgres container has a _paas database (tried: {candidates or 'none'})")
 
 
 def rows() -> list[dict]:
