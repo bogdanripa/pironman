@@ -197,6 +197,22 @@ async def _read_since(cursor: str | None) -> str:
     return out
 
 
+def _diagnose(t: dict) -> str:
+    """Turn the tally into the thing to go and check."""
+    if not t["lines"]:
+        return (f"The {ANALYTICS_PROXY} container produced no log output at all.")
+    if not t["json"]:
+        return ("None of it is JSON, so Traefik is not writing a JSON access log. "
+                "Those proxy flags are a hand-edit and Coolify regenerates them "
+                "away on a proxy restart — re-apply them.")
+    if not t["app"]:
+        return (f"JSON is being written but no line is a request to a "
+                f"*{DOMAIN_SUFFIX}* host with a usable client identity — check "
+                "that the access log still keeps RequestHost, User-Agent and "
+                "Cf-Connecting-Ip.")
+    return "Every line is older than the cursor, which is the normal quiet case."
+
+
 def _stamp_of(line: str) -> str:
     """StartUTC from any JSON access-log line, whether or not it is a request to
     a hosted app. Used only to move the cursor.
