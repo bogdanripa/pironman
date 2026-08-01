@@ -33,6 +33,36 @@ traffic analytics are harvested automatically from the shared proxy log.
 > memory (CPU still works). Fix once: add `cgroup_enable=memory cgroup_memory=1`
 > to the single line in `/boot/firmware/cmdline.txt` and reboot.
 
+### Where things live on the host
+
+| Path | What |
+|---|---|
+| **`/opt/paas/`** | **This repository, cloned on the Pi.** The working copy on the box. |
+| `/opt/paas/app/cronmatch.py` | Imported directly by `paas-cron-dispatch` via `sys.path` |
+| `/usr/local/bin/pdb` | Database provisioning helper, also bind-mounted into `paas-api` |
+| `/usr/local/bin/paas-cron-dispatch` | Host cron dispatcher (every minute) |
+| `/usr/local/bin/paas-watchdog` | Host liveness watchdog (every 5 minutes) |
+| `/var/lib/paas-watchdog/state.json` | Watchdog's edge-trigger state |
+| `/var/log/paas-cron.log`, `/var/log/paas-watchdog.log` | Their output |
+
+`/opt/paas` is the path to reach for from `host_run_script` (§5b): it is where a
+`git pull` happens, where the host-side scripts are copied *from*, and the only
+place on the box where this code exists as files rather than as a built image.
+
+That distinction matters and is easy to get wrong. The host scripts are
+**copied** to `/usr/local/bin`, not run from the clone — so editing
+`/opt/paas/paas-cron-dispatch` changes nothing until it is copied over, and a
+`git pull` alone never updates them:
+
+```sh
+cd /opt/paas && git pull
+sudo cp paas-cron-dispatch paas-watchdog /usr/local/bin/
+```
+
+`paas-api` itself is the opposite: it runs from a **built image**, so the clone
+is not what serves requests and editing files there has no effect on the running
+control plane. Only CI and a redeploy change that.
+
 ---
 
 ## 2. The stack, top to bottom
@@ -142,7 +172,7 @@ A FastAPI app (this repo) that:
    `operation_id`; description = summary + docstring.
 3. **Talks to Docker directly** via the mounted socket for things Coolify doesn't
    expose — container logs/stats, image digest checks, `docker exec` into
-   database containers.
+   database containers, and (`host_run_script`, §5b) a root shell on the host.
 4. Runs **background loops**: hourly auto-update sweep, ~2 min analytics
    ingestion, ~2.5 min alert check.
 
@@ -186,6 +216,35 @@ nothing anywhere to say why. They log the traceback (`main._swallow`), which
 uvicorn captures, so `apps_logs api` shows it — and the healthcheck's own
 successful access-log lines are filtered out, or the 10-second cadence would push
 that traceback out of `--tail` within about two minutes.
+
+### 5b. Getting out of the container (`host_run_script`)
+
+The control plane is a container, so a host-level shell is not a `subprocess` —
+it has to be built out of the only surface it has, the mounted Docker socket.
+`app/hostexec.py` runs a throwaway `--privileged --pid=host` container and
+`nsenter`s into PID 1's mount/UTS/IPC/net/PID namespaces, which lands `sh` in the
+host's own namespaces — the Pi's filesystem, network and process table, as root.
+The helper container carries the `nsenter` binary and contributes nothing else,
+which is why it defaults to paas-api's **own image** (already on the box, so no
+pull; `HOST_EXEC_IMAGE` overrides).
+
+Three things there are easy to get wrong, and were:
+
+- **`env -i`.** nsenter passes the *caller's* environment through, so without it
+  a script's `env` prints this control plane's `COOLIFY_TOKEN` and
+  `PAAS_DB_PASSWORD`, and inherits a PATH with no host sbin dirs.
+- **`cd /` inside the shell, not `nsenter --wd=/`.** nsenter opens that directory
+  before entering the mount namespace, so `--wd=/` lands the script in the
+  *container's* root — the one place it must not be.
+- **Two timeouts.** The host-side `timeout` bounds the script and lets the helper
+  exit cleanly; an outer wait force-removes the container when it does not, since
+  killing the `docker run` client leaves the container running.
+
+This is the platform's escape hatch, not its front door: `apps_logs`, `apps_stats`
+and `db_run_script` cover their ground better, and this is a root shell on the
+machine all of them run on. It is admin-key-only (deploy keys are confined to
+their three deploy routes by `require_key`) and tagged destructive so the
+connector prompts.
 
 ### Auth
 
@@ -610,6 +669,10 @@ it as load-bearing.
   as text, an internal hostname in otherwise valid metadata, a background loop
   swallowing its own exception. Every long debugging session here started with a
   green signal.
+- **A shell "on the host" from inside a container inherits the container** —
+  nsenter passes the caller's environment through and resolves `--wd` *before*
+  the namespace switch, so a host shell needs `env -i` and a `cd /` run inside
+  the shell, or it reads the container's secrets from the container's root (§5b).
 - **Two writes to one label set is one write too many** — each is a
   read-modify-write against the live container, and a Coolify deploy is
   asynchronous, so the second reads the pre-deploy container and reverts the

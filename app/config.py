@@ -106,6 +106,12 @@ CLOUDFLARE_ZONE_ID   = os.environ.get("CLOUDFLARE_ZONE_ID", "")
 # is served by the container being replaced — so that one path skips the check.
 CONTROL_PLANE_APP = os.environ.get("CONTROL_PLANE_APP", "api")
 
+# host_run_script (app/hostexec.py) borrows `nsenter` from a throwaway container
+# to reach the host's namespaces. Any image carrying nsenter will do; unset, it
+# uses this control plane's own image, which is already on the box — so there is
+# normally nothing to set here.
+HOST_EXEC_IMAGE = os.environ.get("HOST_EXEC_IMAGE", "")
+
 # The dashboard runs as its own app, so the control plane must accept its origin
 # for cross-origin reads (see app/cors.py).
 DASHBOARD_ORIGIN = os.environ.get(
