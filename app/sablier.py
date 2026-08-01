@@ -124,7 +124,8 @@ def is_enrolled(labels: dict[str, str], app_id: str) -> bool:
 
 
 async def reconcile() -> list[dict]:
-    """Re-enroll any app whose Sablier labels have gone missing.
+    """Re-enroll any app whose Sablier labels have gone missing, and recreate any
+    whose container has gone missing entirely.
 
     The enrollment is written as Coolify custom labels marked read-only, but this
     Coolify build rejects the read-only flag, so a deploy can regenerate the label
@@ -144,6 +145,25 @@ async def reconcile() -> list[dict]:
             if excluded(app["id"]):
                 continue
             try:
+                # A sleeping app is SUPPOSED to have a stopped container, so the
+                # check that matters is existence, not state. `_container_name`
+                # lists stopped ones too (docker ps -a), so None here means the
+                # container is not stopped — it is gone.
+                #
+                # That state is terminal without help. Sablier discovers an app
+                # through the `sablier.group` label, which lives on the container:
+                # once the container is deleted the group has no members, so the
+                # wake request 404s ("Group not found"), the name-based fallback
+                # 500s ("No such container"), and every request to the app is
+                # 502/503 for ever. Scale-to-zero becomes scale-to-zero-and-stay.
+                # Only a deploy can recreate a container, so ask for one — and
+                # leave re-enrollment to the next pass, since the labels this
+                # reconciles are read off a container that does not exist yet.
+                if not await autoupdate._container_name(app["coolify_uuid"]):
+                    await coolify.deploy(app["coolify_uuid"])
+                    out.append({"id": app["id"], "redeployed": True,
+                                "reason": "no container — the app could not wake"})
+                    continue
                 labels = await _current_labels(app["coolify_uuid"])
                 if not labels or is_enrolled(labels, app["id"]):
                     continue
