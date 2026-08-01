@@ -62,9 +62,9 @@ def pg_container() -> str:
         f"no postgres container has a _paas database (tried: {candidates or 'none'})")
 
 
-def rows() -> list[dict]:
+def rows(container: str) -> list[dict]:
     r = subprocess.run(
-        ["docker", "exec", "-i", pg_container(),
+        ["docker", "exec", "-i", container,
          "psql", "-U", "postgres", "-d", "_paas", "-tAc", SQL],
         capture_output=True, text=True, check=True)
     return json.loads(r.stdout.strip() or "[]")
@@ -90,11 +90,36 @@ def fire(app_id: str, method: str, path: str, body: str) -> None:
         print(f"{stamp} {method} {host}{path} -> ERROR {e}")
 
 
+def beat(container: str) -> None:
+    """Record that a dispatch pass completed, for the platform's liveness table.
+
+    This script is silent when nothing is due, which is most minutes — so its own
+    log cannot distinguish "ran, nothing scheduled" from "has not run since the
+    crontab entry was removed" or "dies every minute on an error". A beat makes
+    the difference visible to anything reading the database, without this having
+    to become chatty.
+    """
+    try:
+        subprocess.run(
+            ["docker", "exec", "-i", container, "psql", "-U", "postgres",
+             "-d", "_paas", "-tAc",
+             "INSERT INTO task_heartbeat (task, last_ok, stale_after_s) "
+             "VALUES ('cron_dispatch', now(), 300) "
+             "ON CONFLICT (task) DO UPDATE SET last_ok = now(), "
+             "last_error = NULL, last_error_at = NULL"],
+            capture_output=True, text=True, check=True)
+    except Exception as e:                                      # noqa: BLE001
+        # Bookkeeping must never stop jobs from firing.
+        print(f"warning: could not record heartbeat: {e}")
+
+
 def main() -> None:
     now = datetime.now()
-    for c in rows():
+    container = pg_container()
+    for c in rows(container):
         if due(c["schedule"], now):
             fire(c["app_id"], c["method"], c["path"], c["body"] or "")
+    beat(container)
 
 
 if __name__ == "__main__":

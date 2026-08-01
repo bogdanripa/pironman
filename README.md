@@ -18,6 +18,8 @@ app/autoupdate.py  watch an app's tag, redeploy when the image digest changes
 app/cli.py         python -m app.cli create <label>
 app/routers/       apps, crons, query, scaffold, env, refresh
 paas-cron-dispatch host-side dispatcher, runs every minute from crontab
+paas-watchdog      host-side liveness watchdog, runs every 5 minutes
+app/heartbeat.py   background-loop liveness (task_heartbeat)
 ```
 
 `db.py` creates the tables it owns (`shared_env`, `app_env`) on startup with
@@ -115,6 +117,48 @@ sudo mkdir -p /opt/paas/app && sudo cp app/cronmatch.py /opt/paas/app/
 sudo touch /opt/paas/app/__init__.py
 ( sudo crontab -l 2>/dev/null; echo '* * * * * /usr/local/bin/paas-cron-dispatch >> /var/log/paas-cron.log 2>&1' ) | sudo crontab -
 ```
+
+## Watchdog
+
+```
+sudo cp paas-watchdog /usr/local/bin/
+sudo mkdir -p /var/lib/paas-watchdog
+( sudo crontab -l 2>/dev/null; echo '*/5 * * * * /usr/local/bin/paas-watchdog --restart >> /var/log/paas-watchdog.log 2>&1' ) | sudo crontab -
+paas-watchdog --dry-run          # see what it would say, send nothing
+```
+
+It answers one question nothing else on the box can: **is the platform's
+background work still happening?** Containers that die are already covered —
+Coolify sets `restart: unless-stopped`, so Docker brings them back. What has
+actually bitten this platform is the opposite: a loop that keeps running while
+achieving nothing. An analytics cursor frozen for 23 hours. A sweep whose first
+hour-long sleep outlives every redeploy, so it never runs at all. A dispatcher
+that stopped firing jobs. Every one of those leaves a **healthy container and a
+silent log**, because a loop with nothing to do and a loop that is dead produce
+identical output — nothing.
+
+So each loop records when it last *completed* and how long it may go without
+completing (`task_heartbeat`, written by `app/heartbeat.py` and by the cron
+dispatcher). Staleness is then a plain comparison, readable by anything with
+database access. `platform_tasks_health` exposes the same view over MCP.
+
+This runs on the **host**, not in a container, for one reason: `app/alerts.py`
+already notifies Telegram about apps going down, but it runs *inside* paas-api
+and so can never report that paas-api itself is wedged. Anything watching a
+process from inside that process shares its fate. The watchdog therefore depends
+on nothing but the stdlib, `docker` and `psql`, and reads Telegram credentials
+out of the api container's config with `docker inspect` — which works on a
+*stopped* container, which is exactly when it has something to say. Override with
+`/etc/paas-watchdog.env` if the container may not exist at all.
+
+Alerts are edge-triggered against `/var/lib/paas-watchdog/state.json`: one
+message when a fault appears, one when it clears, nothing in between. A monitor
+that repeats itself every five minutes is one people mute.
+
+`--restart` is opt-in and narrow on purpose: only apps with
+`sleep_when_idle = false`, after two consecutive failed runs. An app that sleeps
+is *supposed* to be stopped, and a watchdog that "fixed" that would quietly
+destroy scale-to-zero while reporting success.
 
 ## Test sequence — do not skip step 1
 

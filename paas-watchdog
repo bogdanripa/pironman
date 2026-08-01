@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Host-side watchdog. One crontab entry runs this every five minutes:
+
+    */5 * * * * /usr/local/bin/paas-watchdog >> /var/log/paas-watchdog.log 2>&1
+
+Why this lives on the HOST rather than inside paas-api, which already has an
+alert loop: because the alert loop cannot report that paas-api is down. Anything
+that watches a process from inside that process shares its fate. This is the
+only monitor on the box that survives the control plane dying, so it deliberately
+depends on nothing but the stdlib, docker and psql.
+
+It answers three questions, in increasing order of subtlety:
+
+  1. Is every app that is NOT supposed to sleep actually running?
+  2. Is paas-api's container healthy, not merely up?
+  3. Is the platform's background work still HAPPENING?
+
+(3) is the one that matters and the reason this exists. Containers that die are
+already handled — Coolify sets restart: unless-stopped, so Docker brings them
+back. What nothing catches is a loop that keeps running while achieving nothing:
+an analytics cursor frozen for a day, a sweep whose first sleep outlives every
+redeploy, a dispatcher that stopped firing jobs. Every one of those leaves a
+healthy container and a quiet log. They are visible only as a heartbeat that
+stopped advancing, which is what task_heartbeat records and this reads.
+
+Alerts are edge-triggered against a small state file, so a persistent fault
+notifies once and recovery notifies once. A watchdog that repeats itself every
+five minutes is one people mute.
+
+Restarting is opt-in (--restart) and deliberately narrow: only containers for
+apps marked sleep_when_idle = false, and never one that is merely idle. An app
+that sleeps is SUPPOSED to be stopped, and a watchdog that "fixes" that would
+quietly destroy scale-to-zero while reporting success.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_FILE = Path(os.environ.get("PAAS_WATCHDOG_STATE",
+                                 "/var/lib/paas-watchdog/state.json"))
+ENV_FILE = Path(os.environ.get("PAAS_WATCHDOG_ENV", "/etc/paas-watchdog.env"))
+API_APP = os.environ.get("CONTROL_PLANE_APP", "api")
+# Restarting the same container in a tight loop turns one fault into a different
+# fault. Two consecutive failing runs (~10 minutes) before trying again.
+RESTART_COOLDOWN_RUNS = 2
+
+
+def sh(*args: str, check: bool = False) -> tuple[int, str]:
+    p = subprocess.run(args, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise SystemExit(f"{' '.join(args)} failed: {p.stdout}{p.stderr}")
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def pg_container() -> str:
+    """The container holding `_paas`. Probed, not guessed from the image tag —
+    see the same note in paas-cron-dispatch. Guessing broke that script once."""
+    _, out = sh("docker", "ps", "--format", "{{.Names}}\t{{.Image}}", check=True)
+    candidates = [n for n, _, img in (l.partition("\t") for l in out.splitlines())
+                  if img.startswith("postgres:") and n != "coolify-db"]
+    for name in candidates:
+        code, _ = sh("docker", "exec", "-i", name,
+                     "psql", "-U", "postgres", "-d", "_paas", "-tAc", "SELECT 1")
+        if code == 0:
+            return name
+    raise SystemExit(f"no postgres container has _paas (tried: {candidates or 'none'})")
+
+
+def query(container: str, sql: str) -> list[list[str]]:
+    code, out = sh("docker", "exec", "-i", container, "psql", "-U", "postgres",
+                   "-d", "_paas", "-tAF", "\x1f", "-c", sql)
+    if code != 0:
+        raise SystemExit(f"psql failed: {out.strip()[:300]}")
+    return [line.split("\x1f") for line in out.strip().splitlines() if line.strip()]
+
+
+def telegram_config() -> tuple[str, str]:
+    """Bot token and chat id.
+
+    Preferred source is paas-api's own container config, so the secret is defined
+    once and this cannot drift out of sync with what the platform uses. Read via
+    `docker inspect`, which works on a STOPPED container — precisely the case
+    where this script has something to say. /etc/paas-watchdog.env overrides, for
+    a box where the api container may not exist at all.
+    """
+    if ENV_FILE.exists():
+        env = {}
+        for line in ENV_FILE.read_text().splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip().strip('"').strip("'")
+        if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
+            return env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_CHAT_ID"]
+
+    name = container_for(API_APP, include_stopped=True)
+    if name:
+        code, out = sh("docker", "inspect", name, "--format", "{{json .Config.Env}}")
+        if code == 0:
+            try:
+                env = dict(e.split("=", 1) for e in json.loads(out) if "=" in e)
+                return env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", "")
+            except (ValueError, json.JSONDecodeError):
+                pass
+    return "", ""
+
+
+def notify(text: str) -> None:
+    token, chat = telegram_config()
+    if not token or not chat:
+        print(f"[no telegram configured] {text}")
+        return
+    body = json.dumps({"chat_id": chat, "text": text, "parse_mode": "HTML",
+                       "disable_web_page_preview": True}).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            if r.status != 200:
+                print(f"telegram returned {r.status}")
+    except Exception as e:                                       # noqa: BLE001
+        print(f"could not send telegram: {e}")
+
+
+def container_for(app_id: str, include_stopped: bool = False) -> str | None:
+    """The container running `app_id`, found by the `pironman.app` label paas-api
+    stamps on it. Coolify names containers <uuid>-<timestamp>, which changes on
+    every deploy, so the label is the only stable handle."""
+    args = ["docker", "ps", "--filter", f"label=pironman.app={app_id}",
+            "--format", "{{.Names}}"]
+    if include_stopped:
+        args.insert(2, "-a")
+    _, out = sh(*args)
+    names = [n for n in out.splitlines() if n.strip()]
+    return names[0] if names else None
+
+
+def container_state(name: str) -> tuple[str, str]:
+    """(state, health). health is '' when the image declares no healthcheck."""
+    _, out = sh("docker", "inspect", name, "--format",
+                "{{.State.Status}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}")
+    state, _, health = out.strip().partition("\t")
+    return state, health
+
+
+def check(container: str) -> tuple[dict[str, str], list[str]]:
+    """Every current problem as {key: human description}, plus app ids that are
+    down and eligible for a restart."""
+    problems: dict[str, str] = {}
+    restartable: list[str] = []
+
+    # 1. Apps that are not supposed to sleep. An app with sleep_when_idle = true
+    #    being stopped is the feature working, not a fault — checking it would
+    #    alert on every idle night and train everyone to ignore this.
+    for row in query(container,
+                     "SELECT id FROM apps WHERE coolify_uuid IS NOT NULL "
+                     "AND sleep_when_idle = false ORDER BY id"):
+        app = row[0]
+        name = container_for(app)
+        if not name:
+            problems[f"down:{app}"] = f"{app} has no running container"
+            restartable.append(app)
+            continue
+        state, health = container_state(name)
+        if state != "running":
+            problems[f"down:{app}"] = f"{app} container is {state}"
+            restartable.append(app)
+        elif health == "unhealthy":
+            problems[f"unhealthy:{app}"] = f"{app} is running but its healthcheck fails"
+
+    # 2. Background work. The whole reason this script exists: a stalled loop
+    #    leaves a healthy container and a silent log, so nothing else can see it.
+    for task, last_ok, age, tol in query(
+            container,
+            "SELECT task, coalesce(to_char(last_ok, 'YYYY-MM-DD\"T\"HH24:MI:SSZ'), 'never'), "
+            "coalesce(EXTRACT(EPOCH FROM (now() - last_ok))::int, -1), stale_after_s "
+            "FROM task_heartbeat ORDER BY task"):
+        age_i, tol_i = int(age), int(tol)
+        if age_i < 0:
+            problems[f"stale:{task}"] = f"{task} has never completed"
+        elif age_i > tol_i:
+            problems[f"stale:{task}"] = (
+                f"{task} last completed {age_i // 60}m ago "
+                f"(expected within {tol_i // 60}m) — last ok {last_ok}")
+    return problems, restartable
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--restart", action="store_true",
+                    help="restart down containers for apps that should never "
+                         "sleep (never touches an app that is merely idle)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report to stdout without sending Telegram")
+    args = ap.parse_args()
+
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    pg = pg_container()
+    problems, restartable = check(pg)
+
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except Exception:                                            # noqa: BLE001
+        state = {}
+    known = set(state.get("problems", []))
+    strikes = state.get("strikes", {})
+
+    new = [k for k in problems if k not in known]
+    cleared = [k for k in known if k not in problems]
+
+    for k in sorted(problems):
+        print(f"{stamp} PROBLEM {problems[k]}")
+    if not problems:
+        print(f"{stamp} ok — all always-on apps running, all background work current")
+
+    if args.restart:
+        for app in restartable:
+            strikes[app] = strikes.get(app, 0) + 1
+            if strikes[app] < RESTART_COOLDOWN_RUNS:
+                print(f"{stamp} {app} down (strike {strikes[app]}) — waiting before restart")
+                continue
+            name = container_for(app, include_stopped=True)
+            if not name:
+                print(f"{stamp} {app} has no container to restart")
+                continue
+            code, out = sh("docker", "start", name)
+            print(f"{stamp} restart {app} ({name}) -> "
+                  f"{'ok' if code == 0 else out.strip()[:200]}")
+            if code == 0:
+                strikes[app] = 0
+    for app in list(strikes):
+        if app not in restartable:
+            strikes.pop(app, None)
+
+    if not args.dry_run:
+        if new:
+            notify("<b>pironman</b>\n" + "\n".join(f"• {problems[k]}" for k in sorted(new)))
+        if cleared:
+            notify("<b>pironman — recovered</b>\n" +
+                   "\n".join(f"• {k.split(':', 1)[1]}" for k in sorted(cleared)))
+
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(
+            {"problems": sorted(problems), "strikes": strikes, "at": stamp}))
+    except Exception as e:                                       # noqa: BLE001
+        # Without state every run re-alerts. Say so rather than spam silently.
+        print(f"{stamp} warning: could not write {STATE_FILE}: {e}")
+
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

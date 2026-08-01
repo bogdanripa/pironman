@@ -4,7 +4,7 @@ the static path never collides with /apps/{app_id}."""
 from fastapi import APIRouter, Depends, Query
 
 from ..auth import require_key
-from .. import stats
+from .. import heartbeat, stats
 
 router = APIRouter(prefix="/stats", tags=["stats"],
                    dependencies=[Depends(require_key)])
@@ -33,3 +33,44 @@ async def apps_stats(
     Also returns **host** totals (CPU count, total RAM, RAM currently used by
     containers) so you can see the Pi's remaining headroom at a glance."""
     return await stats.app_resources(include_db=include_db, perf_days=traffic_days)
+
+
+@router.get("/tasks", operation_id="platform_tasks_health",
+            summary="Liveness of the platform's own background loops")
+async def tasks_health():
+    """Whether the control plane's background work is actually happening.
+
+    Every loop here fails the same way when it fails: it keeps running and stops
+    achieving anything. Nothing about the container says so — it stays up and
+    healthy — and the loops are silent when idle, so a dead one and a bored one
+    look identical in the logs. Each therefore records when it last *completed*,
+    and how long it may go without completing before that counts as stalled.
+
+    Read this when a platform-wide symptom has no obvious owner: analytics that
+    stopped moving, an app that never sleeps, a deploy that never swept, a
+    scheduled job that silently stopped firing. A `stalled` task names the
+    culprit directly instead of leaving it to be inferred from side effects.
+
+    - **analytics_ingest** — folds the proxy access log into the rollups. Stalled
+      means every traffic number and last-accessed time is frozen.
+    - **alerts_check** — down/recovered/5xx notifications. Stalled means outages
+      go unannounced.
+    - **autoupdate_sweep** — hourly image check, route sync and Sablier repair.
+      Stalled means drift stops being repaired; note this loop waits an hour
+      before its first run, so a control plane that redeploys more often than
+      that can go indefinitely without ever sweeping.
+    - **cron_dispatch** — the host-side scheduled-job dispatcher. It writes its
+      own beat, so a missing or stale one means jobs are not firing at all.
+
+    A task absent from the list has never reported since the table was created.
+    """
+    rows = await heartbeat.snapshot()
+    stalled = [r["task"] for r in rows if r["stalled"]]
+    return {
+        "tasks": rows,
+        "stalled": stalled,
+        "healthy": not stalled,
+        "note": ("all background work is current" if not stalled else
+                 "stalled: " + ", ".join(stalled) + " — these are not doing "
+                 "their work, whatever the container status says"),
+    }

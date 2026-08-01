@@ -6,7 +6,7 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool, pool
-from . import autoupdate, analytics, alerts, routing, sablier
+from . import heartbeat, autoupdate, analytics, alerts, routing, sablier
 from .cors import CorsMiddleware
 from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
@@ -261,13 +261,19 @@ async def _sync_routes(reason: str) -> None:
 async def _autoupdate_loop():
     """Hourly: redeploy every opted-in app whose watched image tag has moved.
     First run is an hour after startup, not on boot — this control plane
-    redeploys itself often, and there is no need to sweep on every restart."""
+    redeploys itself often, and there is no need to sweep on every restart.
+
+    That delay is also why this loop needs a heartbeat more than the others: a
+    control plane that redeploys more often than hourly restarts the timer every
+    time and can go indefinitely without ever sweeping, while looking perfectly
+    healthy."""
     while True:
         await asyncio.sleep(3600)
         try:
             await autoupdate.check_all()
-        except Exception:
+        except Exception as e:
             _swallow("auto-update sweep")
+            await heartbeat.beat("autoupdate_sweep", error=repr(e))
         # Same cadence: repair anything a Coolify label regeneration undid — the
         # static host's per-app routers, and each app's Sablier enrollment. Both
         # fail silently (a hostname resolves nowhere; an app quietly stops
@@ -275,8 +281,14 @@ async def _autoupdate_loop():
         await _sync_routes("hourly sweep")
         try:
             await sablier.reconcile()
-        except Exception:
+        except Exception as e:
             _swallow("sablier reconcile")
+            await heartbeat.beat("autoupdate_sweep", error=repr(e))
+        else:
+            # Beat once the whole sweep is done — the redeploy check, the route
+            # sync and the Sablier repair are one unit of work, and a partial
+            # sweep is not a working one.
+            await heartbeat.beat("autoupdate_sweep")
 
 
 async def _analytics_loop():
@@ -286,8 +298,11 @@ async def _analytics_loop():
     while True:
         try:
             await analytics.ingest_once()
-        except Exception:
+        except Exception as e:
             _swallow("analytics ingest")
+            await heartbeat.beat("analytics_ingest", error=repr(e))
+        else:
+            await heartbeat.beat("analytics_ingest")
         await asyncio.sleep(120)
 
 
@@ -299,8 +314,11 @@ async def _alerts_loop():
         await asyncio.sleep(150)
         try:
             await alerts.check_once()
-        except Exception:
+        except Exception as e:
             _swallow("alert check")
+            await heartbeat.beat("alerts_check", error=repr(e))
+        else:
+            await heartbeat.beat("alerts_check")
 
 
 @asynccontextmanager

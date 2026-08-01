@@ -160,6 +160,25 @@ CREATE TABLE IF NOT EXISTS analytics_latency (
     count  int      NOT NULL DEFAULT 0,
     PRIMARY KEY (app_id, day, bucket)
 );
+
+-- Liveness for the background loops. A loop that dies takes the container with
+-- it and is obvious; a loop that keeps running while achieving nothing is not,
+-- and that is the failure this platform actually hits — an ingest cursor frozen
+-- for a day, a sweep whose first sleep outlives every redeploy. Both looked
+-- healthy from every angle: process up, container healthy, logs quiet.
+--
+-- Each task records when it last COMPLETED and how long it may reasonably go
+-- without completing, so staleness is a fact any reader can evaluate without
+-- knowing the schedules. Deliberately a plain table rather than an endpoint: the
+-- reader that matters most runs OUTSIDE this process, because nothing inside
+-- paas-api can report that paas-api is wedged.
+CREATE TABLE IF NOT EXISTS task_heartbeat (
+    task          text PRIMARY KEY,
+    last_ok       timestamptz,
+    last_error    text,
+    last_error_at timestamptz,
+    stale_after_s int NOT NULL
+);
 """
 
 
