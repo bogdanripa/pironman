@@ -23,13 +23,17 @@ import hashlib
 import json
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from . import autoupdate
 from .config import ANALYTICS_PROXY, ANALYTICS_SALT, DOMAIN_SUFFIX
 from .db import pool
 
 _log = logging.getLogger("pironman.analytics")
+
+# Ingestion runs every two minutes, so a cursor more than this far back
+# is not lag, it is a stall worth saying out loud.
+_CURSOR_LAG_WARN_MIN = 30
 
 _CURSOR_KEY = "accesslog_cursor"
 
@@ -142,9 +146,37 @@ async def _read_since(cursor: str | None) -> str:
     already counted, so nothing is double-counted.
     """
     since = (cursor[:19] + "Z") if cursor else "24h"
-    _, out = await autoupdate._docker(
+    code, out = await autoupdate._docker(
         "logs", "--since", since, ANALYTICS_PROXY, timeout=120)
+    # Check the exit code. Discarding it makes a FAILED read indistinguishable
+    # from a quiet hour: both hand back text with no parseable request lines, the
+    # pass counts nothing, the cursor never advances, and every number on the
+    # dashboard silently stops moving while the loop reports success for ever.
+    # _docker folds stderr into stdout, so `out` is the error text here.
+    if code != 0:
+        raise RuntimeError(
+            f"docker logs {ANALYTICS_PROXY} failed ({code}): {out.strip()[:300]}")
     return out
+
+
+def _stamp_of(line: str) -> str:
+    """StartUTC from any JSON access-log line, whether or not it is a request to
+    a hosted app. Used only to move the cursor.
+
+    The distinction matters: the proxy logs plenty that _parse_line rightly
+    rejects — bots hitting the box's bare IP via catchall@file, requests to
+    hostnames this platform does not own. Those are not traffic to any app, but
+    they ARE proof that time has passed and the window up to here has been read.
+    """
+    line = line.strip()
+    if not line.startswith("{"):
+        return ""
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return ""
+    s = (e.get("StartUTC") or "").strip()
+    return s if len(s) >= 10 else ""
 
 
 async def ingest_once() -> dict:
@@ -171,8 +203,18 @@ async def ingest_once() -> dict:
         # recording nothing, which is what an unparsed stamp used to mean.
         now = datetime.now(timezone.utc)
         newest = cursor or ""
+        # How far the READ got, as opposed to how far the counting got. The
+        # cursor used to advance only on lines belonging to a hosted app, so a
+        # window containing nothing but bot hits on the bare IP left it exactly
+        # where it was — and the next pass re-read the same span, found the same
+        # nothing, and moved nothing again. On a quiet box that span only grows,
+        # and the stall is invisible: every pass "succeeds" having counted zero.
+        horizon = cursor or ""
         seen = 0
         for line in raw.splitlines():
+            stamp = _stamp_of(line)
+            if stamp > horizon:
+                horizon = stamp
             rec = _parse_line(line)
             if rec is None:
                 continue
@@ -260,13 +302,27 @@ async def ingest_once() -> dict:
             except Exception:
                 _log.exception("could not record last-accessed times")
 
-        if newest and newest != cursor:
+        # Advance to the furthest point actually read, not merely the newest line
+        # that happened to belong to an app. Everything up to here has been
+        # examined, so re-reading it can only find what was already counted.
+        mark = max(newest, horizon)
+        if mark and mark != cursor:
             await conn.execute(
                 "INSERT INTO analytics_state (k, v) VALUES ($1, $2) "
                 "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
-                _CURSOR_KEY, newest)
+                _CURSOR_KEY, mark)
 
-    return {"lines_counted": seen, "cursor": newest or None}
+        # A cursor that keeps falling further behind is the signature of a stall,
+        # and it is the one thing a pass cannot notice about itself: counting
+        # zero looks identical to an idle box. Say it out loud instead.
+        lag = _moment(mark)
+        if lag and (now - lag) > timedelta(minutes=_CURSOR_LAG_WARN_MIN):
+            _log.warning(
+                "analytics: cursor is %d minutes behind (%s) after reading %d "
+                "app requests — ingestion is not keeping up",
+                int((now - lag).total_seconds() // 60), mark, seen)
+
+    return {"lines_counted": seen, "cursor": mark or None}
 
 
 async def overview(app_id: str | None = None, days: int = 30) -> dict:
