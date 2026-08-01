@@ -11,7 +11,8 @@ depends on nothing but the stdlib, docker and psql.
 
 It answers three questions, in increasing order of subtlety:
 
-  1. Is every app that is NOT supposed to sleep actually running?
+  1. Is every app that is NOT supposed to sleep actually running — and does every
+     app that IS supposed to sleep still have a container left to wake?
   2. Is paas-api's container healthy, not merely up?
   3. Is the platform's background work still HAPPENING?
 
@@ -30,7 +31,9 @@ five minutes is one people mute.
 Restarting is opt-in (--restart) and deliberately narrow: only containers for
 apps marked sleep_when_idle = false, and never one that is merely idle. An app
 that sleeps is SUPPOSED to be stopped, and a watchdog that "fixes" that would
-quietly destroy scale-to-zero while reporting success.
+quietly destroy scale-to-zero while reporting success. A sleeping app whose
+container has been DELETED is reported but still never restarted here — there is
+nothing to start, and only a redeploy can recreate it.
 """
 import argparse
 import json
@@ -209,6 +212,19 @@ def check(container: str) -> tuple[dict[str, str], list[str], dict[str, str]]:
         # depends on. Trusting the column alone would silently drop `api`, the
         # one app whose being down matters most, out of the checks entirely.
         if sleeps == "t" and app not in ALWAYS_ON:
+            # A sleeping app is SUPPOSED to be stopped, so its run state says
+            # nothing. Whether it still HAS a container says everything: Sablier
+            # finds an app by a label on its container, so a deleted one leaves an
+            # empty group that no request can wake, and the app 502s until
+            # something redeploys it. That is invisible from the outside — an app
+            # fronted by the static host still answers 200 on / while its backend
+            # is unreachable — so this is the only thing that reports it.
+            # Deliberately not `restartable`: there is no container to start, and
+            # `docker start` on a missing one would just fail every five minutes.
+            if not container_for(app, uuid, include_stopped=True):
+                problems[f"missing:{app}"] = (
+                    f"{app} sleeps but has no container at all — it cannot wake "
+                    f"and needs a redeploy")
             continue
         name = container_for(app, uuid)
         if not name:

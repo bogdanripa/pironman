@@ -194,6 +194,18 @@ async def app_runtime(uuid: str | None, sleeps: bool = False) -> dict:
     stats = await _container_stats()
     cname = next((n for n in stats if uuid in n), None)
     if not cname:
+        # `_container_stats` sees running containers only, so "not here" covers
+        # both a slept container and a deleted one — and they need opposite
+        # responses. Only a container that EXISTS can be woken by a request; a
+        # deleted one has to be redeployed. Ask docker for the stopped ones too.
+        if not await autoupdate._container_name(uuid):
+            return {"state": "missing", "container": None,
+                    "note": ("no container exists at all — a sleeping app whose "
+                             "container was deleted cannot wake on the next "
+                             "request and has to be redeployed" if sleeps else
+                             "not running, and there is no container to start — "
+                             "the deploy failed or was rolled back. apps_logs "
+                             "shows why")}
         return {"state": "asleep" if sleeps else "stopped", "container": None,
                 "note": ("stopped while idle; the next request wakes it"
                          if sleeps else
@@ -243,6 +255,10 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
     async def one(app) -> dict:
         uuid = app["coolify_uuid"] or ""
         cname = next((n for n in names if uuid and uuid in n), None)
+        # `names` holds RUNNING containers only, so its absence cannot tell a
+        # slept container from a deleted one. `disk` is built from `docker ps -a`,
+        # so its keys answer that for free — no extra call.
+        exists = next((n for n in disk if uuid and uuid in n), None)
         s = stats.get(cname, {})
         d = disk.get(cname, {})
         has_backend = bool(app["coolify_uuid"])
@@ -254,11 +270,13 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
                      else "frontend" if app["has_frontend"]
                      else "backend"),
             "running": (cname is not None) if has_backend else None,
-            # Distinguishes a stopped-because-idle app from a broken one: an
-            # enrolled app with no container is asleep and will wake on the next
-            # request, which is very different from a crash.
+            # Distinguishes a stopped-because-idle app from a broken one. 'asleep'
+            # is only true while a container still EXISTS to be started: one that
+            # has been deleted cannot be woken by a request, and reporting that as
+            # asleep describes a dead app as a healthy one.
             "state": ("static" if not has_backend
                       else "running" if cname
+                      else "missing" if not exists
                       else "asleep" if app["sleep_when_idle"]
                       else "stopped"),
             "cpu_pct": s.get("cpu_pct"),
