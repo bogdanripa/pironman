@@ -35,9 +35,14 @@ _log = logging.getLogger("pironman.analytics")
 # treated as a stall rather than a quiet box.
 _STALL_AFTER = 15 * 60
 
-# The most log we will ask Docker for in one pass. Bounds the work whatever state
-# the cursor is in — see _read_since.
+# How far behind the cursor may be before a catch-up is worth mentioning.
 MAX_WINDOW = 60 * 60
+
+# The most log we will ask Docker for in one pass, in LINES — not a time window;
+# see _read_since for why time filtering cannot be trusted here. Re-reading is
+# free (every line is checked against the cursor), so this errs high: it only has
+# to exceed the traffic between two passes.
+MAX_LINES = 20000
 
 
 _CURSOR_KEY = "accesslog_cursor"
@@ -147,65 +152,49 @@ def _parse_line(line: str) -> dict | None:
 
 
 async def _read_since(cursor: str | None) -> str:
-    """Raw access-log text from the proxy container, for a **bounded** window.
+    """Raw access-log text from the proxy container, bounded by LINE COUNT.
 
-    `--since` takes a container-log timestamp; we pass the cursor (an RFC3339
-    StartUTC) so Docker hands back only recent lines, then the caller drops any
-    at/before the cursor by StartUTC. Docker gets a plain whole-second stamp
-    (2026-07-30T14:31:17Z), not the cursor's nanosecond precision, which some
-    Docker versions reject. Dropping the sub-second part only widens the window
-    slightly; the exact check in ingest_once drops the boundary line already
-    counted, so nothing is double-counted.
+    **Not `--since`, deliberately.** Time filtering is broken on this box, and
+    trusting it froze every analytic here for a day. Measured against the live
+    proxy container (Docker 29.6.2, json-file, 2333 lines available):
 
-    Two things here are load-bearing, and their absence froze every analytic on
-    this box for twelve hours:
+        --since 2026-07-01T00:00:00Z  -> 2333 lines
+        --since 2026-07-31T07:11:08Z  ->    0
+        --since 1h                    ->    0
+        --until now                   ->    0      <- should be everything
+        --tail 100000                 -> 2333, ending at the current second
 
-    **The window is capped.** If the cursor is further back than MAX_WINDOW, we
-    read the cap instead and skip the gap. Otherwise a single failed pass is
-    permanent: the cursor does not advance, so the next pass asks for a larger
-    window, which fails more easily, which... The gap is a few missing rows; the
-    alternative is never ingesting again.
+    Docker finds nothing after 2026-07-31T07:11 — the minute coolify-proxy last
+    restarted — while `--tail` hands back those very lines stamped with the
+    current time. `--until now` returning nothing proves it is the filter that is
+    wrong, not the window. Whatever the cause (log rotation across a restart is
+    the likeliest), the conclusion holds: on this box a time-filtered read
+    reports an empty log, which is indistinguishable from a quiet one.
 
-    **The exit code is checked.** `_docker` reports a timeout by *returning*
-    (124, "docker timed out"). Ignoring that yields a string with no JSON in it,
-    which is indistinguishable from a quiet log — zero lines counted, no error,
-    cursor pinned. That is exactly how this failed.
+    `--tail` has no such problem, and there is corroboration in this very module:
+    `recent()` has always used `--tail` and has always worked, against the same
+    container through the same socket, while ingestion sat frozen.
+
+    Correctness does not depend on the window anyway. Every line is checked
+    against the cursor by StartUTC in ingest_once, so re-reading is free and only
+    under-reading loses data. MAX_LINES is therefore generous: it needs to exceed
+    the traffic between two passes (120s), and the whole log is currently 2333
+    lines.
     """
-    behind = _behind(cursor)
-    skipped = None
-    if cursor and (behind is None or behind > MAX_WINDOW):
-        skipped = behind
-        since = f"{int(MAX_WINDOW)}s"
-    else:
-        since = (cursor[:19] + "Z") if cursor else "24h"
-
     rc, out = await autoupdate._docker(
-        "logs", "--since", since, ANALYTICS_PROXY, timeout=120)
+        "logs", "--tail", str(MAX_LINES), ANALYTICS_PROXY, timeout=120)
     if rc != 0:
+        # _docker reports a timeout by RETURNING (124, "docker timed out").
+        # Ignoring that yields a string with no JSON in it, which reads exactly
+        # like a quiet log — zero counted, no error, cursor pinned.
         _log.warning("analytics: could not read %s logs (rc=%s): %s",
                      ANALYTICS_PROXY, rc, out.strip()[:200])
         return ""
-    if skipped:
-        _log.warning("analytics: cursor was %.0f minutes behind; read only the "
-                     "last %d minutes and skipped the gap",
-                     skipped / 60, MAX_WINDOW // 60)
+    behind = _behind(cursor)
+    if behind is not None and behind > MAX_WINDOW:
+        _log.warning("analytics: cursor was %.0f minutes behind; catching up "
+                     "from the last %d log lines", behind / 60, MAX_LINES)
     return out
-
-
-def _diagnose(t: dict) -> str:
-    """Turn the tally into the thing to go and check."""
-    if not t["lines"]:
-        return (f"The {ANALYTICS_PROXY} container produced no log output at all.")
-    if not t["json"]:
-        return ("None of it is JSON, so Traefik is not writing a JSON access log. "
-                "Those proxy flags are a hand-edit and Coolify regenerates them "
-                "away on a proxy restart — re-apply them.")
-    if not t["app"]:
-        return (f"JSON is being written but no line is a request to a "
-                f"*{DOMAIN_SUFFIX}* host with a usable client identity — check "
-                "that the access log still keeps RequestHost, User-Agent and "
-                "Cf-Connecting-Ip.")
-    return "Every line is older than the cursor, which is the normal quiet case."
 
 
 def _stamp_of(line: str) -> str:
