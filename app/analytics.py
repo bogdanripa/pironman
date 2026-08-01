@@ -38,11 +38,13 @@ _STALL_AFTER = 15 * 60
 # How far behind the cursor may be before a catch-up is worth mentioning.
 MAX_WINDOW = 60 * 60
 
-# The most log we will ask Docker for in one pass, in LINES — not a time window;
-# see _read_since for why time filtering cannot be trusted here. Re-reading is
-# free (every line is checked against the cursor), so this errs high: it only has
-# to exceed the traffic between two passes.
-MAX_LINES = 20000
+# The most log we will ask Docker for in one pass, in LINES — not a time window,
+# and deliberately MODEST. Asking for too many is not merely wasteful here: past
+# some threshold Docker stops tailing from the end and returns truncated output
+# from the START of the log instead, i.e. the oldest lines. See _read_since.
+# Measured good up to 3000 on this box; 2000 leaves margin and is still hours of
+# traffic, against a 120s pass.
+MAX_LINES = 2000
 
 
 _CURSOR_KEY = "accesslog_cursor"
@@ -154,26 +156,28 @@ def _parse_line(line: str) -> dict | None:
 async def _read_since(cursor: str | None) -> str:
     """Raw access-log text from the proxy container, bounded by LINE COUNT.
 
-    **Not `--since`, deliberately.** Time filtering is broken on this box, and
-    trusting it froze every analytic here for a day. Measured against the live
-    proxy container (Docker 29.6.2, json-file, 2333 lines available):
+    **Not `--since`, and not a large `--tail` either.** Both make Docker read
+    from the START of the log, and on this box that read is truncated long before
+    it reaches recent entries — so it returns old lines, or none, which is
+    indistinguishable from a quiet log. Measured against the live proxy
+    container (Docker 29.6.2, json-file):
 
-        --since 2026-07-01T00:00:00Z  -> 2333 lines
-        --since 2026-07-31T07:11:08Z  ->    0
-        --since 1h                    ->    0
-        --until now                   ->    0      <- should be everything
-        --tail 100000                 -> 2333, ending at the current second
+        --tail 3 .. 3000              -> current, newest 2026-08-01T07:47:19Z
+        --tail 20000                  -> 2333 lines, NONE from Aug 1,
+                                         newest 2026-07-31T07:09:33Z
+        --since 2026-07-01T00:00:00Z  -> 2333 lines (same truncated prefix)
+        --since 1h                    -> 0
+        --until now                   -> 0        <- should be everything
 
-    Docker finds nothing after 2026-07-31T07:11 — the minute coolify-proxy last
-    restarted — while `--tail` hands back those very lines stamped with the
-    current time. `--until now` returning nothing proves it is the filter that is
-    wrong, not the window. Whatever the cause (log rotation across a restart is
-    the likeliest), the conclusion holds: on this box a time-filtered read
-    reports an empty log, which is indistinguishable from a quiet one.
+    The `--since` results are the same failure seen from a different angle: the
+    filter is applied to a prefix that stops before the recent lines, so any
+    recent window matches nothing. `--until now` returning nothing is the tell —
+    it is not the window that is wrong.
 
-    `--tail` has no such problem, and there is corroboration in this very module:
-    `recent()` has always used `--tail` and has always worked, against the same
-    container through the same socket, while ingestion sat frozen.
+    A bounded `--tail` reads backwards from the end and is exact. There is
+    corroboration in this module: recent() has always used a small `--tail` and
+    has always worked, against the same container through the same socket, while
+    ingestion read from the start and sat frozen for a day.
 
     Correctness does not depend on the window anyway. Every line is checked
     against the cursor by StartUTC in ingest_once, so re-reading is free and only
@@ -391,6 +395,16 @@ async def ingest_once() -> dict:
         if behind is None:
             _log.warning("analytics: no lines counted and the cursor %r cannot be "
                          "parsed — nothing will ever advance", cursor)
+        elif tally["lines"] >= MAX_LINES:
+            # The window was filled and still held nothing new. Either traffic
+            # genuinely outran a pass, or MAX_LINES has crossed the threshold
+            # where Docker starts returning the head of the log instead of the
+            # tail — the failure this constant exists to avoid.
+            _log.warning(
+                "analytics: read the full %d-line window and none of it was "
+                "newer than the cursor (%s). Either traffic outran a pass, or "
+                "the read is returning the START of the log rather than the "
+                "end — lower MAX_LINES.", MAX_LINES, cursor)
         elif behind > _STALL_AFTER:
             _log.warning(
                 "analytics: nothing counted and the cursor is %.0f minutes behind "
