@@ -12,11 +12,12 @@ app/db.py          asyncpg pool against _paas
 app/auth.py        bearer key -> sha256 -> api_keys; per-app deploy keys
 app/coolify.py     facade client (VERIFIED / UNVERIFIED marked per call)
 app/provision.py   wraps the host `pdb` script
+app/hostexec.py    host_run_script — a root shell on the Pi itself, via nsenter
 app/cronmatch.py   dependency-free 5-field cron matcher
 app/envs.py        shared + per-app env vars: desired-set + Coolify sync
 app/autoupdate.py  watch an app's tag, redeploy when the image digest changes
 app/cli.py         python -m app.cli create <label>
-app/routers/       apps, crons, query, scaffold, env, refresh
+app/routers/       apps, crons, query, host, scaffold, env, refresh
 paas-cron-dispatch host-side dispatcher, runs every minute from crontab
 ```
 
@@ -115,6 +116,50 @@ sudo mkdir -p /opt/paas/app && sudo cp app/cronmatch.py /opt/paas/app/
 sudo touch /opt/paas/app/__init__.py
 ( sudo crontab -l 2>/dev/null; echo '* * * * * /usr/local/bin/paas-cron-dispatch >> /var/log/paas-cron.log 2>&1' ) | sudo crontab -
 ```
+
+## A shell on the host (`host_run_script`)
+
+`POST /host/run {"script":"df -h /","timeout":60}` runs a shell script **on the
+Pi**, as root, in the host's own filesystem and network — not inside an app
+container. It is the escape hatch for what has no tool: disk pressure and
+cleanup, OS/kernel config, a container the platform did not create, `systemctl`,
+`crontab -l`. Admin keys only; a scoped deploy key cannot reach it (`auth.py`
+allows deploy keys nothing but their own three deploy routes).
+
+The control plane is itself a container, so this is not a plain `subprocess`.
+`app/hostexec.py` spends the one surface it has — the mounted Docker socket — on
+a throwaway `--privileged --pid=host` container that `nsenter`s into PID 1's
+namespaces:
+
+```
+docker run --rm -i --privileged --pid=host <image> \
+  nsenter -t 1 -m -u -i -n -p -- timeout -k 5 <t> env -i PATH=… /bin/sh -c 'cd / && exec /bin/sh'
+```
+
+Four details are load-bearing:
+
+- **The image is only a carrier for `nsenter`.** Everything the script runs comes
+  from the host, so the default is paas-api's own image — already on the box, so
+  no pull — and `HOST_EXEC_IMAGE` overrides it if that base ever drops
+  util-linux.
+- **`env -i`**, because nsenter passes the *caller's* environment through: without
+  it a script's `env` would print this control plane's `COOLIFY_TOKEN` and
+  `PAAS_DB_PASSWORD`, and inherit a PATH with no host sbin dirs.
+- **`cd /` inside the shell**, not `nsenter --wd=/`: nsenter opens that directory
+  *before* entering the mount namespace, so `--wd=/` would leave the script
+  sitting in the container's root.
+- **The script goes in on stdin** — nothing to quote, no argument-length limit —
+  so the shell is `exec`'d rather than handed a `-c` command.
+
+Two timeouts guard it: the host-side `timeout` bounds the script and lets the
+helper exit cleanly, and an outer wait force-removes the container if it does not
+(killing the `docker run` client alone would leave it running). Output is
+combined stdout/stderr, truncated past 100k characters; the response carries the
+script's `exit_code` and is a 200 even when that is non-zero.
+
+There are no guardrails, and this is the machine everything else runs on. The
+tool's description tells the model to read the script back before anything that
+writes, and it is tagged destructive so the connector asks.
 
 ## Test sequence — do not skip step 1
 

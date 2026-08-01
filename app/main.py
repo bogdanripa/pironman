@@ -12,7 +12,7 @@ from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
                       redirects as redirects_router,
                       analytics as analytics_router, stats,
-                      alerts as alerts_router, frontend)
+                      alerts as alerts_router, frontend, host)
 
 
 log = logging.getLogger("pironman")
@@ -124,6 +124,13 @@ app's own database, manage scheduled HTTP calls to an app, create, list or
 delete a GitHub repository's Actions secrets, and read traffic analytics —
 unique visitors, DAU/WAU/MAU, daily trends and weekly retention cohorts — for
 one app or across the whole platform.
+
+For anything the tools above do not cover, host_run_script runs a shell script
+on the Raspberry Pi itself — the host, as root, not inside any app's container —
+so `df -h`, `docker ps`, `/etc`, `systemctl` and the crontab are all reachable.
+Reach for it for host-level work (disk pressure, OS config, a log no tool
+exposes) and not as a shortcut around a purpose-built tool: apps_logs,
+apps_stats and db_run_script give better answers for the things they cover.
 
 Analytics are automatic: every app is measured at the shared edge proxy, so a
 new app starts producing numbers as soon as it serves traffic, with nothing to
@@ -253,8 +260,9 @@ secret and no human step. New apps auto-update by default; apps_update turns
 it off (e.g. to hold a manual rollback).
 
 The whole platform runs on one small machine at home. Deleting an app destroys
-its database and all its data with no undo, and running a database script is an
-unguarded pipe into that database — confirm both with the user first.\
+its database and all its data with no undo, running a database script is an
+unguarded pipe into that database, and host_run_script is an unguarded root
+shell on the machine all of it runs on — confirm all three with the user first.\
 """
 
 
@@ -354,14 +362,15 @@ app.add_middleware(CorsMiddleware, allow_origins=(DASHBOARD_ORIGIN,))
 
 
 # Router order controls how tools list at /mcp. operation_ids are prefixed by
-# group (apps_*, crons_*, db_*, env_*) so the flat MCP tool list reads as
+# group (apps_*, crons_*, db_*, host_*, env_*) so the flat MCP tool list reads as
 # coherent groups: apps (lifecycle + deploy + per-app env), schedules,
-# database, and shared env.
+# database, the host itself, and shared env.
 app.include_router(apps.router)
 app.include_router(scaffold.router)   # apps_deploy_workflow — part of the apps group
 app.include_router(env.app_router)    # apps_env_* — per-app env, part of the apps group
 app.include_router(crons.router)
 app.include_router(query.router)
+app.include_router(host.router)        # host_run_script — a shell on the box itself
 app.include_router(env.shared_router)  # env_* — shared, account-wide variables
 app.include_router(refresh.router)     # POST /apps/{id}/refresh — CI deploy hook
 app.include_router(ghsecrets.router)   # github_secret_* — repo Actions secrets
@@ -459,8 +468,8 @@ try:
                  "analytics_agents", "analytics_recent", "apps_stats",
                  "apps_redirects_list"}
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
-                    "crons_delete", "db_run_script", "env_delete",
-                    "github_secret_delete"}
+                    "crons_delete", "db_run_script", "host_run_script",
+                    "env_delete", "github_secret_delete"}
     for _tool in getattr(_mcp, "tools", None) or []:
         if _tool.name in _READONLY:
             _tool.annotations = ToolAnnotations(readOnlyHint=True)
