@@ -71,12 +71,21 @@ def pg_container() -> str:
     raise SystemExit(f"no postgres container has _paas (tried: {candidates or 'none'})")
 
 
-def query(container: str, sql: str) -> list[list[str]]:
+def query(container: str, sql: str) -> tuple[list[list[str]], str | None]:
+    """(rows, error). Never raises.
+
+    A watchdog that dies on one bad query stops watching everything else, which
+    is precisely the opposite of its job — and it fails at the moment it is most
+    needed, since a half-broken box is what produces bad queries. Every caller
+    decides for itself whether its query failing is a problem to report or a
+    reason to skip one check.
+    """
     code, out = sh("docker", "exec", "-i", container, "psql", "-U", "postgres",
                    "-d", "_paas", "-tAF", "\x1f", "-c", sql)
     if code != 0:
-        raise SystemExit(f"psql failed: {out.strip()[:300]}")
-    return [line.split("\x1f") for line in out.strip().splitlines() if line.strip()]
+        return [], out.strip()[:300]
+    return ([line.split("\x1f") for line in out.strip().splitlines() if line.strip()],
+            None)
 
 
 def telegram_config() -> tuple[str, str]:
@@ -157,9 +166,13 @@ def check(container: str) -> tuple[dict[str, str], list[str]]:
     # 1. Apps that are not supposed to sleep. An app with sleep_when_idle = true
     #    being stopped is the feature working, not a fault — checking it would
     #    alert on every idle night and train everyone to ignore this.
-    for row in query(container,
-                     "SELECT id FROM apps WHERE coolify_uuid IS NOT NULL "
-                     "AND sleep_when_idle = false ORDER BY id"):
+    rows, err = query(container,
+                      "SELECT id FROM apps WHERE coolify_uuid IS NOT NULL "
+                      "AND sleep_when_idle = false ORDER BY id")
+    if err:
+        problems["db:apps"] = f"cannot read the apps table from _paas: {err}"
+        rows = []
+    for row in rows:
         app = row[0]
         name = container_for(app)
         if not name:
@@ -175,11 +188,24 @@ def check(container: str) -> tuple[dict[str, str], list[str]]:
 
     # 2. Background work. The whole reason this script exists: a stalled loop
     #    leaves a healthy container and a silent log, so nothing else can see it.
-    for task, last_ok, age, tol in query(
-            container,
-            "SELECT task, coalesce(to_char(last_ok, 'YYYY-MM-DD\"T\"HH24:MI:SSZ'), 'never'), "
-            "coalesce(EXTRACT(EPOCH FROM (now() - last_ok))::int, -1), stale_after_s "
-            "FROM task_heartbeat ORDER BY task"):
+    rows, err = query(
+        container,
+        "SELECT task, coalesce(to_char(last_ok, 'YYYY-MM-DD\"T\"HH24:MI:SSZ'), 'never'), "
+        "coalesce(EXTRACT(EPOCH FROM (now() - last_ok))::int, -1), stale_after_s "
+        "FROM task_heartbeat ORDER BY task")
+    if err:
+        # paas-api creates this table at startup, so its absence is not a broken
+        # database — it means the control plane has not yet deployed a build that
+        # records heartbeats. Worth saying once, because until it does, the loop
+        # monitoring this script exists for is simply not happening. It clears
+        # itself on the next deploy.
+        problems["heartbeat:unreadable"] = (
+            "no background-work monitoring: task_heartbeat is unreadable "
+            "(" + ("table does not exist yet — paas-api has not deployed a build "
+                   "that writes heartbeats" if "does not exist" in err
+                   else err) + ")")
+        rows = []
+    for task, last_ok, age, tol in rows:
         age_i, tol_i = int(age), int(tol)
         if age_i < 0:
             problems[f"stale:{task}"] = f"{task} has never completed"
