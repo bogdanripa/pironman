@@ -677,6 +677,15 @@ it as load-bearing.
   read-modify-write against the live container, and a Coolify deploy is
   asynchronous, so the second reads the pre-deploy container and reverts the
   first.
+- **The database records intent; the box records fact, and they drift** — an app
+  row says `sleep_when_idle`, the container says whether it is stopped; the row
+  says `sablier_enrolled`, the labels say whether the middleware is attached;
+  `apps.image` says a tag, the running container says a digest. Every one of
+  those pairs has been observed disagreeing. Diagnose from the box, not from the
+  table, and treat the table as a claim to be checked. The same goes for reading
+  the source: it describes what *should* happen on a fresh box, which is not the
+  same as what this one is doing. See `CLAUDE.md` for the working rule and a
+  table of the assumptions that turned out to be wrong.
 
 **Checking it in isolation.** `web/tests/test_server.py` stands the real static
 host up against a fake Traefik and a fake Sablier and drives the paths that have
