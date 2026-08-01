@@ -292,6 +292,18 @@ async def _autoupdate_loop():
     control plane that redeploys more often than hourly restarts the timer every
     time and can go indefinitely without ever sweeping, while looking perfectly
     healthy."""
+    # The Sablier repair is the exception to that delay and runs BEFORE the first
+    # sleep. What makes the sweep expensive is pulling every watched image; this
+    # is one `docker ps -a` per sleeping app, so there is nothing to save by
+    # postponing it. What it repairs is an app whose container is gone, which
+    # cannot wake and serves 502s for every second it waits — and on a box that
+    # redeploys this control plane more often than hourly, the timer below resets
+    # before the sweep ever fires, so a repair left behind it would never run at
+    # all. Startup is also when it is most likely to be needed.
+    try:
+        await sablier.reconcile()
+    except Exception:
+        _swallow("sablier reconcile (startup)")
     while True:
         await asyncio.sleep(3600)
         try:
