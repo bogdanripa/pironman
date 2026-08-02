@@ -141,9 +141,37 @@ async def reconcile() -> list[dict]:
             "SELECT id, coolify_uuid, has_frontend, redirects, sleep_when_idle "
             "FROM apps WHERE sleep_when_idle = true AND coolify_uuid IS NOT NULL "
             "ORDER BY id")
+        # Excluded apps first, and checked whatever their row says. `excluded()`
+        # is what exempts them, not the sleep_when_idle column, so an enrollment
+        # written while the column said otherwise outlives any change to it.
+        #
+        # This pass exists because skipping was not enough. `api` was enrolled by
+        # the _DEFRONTED repair, and nothing here would have taken it back off:
+        # the loop below skipped it for being excluded, and the _DEFRONTED pass
+        # only touches apps whose rule carries the static-host marker, which the
+        # control plane's does not. Prevention without repair leaves the app
+        # already broken broken for ever, which is the state this was written in.
+        for app in await c.fetch(
+                "SELECT id, coolify_uuid FROM apps "
+                "WHERE coolify_uuid IS NOT NULL ORDER BY id"):
+            if not excluded(app["id"]):
+                continue
+            try:
+                labels = await _current_labels(app["coolify_uuid"])
+                if not labels or not is_enrolled(labels, app["id"]):
+                    continue
+                from . import routing  # lazy: routing imports this module
+                if await routing.apply_backend_labels(
+                        app["id"], app["coolify_uuid"], sleeps=False,
+                        fronted=False):
+                    out.append({"id": app["id"], "unenrolled": True,
+                                "reason": "must never sleep, but was enrolled"})
+            except Exception as e:
+                out.append({"id": app["id"], "error": repr(e)})
+
         for app in apps:
             if excluded(app["id"]):
-                continue
+                continue  # handled by the pass above
             try:
                 # A sleeping app is SUPPOSED to have a stopped container, so the
                 # check that matters is existence, not state. `_container_name`
