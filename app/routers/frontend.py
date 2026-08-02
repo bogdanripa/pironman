@@ -11,11 +11,33 @@ from pydantic import BaseModel, Field
 from ..auth import require_key
 from ..db import pool
 from ..locks import app_lock
-from ..config import app_url
+from ..config import app_url, STATIC_HOST_APP
 from .. import cdn, frontends, routing
 
 router = APIRouter(prefix="/apps", tags=["frontend"],
                    dependencies=[Depends(require_key)])
+
+
+def _refuse_static_host(app_id: str) -> None:
+    """The shared static host cannot have a frontend of its own.
+
+    It serves every OTHER app's bundle, and it deliberately answers 404 on its
+    own hostname — a guarantee the test suite asserts. So a bundle published here
+    is unreachable by construction: it occupies disk, sets has_frontend, and
+    shows the app as having a frontend that can never be served. One was found
+    sitting on this box for days containing "<h1>FRONTEND_OK</h1>", left over
+    from a test.
+
+    Refused rather than silently accepted, because accepting it is a write that
+    looks like it worked and produces nothing.
+    """
+    if app_id == STATIC_HOST_APP:
+        raise HTTPException(
+            400,
+            f"'{app_id}' is the shared static host: it serves other apps' "
+            "bundles and answers 404 on its own hostname, so a frontend "
+            "published here could never be served. Publish to the app that "
+            "should own the page instead.")
 
 
 async def _sync_manifest(c, app_id: str) -> dict:
@@ -52,6 +74,7 @@ async def deploy_frontend(app_id: str, request: Request):
     This is the call an app's CI makes after `npm run build`; it needs the app's
     scoped deploy key — the same one the backend's /refresh hook uses.
     """
+    _refuse_static_host(app_id)
     # Serialised: this can rewrite routing labels and redeploy, and an app's CI
     # ships its frontend and its backend at the same time.
     async with app_lock(app_id), pool().acquire() as c:
@@ -96,6 +119,7 @@ async def write_frontend(app_id: str, body: FrontendFiles):
     paths the site does not have. If the site is a single-page app whose router
     owns those paths, set apps_update spa=true so they serve index.html instead.
     """
+    _refuse_static_host(app_id)
     async with app_lock(app_id), pool().acquire() as c:
         if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
             raise HTTPException(404, "no such app")

@@ -281,7 +281,14 @@ function renderResources(data) {
       `<td class="n">${(t.requests || 0).toLocaleString()}</td>` +
       `<td class="n ${errCls}">${(t.error_pct || 0)}%</td>` +
       `<td class="n">${latency(t)}</td>` +
-      `<td class="n" title="${esc(exact(a.last_seen))}">${ago(a.last_seen)}</td>` +
+      (a.role === 'static-host'
+        // Not "never" — that reads as a fault. This app is never ADDRESSED, and
+        // that is what it is for.
+        ? `<td class="n" title="${esc('This is the shared static host. It serves other apps\u2019 '
+            + 'hostnames, and every request is credited to the app it was for \u2014 so it has no '
+            + 'last-accessed time of its own. Its own hostname deliberately returns 404.')}">`
+          + '<span class="muted">n/a</span></td>'
+        : `<td class="n" title="${esc(exact(a.last_seen))}">${ago(a.last_seen)}</td>`) +
       '</tr>';
   }).join('');
   $('resources').innerHTML =

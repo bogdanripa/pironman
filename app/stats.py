@@ -13,6 +13,7 @@ import shutil
 
 from . import autoupdate, provision
 from .analytics import LATENCY_BUCKETS_MS
+from .config import STATIC_HOST_APP
 from .db import pool
 
 _MEM_UNITS = {"B": 1 / 1048576, "KIB": 1 / 1024, "MIB": 1.0,
@@ -331,6 +332,13 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
             # answers from the CDN without waking anything. So "accessed 2 hours
             # ago" and "backend asleep since yesterday" are both true at once,
             # and only this field says the second.
+            # The static host is infrastructure, not a destination: it serves
+            # OTHER apps' hostnames, and analytics credits a request to the host
+            # header it carried. So its own last_seen is structurally always
+            # empty while it handles every request on the box — "never" there is
+            # true and says the opposite of the truth. Marked so a reader can
+            # decline to show a number that cannot mean anything.
+            "role": "static-host" if app["id"] == STATIC_HOST_APP else None,
             "state_since": (next((v["since"] for n, v in life.items()
                                   if uuid and uuid in n), None)
                             if has_backend else None),
