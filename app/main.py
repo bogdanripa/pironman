@@ -284,15 +284,44 @@ async def _sync_routes(reason: str) -> None:
         _swallow(f"route sync ({reason})")  # drift must never take the box down
 
 
+SWEEP_EVERY = 3600
+# Floor on the catch-up: however overdue a sweep is, wait at least this long
+# after boot. A sweep pulls every watched image, and "overdue" is exactly what a
+# crash-looping control plane looks like — without a floor, a restart loop would
+# turn into a registry-pull loop. Two minutes is longer than a crash loop
+# survives and shorter than anything the sweep is meant to catch.
+SWEEP_MIN_DELAY = 120
+
+
+async def _until_next_sweep() -> float:
+    """Seconds to wait before the next sweep, measured from the last one that
+    actually COMPLETED rather than from this process starting.
+
+    The difference is the whole point. A flat `sleep(3600)` measures the
+    container's lifetime, and on a control plane that redeploys itself those are
+    not the same number: every restart put the first sweep an hour away again, so
+    six deploys in ninety minutes meant no sweep at all — 1h47m of nothing, while
+    every other loop stayed current and the container reported healthy. The
+    heartbeat caught it, which is what it is for, but the loop should not need
+    catching.
+    """
+    since = await heartbeat.since_last_ok("autoupdate_sweep")
+    if since is None:
+        return SWEEP_EVERY  # never swept, or the lookup failed: full interval
+    return max(SWEEP_MIN_DELAY, SWEEP_EVERY - since)
+
+
 async def _autoupdate_loop():
     """Hourly: redeploy every opted-in app whose watched image tag has moved.
-    First run is an hour after startup, not on boot — this control plane
-    redeploys itself often, and there is no need to sweep on every restart.
 
-    That delay is also why this loop needs a heartbeat more than the others: a
-    control plane that redeploys more often than hourly restarts the timer every
-    time and can go indefinitely without ever sweeping, while looking perfectly
-    healthy."""
+    The interval is counted from the last sweep that completed, not from this
+    process starting — see `_until_next_sweep`. So a restart no longer costs a
+    full hour, and a control plane that redeploys often still sweeps roughly
+    hourly instead of never.
+
+    The heartbeat stays, and matters as much as it did: it is what caught this
+    loop starving in the first place, and it is still the only thing that can
+    report a sweep that runs but achieves nothing."""
     # The Sablier repair is the exception to that delay and runs BEFORE the first
     # sleep. What makes the sweep expensive is pulling every watched image; this
     # is one `docker ps -a` per sleeping app, so there is nothing to save by
@@ -306,7 +335,7 @@ async def _autoupdate_loop():
     except Exception:
         _swallow("sablier reconcile (startup)")
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(await _until_next_sweep())
         try:
             await autoupdate.check_all()
         except Exception as e:

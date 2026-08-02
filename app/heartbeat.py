@@ -134,3 +134,29 @@ async def snapshot() -> list[dict]:
         })
     out.sort(key=lambda d: (not d["stalled"], d["task"]))
     return out
+
+
+async def since_last_ok(task: str) -> float | None:
+    """Seconds since `task` last completed, or None if it never has (or the
+    lookup failed).
+
+    Exists so a periodic loop can pick up where the last RUN left off instead of
+    where this process started. A loop that always sleeps its full interval
+    before its first pass measures the lifetime of the container, not the age of
+    the work — and on a control plane that redeploys itself, those are different
+    numbers. `autoupdate_sweep` went 1h47m without a pass that way, across three
+    restarts, while every other loop stayed current and nothing looked wrong.
+
+    Best-effort, and None on failure, which callers should read as "wait the full
+    interval". That errs toward sweeping less often rather than more, so a
+    database wobble cannot turn into a sweep on every boot.
+    """
+    try:
+        async with pool().acquire() as c:
+            v = await c.fetchval(
+                "SELECT EXTRACT(EPOCH FROM (now() - last_ok)) "
+                "FROM task_heartbeat WHERE task = $1", task)
+        return float(v) if v is not None else None
+    except Exception:
+        _log.warning("could not read last_ok for %s", task, exc_info=True)
+        return None
