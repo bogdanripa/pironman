@@ -307,10 +307,25 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
     # anyone — the static host no longer forwards to it, and its own router still
     # demands the header. A backend-only app qualifies for fronting solely via
     # sleep_when_idle, so simply turning sleeping OFF is enough to strand it.
+    # This is a REPAIR pass, so it must read before it writes: touch an app only
+    # if its rule actually still carries the marker. Calling apply_backend_labels
+    # unconditionally here looks equivalent and is not — it also rewrites Sablier
+    # labels, and Coolify regenerates part of the label block on every deploy, so
+    # a sync that always writes produces a deploy, which produces the next sync's
+    # work, which produces another deploy. That loop caught the control plane
+    # (never fronted, therefore always in this set) and restarted it every time
+    # anything anywhere triggered a route sync.
+    marker = _marker_term()
     unscoped_ids = []
     for r in (await conn.fetch(_DEFRONTED, WEB_APP_ID, app_ids)
               if scope_backends else []):
         try:
+            base = await sablier._current_labels(r["coolify_uuid"])
+            if not base:
+                continue  # never deployed; nothing to repair
+            if not any(k.startswith("traefik.http.routers.") and k.endswith(".rule")
+                       and marker in v for k, v in base.items()):
+                continue  # already correct — leave it completely alone
             if await apply_backend_labels(r["id"], r["coolify_uuid"],
                                           sleeps=bool(r["sleep_when_idle"]),
                                           fronted=False):
