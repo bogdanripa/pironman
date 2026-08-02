@@ -319,10 +319,12 @@ function renderRecent() {
   const sc = s => (s >= 500) ? 'bad' : (s >= 400 ? 'warn' : '');
   const shown = rows.slice(0, _recentShown);
   const table =
-    `<div style="overflow-x:auto"><table><tr><th>Time · ${esc(TZ)}</th><th>App</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>` +
+    `<div style="overflow-x:auto"><table><tr><th>Time · ${esc(TZ)}</th><th>App</th><th>Client IP</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>` +
     shown.map(r =>
       `<tr><td class="muted" title="${esc(r.time || '')}">${esc(localTime(r.time))}</td>` +
       `<td>${esc(r.app || '')}</td>` +
+      // IPv6 is long enough to wrap mid-address and read as two addresses.
+      `<td class="ip" title="${esc(r.ip || '')}">${esc(r.ip || '—')}</td>` +
       `<td>${esc(r.method || '')}</td>` +
       `<td style="max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.path || '')}</td>` +
       `<td class="n ${sc(r.status)}">${r.status ?? ''}</td></tr>`).join('') +
@@ -352,9 +354,15 @@ async function loadResources(days) {
 }
 
 async function loadApps() {
-  const o = await api('/analytics/overview?days=30');
+  // The apps that EXIST, not the ones analytics has ever seen. Analytics rows are
+  // keyed by the app id in the access log and nothing removes them when an app is
+  // deleted, so a dead app kept a full set and sat in this list for ever —
+  // offering a filter whose only possible result is a deleted app's old traffic.
+  // include_db=false skips the per-database size probe, which this does not need
+  // and which is the slow part of that endpoint.
+  const d = await api('/stats/apps?include_db=false');
   const sel = $('app');
-  const apps = (o.per_app || []).map(r => r.app_id);
+  const apps = (d.apps || []).map(r => r.id);
   sel.innerHTML = '<option value="">All apps</option>' +
     apps.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('');
 }

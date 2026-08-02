@@ -20,6 +20,7 @@ app/cli.py         python -m app.cli create <label>
 app/routers/       apps, crons, query, host, scaffold, env, refresh
 paas-cron-dispatch host-side dispatcher, runs every minute from crontab
 paas-watchdog      host-side liveness watchdog, runs every 5 minutes
+docker-destroy-log host-side recorder of container destroy events (+ .service, .logrotate)
 app/heartbeat.py   background-loop liveness (task_heartbeat)
 ```
 
@@ -160,6 +161,36 @@ that repeats itself every five minutes is one people mute.
 `sleep_when_idle = false`, after two consecutive failed runs. An app that sleeps
 is *supposed* to be stopped, and a watchdog that "fixed" that would quietly
 destroy scale-to-zero while reporting success.
+
+Sleeping apps are still **checked**, just for the right thing. Their run state
+says nothing — being stopped is the feature — but whether a container still
+**exists** says everything: a deleted one can never be woken by any request and
+502s until something redeploys it. So they are checked with `docker ps -a` and
+reported as `<app> sleeps but has no container at all`, and never restarted (there
+is nothing to `docker start`; only a redeploy recreates it). Before this, sleeping
+apps were skipped outright, so the box's only alerting path had nothing to say
+while an app sat unreachable for nine hours.
+
+## Destroy log
+
+```
+sudo cp docker-destroy-log /usr/local/bin/ && sudo chmod +x /usr/local/bin/docker-destroy-log
+sudo cp docker-destroy-log.service /etc/systemd/system/
+sudo cp docker-destroy-log.logrotate /etc/logrotate.d/docker-destroy-log
+sudo systemctl daemon-reload && sudo systemctl enable --now docker-destroy-log
+tail /var/log/docker-destroy.log
+```
+
+Docker keeps **no event history** — the stream is in-memory and rolls over in
+minutes — so a container that vanishes overnight leaves nothing to read the next
+morning. That gap turned one vanished container into a multi-hour reconstruction
+from inference; this makes the next one a single `grep`. Every destroy is appended
+with a UTC timestamp, container name and image; logrotate keeps 8 weeks.
+
+The shell lives in a **file** rather than inline in the unit's `ExecStart` because
+systemd expands `$VAR` itself — inline, it ate both the timestamp subshell and the
+loop variable and logged garbage.
+
 ## A shell on the host (`host_run_script`)
 
 `POST /host/run {"script":"df -h /","timeout":60}` runs a shell script **on the
@@ -361,14 +392,33 @@ done
 
 `apps_get` also reports the live policy in `backend.runtime.restart_policy`.
 
+**A stopped container is fine; a deleted one is fatal.** Sablier finds an app by
+the `sablier.group` label, and that label lives on the container — so a slept
+container is always findable, but a *deleted* one leaves the group empty and no
+request can ever wake it (`Group not found`, then `No such container` on the name
+fallback). Only a deploy recreates it. Coolify's forced Docker cleanup was
+deleting them nightly, because `docker container prune`'s `label!=` filters are
+ANDed rather than ORed and so excluded nothing; **`force_docker_cleanup` must stay
+false**. `sablier.reconcile` now recreates a missing container at paas-api startup
+and hourly, `paas-watchdog` reports one within 5 minutes, and
+`/var/log/docker-destroy.log` records what removed it. See ARCHITECTURE.md §9.
+
+**New deploys start asleep.** Sablier only stops instances it holds a session for,
+and sessions come from requests through its middleware, never from a deploy — so a
+deployed-but-never-called app used to stay up for ever with `sleep_when_idle: true`.
+`autoupdate.sleep_after_deploy` stops it once the deploy is verified, so the flag
+means what it says from the moment it lands.
+
 ### Is the first request after a quiet night slow?
 
 Two flags describe sleeping and neither answers that on its own.
 `sleep_when_idle` is what the app asked for; `sablier_enrolled` is whether the
 middleware is actually stamped on its container. Auto-enrolment is gated
-(`SABLIER_AUTO_ENROLL`, off by default), so `sleep_when_idle: true` with
-`sablier_enrolled: false` is a normal, indefinite state — an app that is *marked*
-to sleep and never does.
+(`SABLIER_AUTO_ENROLL`, off by default but **`true` on this box**), so
+`sleep_when_idle: true` with `sablier_enrolled: false` is a normal, indefinite
+state on a box where it is off — an app that is *marked* to sleep and never does.
+It is also why `sleep_after_deploy` refuses to stop an unenrolled app: nothing
+would be able to start it again.
 
 So `apps_get` reports a derived `backend.sleeps` (both flags true) and a plain
 `backend.first_request_after_idle` alongside the raw pair, and `apps_create`

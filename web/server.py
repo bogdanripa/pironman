@@ -82,8 +82,18 @@ SABLIER_SESSION_DURATION = os.environ.get("SABLIER_SESSION_DURATION", "5m")
 WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT_SECONDS", "60"))
 # After Sablier reports the app ready, Traefik still has to notice the container
 # and pass its healthcheck filter. A few short retries cover that gap.
+#
+# Backoff, not a flat delay. _wake() has already blocked until Sablier reported
+# the container ready, so all that is left is Traefik picking it up — which is
+# event-driven and usually well under a second. A flat 1.5s was therefore paid in
+# full on the FIRST attempt, every time, and a measured cold wake spent more of
+# its time asleep here than waiting for the app. Starting at 0.2s and doubling to
+# a 2s ceiling keeps roughly the same overall budget (~11s over 8 attempts) for
+# the rare container that really is slow, while the common case returns as soon
+# as Traefik is ready.
 WAKE_RETRIES = 8
-WAKE_RETRY_DELAY = 1.5
+WAKE_RETRY_DELAY = 0.2
+WAKE_RETRY_MAX_DELAY = 2.0
 
 # Hashed build output is safe to cache forever; everything else is not.
 # Entry files, in preference order. index.htm is the legacy spelling; supporting
@@ -261,8 +271,10 @@ async def _proxy(request: Request, aid: str) -> Response:
 
     # Either the connection failed outright or we have just woken the app; give
     # Traefik a moment to pick the container up, then try again.
+    delay = WAKE_RETRY_DELAY
     for _ in range(WAKE_RETRIES):
-        await asyncio.sleep(WAKE_RETRY_DELAY)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, WAKE_RETRY_MAX_DELAY)
         sent = await _send(request, aid)
         if sent and not _is_down(sent[1]):
             return _stream(*sent)

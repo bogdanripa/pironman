@@ -247,7 +247,11 @@ async def settle(app_id: str, uuid: str, before: str | None) -> dict:
                 await c.execute(
                     "UPDATE apps SET deployed_digest = $1 WHERE id = $2",
                     digest, app_id)
-            await _maybe_enroll_sablier(c, app)
+            # Skipped when enrollment just ran: that write queues its own
+            # redeploy, which would start the container straight back up and
+            # leave the app awake anyway.
+            if not await _maybe_enroll_sablier(c, app):
+                result["sleep"] = await sleep_after_deploy(app)
     return result
 
 
@@ -272,23 +276,32 @@ async def check_and_update(conn, app, verify: bool = False) -> dict:
     await conn.execute(
         "UPDATE apps SET image = $1, deployed_digest = $2 WHERE id = $3",
         ref, digest, app["id"])
-    await _maybe_enroll_sablier(conn, app)
+    enrolled = await _maybe_enroll_sablier(conn, app)
     result = {"id": app["id"], "updated": True, "image": ref, "digest": digest}
     if verify:
         result.update(await verify_deploy(app["coolify_uuid"], before))
+        # Only once the deploy is confirmed good, and not when enrollment just
+        # queued a redeploy of its own. Without verify there is nothing to
+        # confirm against, so the app is left running rather than slept blind.
+        if result.get("verified") and not enrolled:
+            result["sleep"] = await sleep_after_deploy(app)
     return result
 
 
-async def _maybe_enroll_sablier(conn, app) -> None:
+async def _maybe_enroll_sablier(conn, app) -> bool:
     """Auto-enroll an app in Sablier scale-to-zero after a deploy, once, if the
     feature is on and the app opts in. Gated by SABLIER_AUTO_ENROLL (off by
     default) so a wrong SABLIER_URL can't break routing platform-wide before it's
-    verified on one app. Best-effort: a failure just leaves it for next time."""
+    verified on one app. Best-effort: a failure just leaves it for next time.
+
+    Returns whether enrollment actually ran, because writing those labels queues
+    a redeploy of its own — so the caller must not also try to put the app to
+    sleep in the same pass."""
     if not SABLIER_AUTO_ENROLL or app["sablier_enrolled"] or not app["sleep_when_idle"]:
-        return
+        return False
     from . import routing, sablier  # lazy: both import this module
     if sablier.excluded(app["id"]):
-        return
+        return False
     try:
         # The static host's router comes FIRST. From the moment this app is
         # enrolled it can be stopped, and Traefik drops a stopped container's
@@ -300,8 +313,45 @@ async def _maybe_enroll_sablier(conn, app) -> None:
             app["id"], app["coolify_uuid"], sleeps=True, fronted=True)
         await conn.execute(
             "UPDATE apps SET sablier_enrolled = true WHERE id = $1", app["id"])
+        return True
     except Exception:
-        pass  # container may not be up yet; a later sweep retries
+        return False  # container may not be up yet; a later sweep retries
+
+
+async def sleep_after_deploy(app) -> dict | None:
+    """Put a freshly deployed scale-to-zero app straight back to sleep.
+
+    Sablier only stops instances it holds a session for, and sessions are created
+    by requests arriving through its middleware — never by a deploy. So an app
+    that has been deployed but not yet called has nothing to expire and stays up
+    for ever, which makes sleep_when_idle quietly untrue until the first request
+    happens to arrive. Stopping it here makes the flag mean what it says from the
+    moment the deploy lands; the next request wakes it exactly as it would after
+    any idle period.
+
+    Only ever called AFTER verify_deploy has passed. Verification is what
+    separates a good deploy from Coolify's silent rollback, and it can only tell
+    them apart while the container is running — stopping first would erase the
+    difference between "deployed and asleep" and "deploy failed, nothing there".
+
+    Returns None when the app is not a candidate, so callers can tell "did not
+    apply" from "tried and failed"."""
+    from . import sablier  # lazy: imports this module
+    if not app["sleep_when_idle"] or sablier.excluded(app["id"]):
+        return None
+    # Enrollment is what makes an app wakeable: the Sablier middleware on its
+    # router is the only thing that will ever start it again. Stopping an app
+    # that opted into sleeping but was never enrolled — SABLIER_AUTO_ENROLL is
+    # off by default, so that combination is entirely normal — would strand it
+    # with nothing able to bring it back. Sleep only what can wake.
+    if not app["sablier_enrolled"]:
+        return None
+    name = await _container_name(app["coolify_uuid"])
+    if not name:
+        return None
+    rc, out = await _docker("stop", name, timeout=90)
+    return {"slept": rc == 0, "container": name,
+            **({} if rc == 0 else {"error": out.strip()[:200]})}
 
 
 async def check_all() -> list[dict]:

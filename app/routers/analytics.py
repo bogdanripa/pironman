@@ -58,9 +58,11 @@ async def recent(
     app_id: str | None = Query(None, description="Scope to one app; omit for all apps"),
     limit: int = Query(50, ge=1, le=200, description="How many recent requests"),
 ):
-    """A live tail of the most recent requests across apps — time, app, method,
-    path and status, newest first. Read straight from the edge proxy log, so it's
-    a rolling buffer of what just happened, not durable history."""
+    """A live tail of the most recent requests across apps — time, app, client IP,
+    method, path and status, newest first. Read straight from the edge proxy log,
+    so it's a rolling buffer of what just happened, not durable history. The IP is
+    the caller's real address (CF-Connecting-Ip behind Cloudflare), unlike the
+    rollup tools, which only ever see a hashed visitor id."""
     return await analytics.recent_requests(app_id, limit)
 
 

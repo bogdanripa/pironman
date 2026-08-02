@@ -1,0 +1,8 @@
+/var/log/docker-destroy.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

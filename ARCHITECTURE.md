@@ -44,6 +44,9 @@ traffic analytics are harvested automatically from the shared proxy log.
 | `/usr/local/bin/paas-watchdog` | Host liveness watchdog (every 5 minutes) |
 | `/var/lib/paas-watchdog/state.json` | Watchdog's edge-trigger state |
 | `/var/log/paas-cron.log`, `/var/log/paas-watchdog.log` | Their output |
+| `/usr/local/bin/docker-destroy-log` | Records every container **destroy** event (§9) |
+| `/etc/systemd/system/docker-destroy-log.service` | Runs it, `Restart=always`, enabled at boot |
+| `/var/log/docker-destroy.log` | Its output — rotated weekly, kept 8 weeks |
 
 `/opt/paas` is the path to reach for from `host_run_script` (§5b): it is where a
 `git pull` happens, where the host-side scripts are copied *from*, and the only
@@ -423,18 +426,97 @@ stays true in the database — the app just quietly stops sleeping. The hourly s
 runs `sablier.reconcile`, which compares the database's belief against the
 container's actual labels and re-applies.
 
+### A deleted container is fatal — a *stopped* one is fine
+
+This is the distinction the whole feature turns on, and getting it wrong cost a
+nine-hour outage nobody noticed.
+
+Sablier discovers an app through the `sablier.group` label, and that label lives
+**on the container**. Stop the container and everything still works: Sablier's
+Docker provider lists stopped containers, finds the group, and starts it on the
+next request. **Delete the container and the group has no members at all** — the
+wake request 404s (`Group not found`), the name-based fallback 500s
+(`No such container: <app>`), and every request to the app is 502/503 **for ever**.
+Only a deploy recreates a container, so nothing short of one recovers the app.
+
+**What was deleting them: Coolify's forced Docker cleanup.** `DockerCleanupJob`
+runs `docker container prune` with four negative filters, intending "spare proxies
+*or* databases *or* applications *or* services":
+
+```
+docker container prune -f --filter "label=coolify.managed=true" \
+  --filter "label!=coolify.proxy=true"       --filter "label!=coolify.type=database" \
+  --filter "label!=coolify.type=application" --filter "label!=coolify.type=service"
+```
+
+Docker **ANDs** them. `matchLabels` spares a container only when *every* `label!`
+pair matches, and nothing can be `coolify.type=database` **and** `=application`
+**and** `=service` at once. The exclusion therefore never fires and **every stopped
+`coolify.managed=true` container is deleted.** Prune only touches stopped
+containers, and the only apps ever stopped are the sleeping ones — which is exactly
+why both enrolled apps died and `api`/`web` never did.
+
+> **`force_docker_cleanup` must stay `false` on this box.** With it true the job
+> bypasses the disk threshold and runs unconditionally (nightly, `0 0 * * *`),
+> deleting every slept container. False still cleans up at
+> `docker_cleanup_threshold` (80%), and the disk sits at 3% of 470GB. Turning it
+> back on in the Coolify UI silently re-arms this. It is an upstream Coolify bug,
+> not a misconfiguration here.
+
+**Two layers stand behind that**, because the trigger is upstream and the next one
+may not be the prune:
+
+- **Recovery.** `sablier.reconcile` checks container **existence before labels** —
+  `_current_labels` returns `{}` when there is no container, so the old
+  `if not labels: continue` skipped precisely the case that cannot fix itself. A
+  missing container is redeployed, with re-enrollment left to the next pass since
+  those labels are read off a container that does not exist yet. It runs at
+  paas-api **startup as well as hourly**: the hourly loop sleeps *first*, and a
+  control plane that redeploys more often than hourly restarts that timer every
+  time, so a repair left behind it would never run at all.
+- **Forensics.** Docker keeps no event history — its stream is in-memory and rolls
+  over in minutes, so a container that vanishes overnight leaves nothing to read
+  the next morning. `docker-destroy-log.service` (§1) appends every destroy event
+  to `/var/log/docker-destroy.log`, turning reconstruction-by-inference into one
+  `grep`.
+
+### New deploys start asleep
+
+`sleep_when_idle` used to be quietly untrue until an app's first request. Sablier
+only stops instances it holds a **session** for, and sessions are created by
+requests arriving through its middleware — **never by a deploy**. An app deployed
+but not yet called therefore had nothing to expire and stayed up for ever.
+
+`autoupdate.sleep_after_deploy` stops it once the deploy is confirmed good. Three
+guards, each blocking a distinct way this could strand an app:
+
+- **After verification, never before.** `verify_deploy` is what distinguishes a
+  good deploy from Coolify's silent rollback, and it can only tell them apart while
+  the container runs. `check_and_update` therefore sleeps only when `verify=True`.
+- **Not when enrollment just ran** — that write queues a redeploy of its own, which
+  would start the container straight back up.
+- **Only when the app is actually enrolled.** Enrollment is what makes an app
+  wakeable; stopping an unenrolled one leaves nothing able to start it again.
+
 - **Default: every app sleeps** when idle (`apps.sleep_when_idle`, default true).
 - **`api` is hard-excluded** (`SABLIER_EXCLUDE`) — it runs the ingester,
   auto-update sweep and alert loop and must never sleep.
 - **`apps_sablier`** toggles it per app (reads base labels → enroll/unenroll →
   redeploy). Requires the app to have deployed once (so its labels exist).
-- **`SABLIER_AUTO_ENROLL`** (default off) makes new/updated apps enroll
-  automatically after deploy, once verified. Config: `SABLIER_URL` (how Traefik
-  reaches Sablier), `SABLIER_SESSION_DURATION`, `SABLIER_STRATEGY`.
+- **`SABLIER_AUTO_ENROLL`** (default off, **`true` on this box**) makes new/updated
+  apps enroll automatically after deploy, once verified. Config: `SABLIER_URL` (how
+  Traefik reaches Sablier), `SABLIER_SESSION_DURATION`, `SABLIER_STRATEGY`.
+- **Scale-to-zero is not offered at creation.** `apps_create` has no
+  `sleep_when_idle` field — the column defaults true and `apply_image` sets it
+  explicitly when a backend first appears — so every app made through the MCP tools
+  sleeps. `apps_update sleep_when_idle=false` is the deliberate opt-out afterwards,
+  and it is how an app is marked always-on alongside the `SABLIER_EXCLUDE` set.
 
 > Verify enrollment on one app (`apps_sablier <app> true`) — confirm it sleeps
 > when idle and wakes on request — **before** flipping `SABLIER_AUTO_ENROLL` on,
-> since a wrong `SABLIER_URL` would break routing for every enrolled app.
+> since a wrong `SABLIER_URL` would break routing for every enrolled app. With it
+> on, a not-yet-enrolled app's first deploy redeploys twice: once for the code, once
+> for the enrollment labels.
 
 ---
 
@@ -548,6 +630,13 @@ By **group**, not by name: enrollment tags the container `sablier.group=<app-id>
 a stable id, while its actual name is the Coolify uuid plus a deploy timestamp.
 `?names=<app-id>` returns `500 … No such container` — verified on the box. The caller sees one slow request; there is no interstitial.
 
+All of that holds only while the container **exists**. Sablier lists stopped
+containers, so a slept one is always findable; a *deleted* one leaves the group
+empty and the same request 404s `Group not found` and then 500s on the name
+fallback — the two error shapes together are the signature of a deleted container,
+not a sleeping one (§9). Verified end to end on the box: `docker stop` →
+`Exited (137)`, request through the public host → `200`, container `Up`.
+
 The one thing the static host must never do here is fall through to `index.html`.
 An unreachable backend that answers with the site's homepage looks like a working
 site — that is precisely how the failure above stayed invisible. It is a 502.
@@ -625,6 +714,17 @@ flows through: the Traefik access log** — nothing is installed per app.
   routing `api` through the static host would put the control plane's
   availability behind another app.
 
+**Analytics rows outlive the apps they describe.** They are keyed by the app id
+seen in the access log and nothing deletes them when an app is deleted, so every
+app that ever served a request is still in `analytics_visits`, `_perf`, `_agents`,
+`_latency` and `_first_seen`. That is correct for a *report* — dropping the rows
+would misstate history — but wrong for *navigation*: the dashboard's app filter was
+built from `/analytics/overview`'s `per_app` and so offered long-deleted apps whose
+only possible result is their own old traffic. It reads `/stats/apps` instead, which
+comes from the `apps` table. The per-app traffic table still renders everything
+analytics holds. `analytics_last_seen` is the one table that tracks live apps only,
+which makes it a useful cross-check for orphans.
+
 ---
 
 ## 11. Alerting
@@ -641,6 +741,30 @@ crashes on start, the errors its requests produce are the one thing that says so
 That check spent its whole life nested in a branch requiring an app to both sleep
 *and* have been alerted down, which meant it had never fired for anything. Treat
 it as load-bearing.
+
+**For a sleeping app, check existence — never state.** A sleeping app is *supposed*
+to be stopped, so "is it running" says nothing and alerting on it would fire every
+idle night. Whether it still **has a container** says everything (§9). Every reader
+of that state now makes the distinction:
+
+| Reported | Means | Response |
+|---|---|---|
+| `asleep` | container exists, stopped | healthy — the next request wakes it |
+| `missing` | **no container at all** | cannot wake; needs a redeploy |
+
+- `paas-watchdog` no longer skips sleeping apps: it checks them with
+  `docker ps -a` and reports a missing container within 5 minutes. Deliberately
+  **not** `restartable` — there is nothing to `docker start`, and retrying that
+  every five minutes would just fail forever.
+- `stats.app_runtime` falls back to `docker ps -a` rather than inferring from the
+  running-only `docker stats`; `stats.app_resources` does the same, reusing the
+  `ps -a` listing it already fetches for disk sizes, so the list view costs no
+  extra Docker call.
+
+Reporting a deleted app as `asleep — the next request wakes it` is what let the
+outage in §9 run for nine hours unseen: an app fronted by the static host still
+answers `200` on `/` while its backend is unreachable, so there was no external
+symptom and the platform's own status agreed with it.
 
 ---
 
@@ -664,6 +788,24 @@ it as load-bearing.
 - **Traefik's Docker provider only sees running containers** — a stopped app has
   no router, so anything that must survive the app being stopped (a wake path
   above all) has to live on a container that stays up.
+- **Stopped and deleted are different states, and the platform must never conflate
+  them** — a slept container wakes, a deleted one can only be redeployed. Anything
+  that answers "is this app OK" by looking at `docker ps` sees the same thing for
+  both. Ask `docker ps -a` (§9, §11).
+- **`docker container prune`'s `label!=` filters are ANDed, not ORed** — a spare
+  list of mutually exclusive labels excludes nothing at all. Coolify's forced
+  cleanup deletes every stopped app container because of it; keep
+  `force_docker_cleanup` false. Assume nothing about filter semantics: this one
+  survived two confident wrong diagnoses and was settled only by creating a
+  labelled throwaway container and running the exact command against it.
+- **Instrument the disappearance, not just the symptom** — Docker's event stream is
+  in-memory and rolls over in minutes, so "what deleted this overnight" is
+  unanswerable after the fact. `docker-destroy-log.service` exists because the
+  first investigation had to be reconstructed by inference.
+- **A background repair behind a long `sleep` may never run** — the auto-update
+  loop sleeps an hour *before* its first pass and the timer restarts on every
+  redeploy of the control plane, which redeploys more often than that. Anything
+  that must actually happen goes ahead of the sleep, not inside the loop.
 - **Never let a failure be answered with something that looks like success** —
   an SPA fallback in place of an unreachable backend, a compressed body labelled
   as text, an internal hostname in otherwise valid metadata, a background loop

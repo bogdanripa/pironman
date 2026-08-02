@@ -1,0 +1,18 @@
+#!/bin/sh
+# Append every container destroy event to a durable log.
+#
+# Docker's own event stream is in-memory and rolls over within minutes, so a
+# container that vanishes overnight leaves nothing behind to explain it. That
+# gap turned one vanished container into a multi-hour reconstruction; this is
+# the record that makes the next one a single grep.
+#
+# The shell lives here rather than inline in the unit's ExecStart because
+# systemd expands $VAR itself: inline, it consumed both the timestamp subshell
+# and the loop variable and logged garbage.
+LOG=/var/log/docker-destroy.log
+exec /usr/bin/docker events \
+    --filter type=container --filter event=destroy \
+    --format '{{.Actor.Attributes.name}} image={{.Actor.Attributes.image}}' \
+  | while IFS= read -r line; do
+      printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >> "$LOG"
+    done

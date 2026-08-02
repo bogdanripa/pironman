@@ -139,7 +139,8 @@ counted as one person across apps. Use analytics_overview for headline numbers
 (unique visitors, DAU/WAU/MAU, a humans-vs-bots split, and a per-app breakdown
 when no app is given), analytics_timeseries for a daily line chart,
 analytics_cohorts for retention, analytics_agents for the top user-agents, and
-analytics_recent for a live tail of the most recent HTTP requests. apps_stats
+analytics_recent for a live tail of the most recent HTTP requests, each with the
+caller's real IP — the one place a raw address is reported. apps_stats
 gives the live infra view (running state, CPU/RAM, disk, DB size, and request
 error rate / latency percentiles). A human-facing dashboard of all of this runs
 as its own frontend-only app at https://dashboard-coolify.bogdanripa.com — it
@@ -292,6 +293,18 @@ async def _autoupdate_loop():
     control plane that redeploys more often than hourly restarts the timer every
     time and can go indefinitely without ever sweeping, while looking perfectly
     healthy."""
+    # The Sablier repair is the exception to that delay and runs BEFORE the first
+    # sleep. What makes the sweep expensive is pulling every watched image; this
+    # is one `docker ps -a` per sleeping app, so there is nothing to save by
+    # postponing it. What it repairs is an app whose container is gone, which
+    # cannot wake and serves 502s for every second it waits — and on a box that
+    # redeploys this control plane more often than hourly, the timer below resets
+    # before the sweep ever fires, so a repair left behind it would never run at
+    # all. Startup is also when it is most likely to be needed.
+    try:
+        await sablier.reconcile()
+    except Exception:
+        _swallow("sablier reconcile (startup)")
     while True:
         await asyncio.sleep(3600)
         try:
