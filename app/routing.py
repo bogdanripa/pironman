@@ -169,6 +169,27 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
     base = await sablier._current_labels(uuid)
     if not base:
         raise sablier.NoContainer(app_id)
+    # Whether an app MAY sleep is not the caller's to decide. Every other path
+    # asks sablier.excluded() — is_fronted(), the _FRONTED filter, reconcile() —
+    # and this one took `sleeps` on trust, which is how the control plane came to
+    # be enrolled in scale-to-zero.
+    #
+    # The route in was the _DEFRONTED repair pass. `api` is dropped from _FRONTED
+    # precisely BECAUSE it is excluded, which puts it in the complement, where
+    # this function was called with sleeps=True straight off its sleep_when_idle
+    # column. The exclusion that exists to keep it awake is what delivered it to
+    # the one caller that ignored the exclusion.
+    #
+    # It fails the worst possible way. Sablier stops the control plane five
+    # minutes after the last request; Traefik drops the router of a stopped
+    # container; and the control plane is the one app the static host does not
+    # front, so no request can reach Sablier to wake it. It cannot come back on
+    # its own, and "stopped" is indistinguishable from a healthy idle app (§9c).
+    #
+    # Structural, not advisory: with this here no caller can enroll an excluded
+    # app whatever its row says, and the next sync strips the labels off one that
+    # already is.
+    sleeps = sleeps and not sablier.excluded(app_id)
     desired = (sablier.enrolled_labels(base, app_id) if sleeps
                else sablier.stripped(base, app_id))
     desired = (scoped(desired, app_id) if fronted
