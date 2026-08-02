@@ -11,10 +11,10 @@ from pydantic import BaseModel, Field
 from ..auth import require_key
 from ..db import pool
 from ..locks import app_lock
-from .. import coolify, envs
+from .. import apperr, coolify, envs
 
 # Columns sync_env needs to recompose an app's environment and redeploy it.
-_APP_COLS = "id, coolify_uuid, db_engine, db_user, db_password, db_name"
+_APP_COLS = ("id, coolify_uuid, has_frontend, db_engine, db_user, db_password, db_name")
 
 shared_router = APIRouter(prefix="/env", tags=["env"],
                           dependencies=[Depends(require_key)])
@@ -138,10 +138,9 @@ async def _require_app_row(conn, app_id: str, needs_container: bool = False):
     if not row:
         raise HTTPException(404, "no such app")
     if needs_container and not row["coolify_uuid"]:
-        raise HTTPException(
-            400, "this is a frontend-only app: it has no container, so it has no "
-                 "environment to set. Static files are served as they are — put "
-                 "configuration in the bundle, or give the app a backend.")
+        raise HTTPException(400, apperr.no_container(
+            app_id, row, "it has no environment to set",
+            "Put configuration in the bundle, or give the app a backend."))
     return row
 
 

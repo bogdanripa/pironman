@@ -6,7 +6,8 @@ from ..auth import require_key, mint_key
 from ..db import pool
 from ..locks import app_lock
 from ..config import app_url, app_fqdn, CONTROL_PLANE_APP
-from .. import coolify, provision, envs, autoupdate, sablier, frontends, routing, stats
+from .. import (apperr, coolify, provision, envs, autoupdate, sablier,
+                frontends, routing, stats)
 from ..provision import SLUG_RE
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
@@ -492,7 +493,8 @@ async def app_logs(app_id: str, tail: int = 200):
     """
     tail = max(1, min(tail, 2000))
     async with pool().acquire() as c:
-        row = await c.fetchrow("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
+        row = await c.fetchrow(
+            "SELECT coolify_uuid, has_frontend FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
     if not row["coolify_uuid"]:
@@ -709,14 +711,15 @@ async def set_sleep(app_id: str, body: Sleep):
         raise HTTPException(
             400, f"{app_id} is the control plane and must never sleep")
     async with pool().acquire() as c:
-        row = await c.fetchrow("SELECT coolify_uuid FROM apps WHERE id = $1", app_id)
+        row = await c.fetchrow(
+            "SELECT coolify_uuid, has_frontend FROM apps WHERE id = $1", app_id)
         if not row:
             raise HTTPException(404, "no such app")
         if not row["coolify_uuid"]:
-            raise HTTPException(
-                400, "this is a frontend-only app: it has no container to sleep. "
-                     "Its assets are served by the shared frontend host, which "
-                     "stays warm.")
+            raise HTTPException(400, apperr.no_container(
+                app_id, row, "it has no container to sleep",
+                "Its assets are served by the shared frontend host, which stays "
+                "warm."))
         # Turning sleep ON means the static host must already hold this app's
         # hostname, or the first time it sleeps nothing can wake it. Route first,
         # then write the labels — one write, covering both the enrollment and the

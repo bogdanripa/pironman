@@ -128,6 +128,13 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                 with:
                   platforms: linux/arm64
                   push: true
+                  # So the image can report which commit it is running. A health
+                  # endpoint that answers "unknown" cannot tell you whether a
+                  # deploy actually landed, which is exactly when you want to
+                  # know. Ignored harmlessly if the Dockerfile declares no such
+                  # ARG.
+                  build-args: |
+                    GIT_SHA=${{{{ github.sha }}}}
                   tags: |
                     ghcr.io/{GHCR_OWNER}/{repo_name}:latest
                     ghcr.io/{GHCR_OWNER}/{repo_name}:${{{{ steps.tag.outputs.value }}}}
