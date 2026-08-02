@@ -41,9 +41,14 @@ metadata, `WWW-Authenticate` challenges and redirects — none of which resolve.
 Keeping the real hostname end-to-end means an app cannot tell it is behind the
 static host, which is the only way absolute URLs can be right.
 """
+import logging
+
 from . import coolify, frontends, sablier
 from .config import DOMAIN_SUFFIX, STATIC_HOST_APP
+from .db import pool
 from .locks import ROUTING_LOCK, app_lock
+
+_log = logging.getLogger("pironman.routing")
 
 WEB_APP_ID = STATIC_HOST_APP
 _PREFIX = "traefik.http.routers.fe-"
@@ -198,6 +203,24 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
         return False
     await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()],
                                     app_id=app_id)
+    # Keep the registry honest about what was just written. `sablier_enrolled` is
+    # what every human-facing answer reads — apps_sablier, the app detail view,
+    # _sleep_app — while the LABELS are what Sablier actually acts on. This
+    # function wrote the labels and never touched the column, so the two could
+    # disagree, and today they did: `api` was carrying a full enrollment and
+    # sleeping every five minutes while the platform reported it as not enrolled.
+    # Anyone who checked the column would have concluded the app was fine.
+    #
+    # Best-effort, and after the labels rather than before: the labels are the
+    # operative fact, so a column that fails to follow is a stale answer, while a
+    # column written for labels that never landed is a wrong one.
+    try:
+        async with pool().acquire() as c:
+            await c.execute("UPDATE apps SET sablier_enrolled = $1 WHERE id = $2",
+                            sleeps, app_id)
+    except Exception:
+        _log.warning("wrote sablier labels for %s but could not set "
+                     "sablier_enrolled=%s", app_id, sleeps, exc_info=True)
     # Name the label change, not the function. "enrolled in sablier" is the line
     # that would have ended today's outage in one read; "apply_backend_labels ran"
     # would have said nothing. Enrollment in particular is worth spelling out
