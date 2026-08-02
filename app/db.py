@@ -1,6 +1,13 @@
 import json
+import re
+
 import asyncpg
-from .config import PAAS_DB, STATIC_HOST_APP
+from .config import PAAS_DB, SABLIER_EXCLUDE, STATIC_HOST_APP
+
+# These ids are interpolated into the repair statements below, so they are
+# constrained rather than trusted: they come from an env var, and an app id
+# with a quote in it would be a SQL injection into the platform's own boot.
+_SAFE_ID = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 _pool: asyncpg.Pool | None = None
 
@@ -216,6 +223,21 @@ _REPAIRS = [
     # refuses to enrol it regardless; this stops the row from claiming otherwise.
     f"""UPDATE apps SET sleep_when_idle = false, sablier_enrolled = false
         WHERE id = '{STATIC_HOST_APP}' AND sleep_when_idle""",
+
+    # Everything else sablier.excluded() covers — the control plane — for the
+    # same reason and a sharper one. `api` sat at sleep_when_idle = true all
+    # along, harmless only while every caller asked excluded() first. One did
+    # not: the _DEFRONTED repair read the column, believed it, and enrolled the
+    # control plane in scale-to-zero, after which it slept five minutes after
+    # every request and could not wake itself, because nothing fronts it.
+    #
+    # excluded() outranks the column everywhere now, so this is not what makes
+    # the platform correct. It removes the bait — a row that says the one app
+    # that must never sleep would like to sleep, waiting for the next reader who
+    # forgets to ask.
+    *[f"""UPDATE apps SET sleep_when_idle = false, sablier_enrolled = false
+          WHERE id = '{a}' AND sleep_when_idle"""
+      for a in sorted(SABLIER_EXCLUDE) if _SAFE_ID.fullmatch(a)],
 ]
 
 
