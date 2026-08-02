@@ -136,6 +136,52 @@ function fmtMb(v) {
 // "how long ago", which is the question being asked — an absolute timestamp
 // would have to be subtracted from now by eye. The exact local time is the cell
 // title, so the precise answer is one hover away when it matters.
+// How long the current state has been the case, as a phrase. Separate from
+// ago(): that answers "when was this app last used", this answers "how long has
+// its container been in the state shown" — which for an app with a frontend AND
+// a backend are different questions with different answers. The bundle is served
+// from the CDN without waking anything, so an app can be accessed constantly
+// while its backend sleeps for a day.
+function statusTitle(state, since, kind) {
+  const when = since ? exact(since) : null;
+  const dur  = since ? ' (' + span(since) + ')' : '';
+  const both = kind === 'both';
+  switch (state) {
+    case 'running':
+      return when ? 'running since ' + when + dur
+                  : 'running (start time unavailable)';
+    case 'asleep':
+      return (when ? 'asleep since ' + when + dur
+                   : 'asleep (stopped time unavailable)') +
+             '\nStopped while idle; the next request wakes it.' +
+             (both ? '\nNote: “Last accessed” counts frontend traffic too, which '
+                   + 'the CDN serves without waking the backend.' : '');
+    case 'stopped':
+      return (when ? 'stopped since ' + when + dur
+                   : 'stopped (time unavailable)') +
+             '\nNot running and not asleep — the deploy failed, was rolled back, '
+             + 'or it crashed.';
+    case 'static':
+      return 'No container of its own — the bundle is served by the shared '
+           + 'frontend host, so there is nothing to start or stop.';
+    default:
+      return '';
+  }
+}
+
+// Elapsed time as a bare duration ("18 hours", "3 days"), for use inside a
+// sentence — ago() returns "18 hours ago", which does not read well after
+// "since <date>".
+function span(iso) {
+  const s = (Date.now() - Date.parse(iso)) / 1000;
+  if (!isFinite(s) || s < 0) return 'just now';
+  const m = s / 60, h = s / 3600, d = s / 86400;
+  if (s < 90) return 'under a minute';
+  if (m < 90) return Math.round(m) + ' minutes';
+  if (h < 36) return Math.round(h) + ' hours';
+  return Math.round(d) + ' days';
+}
+
 function ago(iso) {
   if (!iso) return '<span class="muted">never</span>';
   const s = (Date.now() - Date.parse(iso)) / 1000;
@@ -218,12 +264,16 @@ function renderResources(data) {
     return '<tr>' +
       `<td>${esc(a.id)}</td>` +
       `<td style="white-space:nowrap">${part(has('frontend'), 'FE')}${part(has('backend'), 'BE')}</td>` +
-      `<td>${({
+      (() => {
+        const st = a.state || (a.running === null ? 'static' : a.running ? 'running' : 'stopped');
+        const label = {
           static:  '<span class="muted">static</span>',
           running: '<span class="dot up"></span>running',
           asleep:  '<span class="dot sleep"></span>asleep',
           stopped: '<span class="dot down"></span>stopped',
-        })[a.state || (a.running === null ? 'static' : a.running ? 'running' : 'stopped')]}</td>` +
+        }[st];
+        return `<td title="${esc(statusTitle(st, a.state_since, kind))}">${label}</td>`;
+      })() +
       `<td class="n">${a.cpu_pct != null ? a.cpu_pct + '%' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${a.mem_mb != null ? a.mem_mb.toLocaleString() + ' MB' : '<span class="muted">—</span>'}</td>` +
       `<td class="n">${fmtMb(a.disk_rw_mb)}</td>` +

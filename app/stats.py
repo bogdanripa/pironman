@@ -180,6 +180,42 @@ async def _perf_map(conn, days: int) -> dict[str, dict]:
     return out
 
 
+async def _lifecycle() -> dict[str, dict]:
+    """name -> {state, since} for EVERY container, running or not.
+
+    Deliberately not derived from _container_stats, which lists only running
+    containers — the stopped ones are exactly the interesting case here. A
+    sleeping app's container still exists; it simply is not up, and Docker
+    records when it went down.
+
+    `since` is StartedAt for a running container and FinishedAt for a stopped
+    one, i.e. when the state now being reported actually began. Two calls, not
+    one per container: list the names, then inspect them all at once.
+    """
+    _, names_out = await autoupdate._docker(
+        "ps", "-a", "--format", "{{.Names}}", timeout=30)
+    names = [n for n in names_out.splitlines() if n.strip()]
+    if not names:
+        return {}
+    _, out = await autoupdate._docker(
+        "inspect", *names, "--format",
+        "{{.Name}}\t{{.State.Status}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}",
+        timeout=40)
+    res: dict[str, dict] = {}
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) != 4:
+            continue
+        name, status, started, finished = p[0].lstrip("/"), p[1], p[2], p[3]
+        since = started if status == "running" else finished
+        # Docker writes a zero time for a container that has never stopped;
+        # reporting 0001-01-01 as "asleep since" would be worse than saying
+        # nothing, so drop it.
+        res[name] = {"state": status,
+                     "since": None if since.startswith("0001-01-01") else since}
+    return res
+
+
 async def app_runtime(uuid: str | None, sleeps: bool = False) -> dict:
     """Live state for ONE app: is its container up, and what is it using right now.
 
@@ -228,6 +264,7 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
 
     stats = await _container_stats()
     disk = await _disk_sizes()
+    life = await _lifecycle()
     names = list(stats.keys())
 
     async def db_mb(app) -> float | None:
@@ -270,6 +307,15 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
             "db_size_mb": await db_mb(app),
             # Null means "never seen in the access log" — a brand-new app, or one
             # that has had no traffic since ingestion started.
+            # When the state above began — StartedAt if running, FinishedAt if
+            # not. Distinct from last_seen on purpose: for an app with a frontend
+            # AND a backend, last_seen is edge traffic, which the static bundle
+            # answers from the CDN without waking anything. So "accessed 2 hours
+            # ago" and "backend asleep since yesterday" are both true at once,
+            # and only this field says the second.
+            "state_since": (next((v["since"] for n, v in life.items()
+                                  if uuid and uuid in n), None)
+                            if has_backend else None),
             "last_seen": last_seen.get(app["id"]),
             "traffic": perf.get(app["id"], {
                 "requests": 0, "error_pct": 0, "server_error_pct": 0,
