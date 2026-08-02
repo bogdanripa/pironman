@@ -511,6 +511,23 @@ guards, each blocking a distinct way this could strand an app:
   explicitly when a backend first appears — so every app made through the MCP tools
   sleeps. `apps_update sleep_when_idle=false` is the deliberate opt-out afterwards,
   and it is how an app is marked always-on alongside the `SABLIER_EXCLUDE` set.
+- **Un-fronting an app must un-scope its backend, and that is an active write.**
+  A backend-only app — no bundle, no redirects — is in `_FRONTED` for exactly one
+  reason: `sleep_when_idle = true`. So `apps_update sleep_when_idle=false` on such
+  an app is *also* an un-fronting, and the static host drops its router for that
+  hostname. `scoped()` had no inverse, and every label write is a
+  read-modify-write of the container's **live** labels — so skipping `scoped()`
+  did not remove a marker already written, it only declined to add it again. The
+  app was left with a router demanding `X-Pironman-Backend` from a static host
+  that no longer forwards to it: reachable by nobody, while `docker ps` reports
+  healthy and the container answers 200 on its own container IP. `unscoped()` is
+  that inverse, and `_sync` walks `_DEFRONTED` — deployed backends the static host
+  does not hold — to repair any that already drifted.
+
+  This is the same hazard as the ordering rule above, one step later in the
+  lifecycle: getting a backend safely *onto* the marker is not enough if nothing
+  ever takes it back off. Anything that changes what `is_fronted()` returns has to
+  end in a matching label write, never in an omission.
 
 > Verify enrollment on one app (`apps_sablier <app> true`) — confirm it sleeps
 > when idle and wakes on request — **before** flipping `SABLIER_AUTO_ENROLL` on,

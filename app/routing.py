@@ -120,6 +120,34 @@ def scoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
     return out
 
 
+def unscoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
+    """The inverse of `scoped()`: the marker condition removed from every router
+    rule, and the priority `scoped()` added dropped along with it.
+
+    This is not symmetry for its own sake. `scoped()` writes the marker into the
+    container's **live** labels, and every later write is a read-modify-write of
+    those. So an app that stops being fronted does not lose the marker merely by
+    having `scoped()` skipped — the marker is already there, and skipping only
+    declines to add it a second time. Without this inverse the rule goes on
+    demanding a header that the static host no longer sends, and the app answers
+    nobody on its own hostname.
+
+    Idempotent: a rule with no marker comes back unchanged.
+    """
+    marker = _marker_term()
+    out: dict[str, str] = {}
+    for k, v in labels.items():
+        if k.startswith("traefik.http.routers.") and k.endswith(".priority") \
+                and v == BACKEND_PRIORITY:
+            rule = labels.get(k[: -len(".priority")] + ".rule", "")
+            if marker in rule:
+                continue  # this priority exists only because of the marker
+        if k.startswith("traefik.http.routers.") and k.endswith(".rule"):
+            v = v.replace(f" && {marker}", "").replace(f"{marker} && ", "")
+        out[k] = v
+    return out
+
+
 async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
                                fronted: bool) -> bool:
     """Write everything the platform stamps on a backend's container labels, in
@@ -134,15 +162,17 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
 
     `fronted` must be true whenever the static host holds this app's hostname:
     scoping a backend that nothing fronts makes it unreachable, since the marker
-    header would never be sent.
+    header would never be sent. `fronted=False` actively *removes* the marker
+    rather than merely not adding it — see `unscoped()` for why that distinction
+    is the whole bug.
     """
     base = await sablier._current_labels(uuid)
     if not base:
         raise sablier.NoContainer(app_id)
     desired = (sablier.enrolled_labels(base, app_id) if sleeps
                else sablier.stripped(base, app_id))
-    if fronted:
-        desired = scoped(desired, app_id)
+    desired = (scoped(desired, app_id) if fronted
+               else unscoped(desired, app_id))
     if desired == base:
         return False
     await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()],
@@ -169,6 +199,15 @@ _FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle, spa "
             "  OR jsonb_array_length(redirects) > 0 "
             "  OR (coolify_uuid IS NOT NULL AND sleep_when_idle = true)) "
             "ORDER BY id")
+
+# The complement: deployed backends the static host does NOT front. They must
+# carry no marker, or they answer nobody. Passed the fronted ids rather than
+# re-deriving them so the two sets cannot disagree mid-sync.
+_DEFRONTED = ("SELECT id, coolify_uuid, sleep_when_idle "
+              "FROM apps "
+              "WHERE id <> $1 AND coolify_uuid IS NOT NULL "
+              "  AND NOT (id = ANY($2::text[])) "
+              "ORDER BY id")
 
 
 async def sync_frontend_routes(conn, scope_backends: bool = True) -> dict:
@@ -262,7 +301,27 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
         except Exception:
             pass  # leave its public router alone; the next sync retries
 
-    out = {"routed": app_ids, "changed": changed, "scoped": scoped_ids}
+    # Apps that have STOPPED being fronted. Nothing else revisits them: the loop
+    # above only walks apps the static host currently holds, so an app that drops
+    # out of _FRONTED keeps the marker on its rule forever and is unreachable by
+    # anyone — the static host no longer forwards to it, and its own router still
+    # demands the header. A backend-only app qualifies for fronting solely via
+    # sleep_when_idle, so simply turning sleeping OFF is enough to strand it.
+    unscoped_ids = []
+    for r in (await conn.fetch(_DEFRONTED, WEB_APP_ID, app_ids)
+              if scope_backends else []):
+        try:
+            if await apply_backend_labels(r["id"], r["coolify_uuid"],
+                                          sleeps=bool(r["sleep_when_idle"]),
+                                          fronted=False):
+                unscoped_ids.append(r["id"])
+        except sablier.NoContainer:
+            pass  # never deployed; nothing to repair
+        except Exception:
+            pass  # next sync retries
+
+    out = {"routed": app_ids, "changed": changed, "scoped": scoped_ids,
+           "unscoped": unscoped_ids}
     if readonly is not None:
         out["labels_readonly"] = readonly
     return out
