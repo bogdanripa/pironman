@@ -234,7 +234,15 @@ def _diagnose(t: dict) -> str:
                 f"*{DOMAIN_SUFFIX}* host with a usable client identity — check "
                 "that the access log still keeps RequestHost, User-Agent and "
                 "Cf-Connecting-Ip.")
-    return "Every line is older than the cursor, which is the normal quiet case."
+    # Reached only once the caught-up cases above have been ruled out, so the
+    # read HAS moved past the cursor and this pass simply found nothing worth
+    # counting in what it moved over — bot hits on the bare IP, hostnames this
+    # platform does not own. The old wording, "the normal quiet case", was
+    # accurate but was printed under a warning about a cursor tens of minutes
+    # behind, and the two together read as an incident. The quiet case no longer
+    # reaches here at all; this branch is the narrower one.
+    return ("The read did advance past the cursor, so this window held only "
+            "traffic that belongs to no hosted app.")
 
 
 def _stamp_of(line: str) -> str:
@@ -428,15 +436,29 @@ async def ingest_once() -> dict:
             # line equals the cursor, never precedes it — so the read returned
             # the START of the log instead of the end. Lower MAX_LINES.
             #
-            # Note the condition, which a first attempt got wrong: "the window
-            # was full and nothing in it was newer" is NOT this. The proxy log
-            # is permanently longer than MAX_LINES, so every window is full, and
-            # a quiet two minutes legitimately contains nothing newer. That
-            # version fired five times against a perfectly healthy ingester.
+            # Note the condition, which two attempts have now got wrong. It is
+            # strictly OLDER, and neither "the window was full and nothing in it
+            # was newer" nor "nothing newer for a long time" is that. The proxy
+            # log is permanently longer than MAX_LINES, so every window is full;
+            # and an idle box legitimately produces nothing newer for hours. The
+            # first version fired five times against a healthy ingester; the
+            # second widened it to `<=` gated on _STALL_AFTER and would have
+            # fired on every idle stretch over fifteen minutes.
             _log.warning(
                 "analytics: the newest line read (%s) is OLDER than the cursor "
                 "(%s) — the read is returning the start of the log, not the "
                 "end. Lower MAX_LINES.", newest_line, cursor)
+        elif newest_line and cursor and newest_line <= cursor:
+            # Caught up, and the proxy has emitted nothing since. There is no
+            # fault here to report: the cursor is old because the BOX is idle,
+            # not because ingestion is stuck. Saying anything louder than this
+            # is what the previous code got wrong — it warned "the cursor is 35
+            # minutes behind", which measures how long since the last request,
+            # not how long since ingestion last worked. On a personal box that
+            # can be hours, and the alarm cost an hour of chasing a rotation bug
+            # that was not there.
+            _log.debug("analytics: caught up at %s; no new access-log lines "
+                       "since (%.0f minutes)", cursor, behind / 60)
         elif behind > _STALL_AFTER:
             _log.warning(
                 "analytics: nothing counted and the cursor is %.0f minutes behind "
