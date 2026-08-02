@@ -4,7 +4,7 @@ the static path never collides with /apps/{app_id}."""
 from fastapi import APIRouter, Depends, Query
 
 from ..auth import require_key
-from .. import heartbeat, stats
+from .. import events, heartbeat, stats
 
 router = APIRouter(prefix="/stats", tags=["stats"],
                    dependencies=[Depends(require_key)])
@@ -74,3 +74,27 @@ async def tasks_health():
                  "stalled: " + ", ".join(stalled) + " — these are not doing "
                  "their work, whatever the container status says"),
     }
+
+
+@router.get("/events", operation_id="platform_events",
+            summary="Why the platform recycled a container, and when")
+async def platform_events(
+    limit: int = Query(100, ge=1, le=500, description="How many events, newest first"),
+    app_id: str | None = Query(None, description="Scope to one app; omit for all"),
+):
+    """Every redeploy and every sleep this platform decided on, newest first,
+    each with the reason it decided — "the digest behind X moved", "enrolled in
+    sablier", "the container was gone".
+
+    Read this first when a container restarted and nothing explains it. It is the
+    only account that outlives the container: a Coolify deploy builds a NEW one,
+    so `docker logs` on what is running now cannot contain the deploy that
+    replaced it.
+
+    The one recycle it CANNOT show is a container stopped by Sablier, which is a
+    separate process acting on labels. What it shows instead is the decision
+    upstream of that — the write that put the enrollment on the container — so
+    an app that started sleeping unexpectedly is explained by the "enrolled in
+    sablier" row, not by a stop event.
+    """
+    return {"events": await events.recent(limit, app_id)}

@@ -16,7 +16,7 @@ when the tag's digest actually moved.
 """
 import asyncio
 
-from . import coolify, envs
+from . import coolify, envs, events
 from .config import GHCR_USER, GHCR_TOKEN, SABLIER_AUTO_ENROLL, app_fqdn
 from .db import pool
 
@@ -215,7 +215,8 @@ async def apply_image(app_id: str, image: str) -> dict:
         await coolify.set_image(row["coolify_uuid"], image)
         await envs.sync_env(c, row["coolify_uuid"], app_id, row["db_engine"],
                             row["db_user"], row["db_password"], row["db_name"])
-        await coolify.deploy(row["coolify_uuid"])
+        await coolify.deploy(row["coolify_uuid"], app_id=app_id,
+                             reason=f"code update: image set to {image}")
         # Keep auto-update following the new tag (only if it was already on) — and
         # turn it on for a backend that has just been added.
         watch = (tag_of(image)
@@ -272,7 +273,10 @@ async def check_and_update(conn, app, verify: bool = False) -> dict:
     await coolify.set_image(app["coolify_uuid"], ref)
     await envs.sync_env(conn, app["coolify_uuid"], app["id"], app["db_engine"],
                         app["db_user"], app["db_password"], app["db_name"])
-    await coolify.deploy(app["coolify_uuid"])
+    await coolify.deploy(
+        app["coolify_uuid"], app_id=app["id"],
+        reason=f"auto-update: the digest behind {ref} moved",
+        )
     await conn.execute(
         "UPDATE apps SET image = $1, deployed_digest = $2 WHERE id = $3",
         ref, digest, app["id"])
@@ -350,6 +354,14 @@ async def sleep_after_deploy(app) -> dict | None:
     if not name:
         return None
     rc, out = await _docker("stop", name, timeout=90)
+    # The other half of the recycle record. A deploy leaves a new container to
+    # ask questions of; a stop leaves nothing running at all, and its router
+    # disappears with it — so "why is this app not answering" has no local
+    # evidence unless it was written down before the container went away.
+    await events.record(
+        app["id"], "stop" if rc == 0 else "stop_failed",
+        "put to sleep after a deploy: sleep_when_idle is on and it is enrolled",
+        container=name, **({} if rc == 0 else {"error": out.strip()[:200]}))
     return {"slept": rc == 0, "container": name,
             **({} if rc == 0 else {"error": out.strip()[:200]})}
 

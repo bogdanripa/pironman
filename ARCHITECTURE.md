@@ -220,6 +220,28 @@ uvicorn captures, so `apps_logs api` shows it — and the healthcheck's own
 successful access-log lines are filtered out, or the 10-second cadence would push
 that traceback out of `--tail` within about two minutes.
 
+**A recycle must outlive the container it recycles.** The two rules above both
+end in `apps_logs api`, and that reader has a blind spot: a Coolify deploy builds
+a **new** container, so the control plane's stdout is destroyed by precisely the
+event most worth reading about. `api` was silently enrolled in scale-to-zero one
+morning and thereafter slept five minutes after every request, unable to wake
+itself; reconstructing why took a container log that later restarts had already
+rotated away, the proxy access log, and `docker inspect` of the labels.
+
+So every recycle the platform *decides on* is written to `platform_events` in
+Postgres before it happens — `app/events.py`, read with `platform_events`. It is
+the same argument as `task_heartbeat`: the reader that matters is outside the
+process, and here outside the container too. `coolify.deploy()` requires
+`app_id` and `reason` as keyword arguments, which is the enforcement — the only
+path that recycles a container cannot be called without saying why, so a new
+caller cannot recycle anonymously by forgetting. Reasons are prose for a stranger
+weeks later ("the digest behind X moved", "enrolled in sablier — it will now
+sleep when idle"), not function names.
+
+The limit is worth knowing: a container stopped by **Sablier** is not ours and
+does not appear. What appears is the decision upstream of it — the label write
+that enrolled the app — which is what the morning above actually needed.
+
 ### 5b. Getting out of the container (`host_run_script`)
 
 The control plane is a container, so a host-level shell is not a `subprocess` —

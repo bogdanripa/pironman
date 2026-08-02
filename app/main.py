@@ -6,7 +6,7 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool, pool
-from . import heartbeat, autoupdate, analytics, alerts, routing, sablier
+from . import heartbeat, autoupdate, analytics, alerts, events, routing, sablier
 from .cors import CorsMiddleware
 from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
@@ -368,6 +368,7 @@ async def lifespan(_: FastAPI):
     # invisible to every reader, which is how a dead cron dispatcher went
     # unnoticed while the watchdog reported everything current.
     await heartbeat.register()
+    await events.trim()  # bound the recycle log; best-effort, never fatal
     await _sync_routes("startup")
     tasks = [asyncio.create_task(_autoupdate_loop()),
              asyncio.create_task(_analytics_loop()),

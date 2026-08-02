@@ -6,6 +6,7 @@ injection misbehaves, check these first against /docs in a browser.
 """
 import base64
 import httpx
+from . import events
 from .config import (
     COOLIFY_URL, COOLIFY_TOKEN, COOLIFY_PROJECT, COOLIFY_SERVER,
     COOLIFY_DESTINATION, COOLIFY_ENV_NAME,
@@ -174,7 +175,21 @@ async def set_custom_labels(uuid: str, labels: list[str],
     return {"readonly": False}
 
 
-async def deploy(uuid: str) -> None:
+async def deploy(uuid: str, *, app_id: str, reason: str) -> None:
     """VERIFIED. POST /deploy?uuid= — confirmed both by hand and by the recursive
-    self-deploy, which queued and completed a redeploy of paas-api."""
+    self-deploy, which queued and completed a redeploy of paas-api.
+
+    `app_id` and `reason` are required, and required on purpose. This is the only
+    way the platform recycles a container, so it is the one place that can
+    guarantee a recycle is never anonymous — a new caller cannot forget to say
+    why, because it cannot call this without saying why. Write `reason` for
+    someone reading it weeks later with no memory of the code path.
+
+    The record is written first and is best-effort: it must not be able to stop a
+    deploy, and a deploy that happened without a row is a worse outcome than a
+    row for a deploy that then failed. Before, not after, because the deploy of
+    the control plane ends this process — an `await` placed after it may never
+    run, which is exactly the case worth recording.
+    """
+    await events.record(app_id, "deploy", reason, uuid=uuid)
     await _request("POST", "/deploy", params={"uuid": uuid})

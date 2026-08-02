@@ -179,6 +179,23 @@ CREATE TABLE IF NOT EXISTS task_heartbeat (
     last_error_at timestamptz,
     stale_after_s int NOT NULL
 );
+
+-- Every container this platform recycles, and why. Here for the same reason
+-- task_heartbeat is: the reader that matters is outside the process. More
+-- pointedly, a Coolify deploy builds a NEW container, so the control plane's
+-- stdout is destroyed by precisely the event worth recording. Postgres survives
+-- it. `reason` is prose aimed at whoever reads this weeks later; `detail` is for
+-- anything structured. See app/events.py.
+CREATE TABLE IF NOT EXISTS platform_events (
+    id     bigserial PRIMARY KEY,
+    at     timestamptz NOT NULL DEFAULT now(),
+    app_id text NOT NULL,
+    action text NOT NULL,
+    reason text NOT NULL,
+    detail jsonb
+);
+CREATE INDEX IF NOT EXISTS platform_events_at ON platform_events (at DESC);
+CREATE INDEX IF NOT EXISTS platform_events_app ON platform_events (app_id, at DESC);
 """
 
 

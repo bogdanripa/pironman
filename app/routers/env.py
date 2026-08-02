@@ -54,7 +54,9 @@ async def _apply(conn, row, redeploy: bool) -> None:
         await envs.sync_env(conn, row["coolify_uuid"], row["id"], row["db_engine"],
                             row["db_user"], row["db_password"], row["db_name"])
         if redeploy:
-            await coolify.deploy(row["coolify_uuid"])
+            await coolify.deploy(
+                row["coolify_uuid"], app_id=row["id"],
+                reason="environment variables changed")
 
 
 # --- shared: env_* ---------------------------------------------------------

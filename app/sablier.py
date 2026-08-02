@@ -160,7 +160,11 @@ async def reconcile() -> list[dict]:
                 # leave re-enrollment to the next pass, since the labels this
                 # reconciles are read off a container that does not exist yet.
                 if not await autoupdate._container_name(app["coolify_uuid"]):
-                    await coolify.deploy(app["coolify_uuid"])
+                    await coolify.deploy(
+                        app["coolify_uuid"], app_id=app["id"],
+                        reason="sablier reconcile: the container was gone, so "
+                               "the app could never wake — redeployed to "
+                               "recreate it")
                     out.append({"id": app["id"], "redeployed": True,
                                 "reason": "no container — the app could not wake"})
                     continue

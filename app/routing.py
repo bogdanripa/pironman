@@ -198,7 +198,25 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
         return False
     await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()],
                                     app_id=app_id)
-    await coolify.deploy(uuid)
+    # Name the label change, not the function. "enrolled in sablier" is the line
+    # that would have ended today's outage in one read; "apply_backend_labels ran"
+    # would have said nothing. Enrollment in particular is worth spelling out
+    # because its consequence is invisible: the app keeps working until it has
+    # been idle five minutes, and then stops, and stopped is what a healthy
+    # sleeping app looks like.
+    was, now_ = sablier.is_enrolled(base, app_id), sablier.is_enrolled(desired, app_id)
+    marker, changes = _marker_term(), []
+    if was != now_:
+        changes.append("enrolled in sablier — it will now sleep when idle"
+                       if now_ else "unenrolled from sablier — it will stay awake")
+    scoped_before = any(marker in v for k, v in base.items() if k.endswith(".rule"))
+    scoped_after = any(marker in v for k, v in desired.items() if k.endswith(".rule"))
+    if scoped_before != scoped_after:
+        changes.append("scoped behind the static host" if scoped_after
+                       else "un-scoped — it answers its own hostname again")
+    await coolify.deploy(
+        uuid, app_id=app_id,
+        reason="; ".join(changes) or "container labels rewritten")
     return True
 
 
@@ -297,7 +315,10 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
             res = await coolify.set_custom_labels(
                 web["coolify_uuid"], [f"{k}={v}" for k, v in desired.items()],
                 app_id=WEB_APP_ID)
-            await coolify.deploy(web["coolify_uuid"])
+            await coolify.deploy(
+                web["coolify_uuid"], app_id=WEB_APP_ID,
+                reason=f"static host routers re-derived for {len(app_ids)} "
+                       f"fronted app(s): {', '.join(app_ids) or 'none'}")
             readonly = res.get("readonly", False)
             # Wait for the new routers to actually exist before taking any
             # backend off its public hostname. Scoping into a static host that is

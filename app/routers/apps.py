@@ -631,7 +631,10 @@ async def attach_db(app_id: str, body: AttachDb):
         await envs.sync_env(c, row["coolify_uuid"], app_id, body.db_engine,
                             db_info["user"], db_info["password"],
                             db_info["database"])
-    await coolify.deploy(row["coolify_uuid"])
+    await coolify.deploy(
+        row["coolify_uuid"], app_id=app_id,
+        reason=f"attached a {body.db_engine} database, so its connection "
+               f"variables had to reach the container")
     return {"id": app_id, "db_engine": body.db_engine,
             "db_url": await provision.compose_url(
                 body.db_engine, db_info["user"], db_info["password"],
@@ -665,7 +668,9 @@ async def detach_db(app_id: str):
             "db_name=NULL WHERE id=$1", app_id)
         await envs.sync_env(c, row["coolify_uuid"], app_id,
                             None, None, None, None)
-    await coolify.deploy(row["coolify_uuid"])
+    await coolify.deploy(
+        row["coolify_uuid"], app_id=app_id,
+        reason="detached its database, so the connection variables had to go")
     return {"id": app_id, "detached": True}
 
 
