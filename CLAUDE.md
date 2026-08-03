@@ -35,6 +35,7 @@ was false:
 | `analytics_last_seen` lists only live apps (ARCHITECTURE.md said so) | It holds deleted apps too — `pingpong` and `analytics` are in it with no `apps` row. Only the `apps` table answers "does this app exist" |
 | An app's uuid prefix identifies exactly **one** container, so `docker ps ... \| head -1` is safe | `wa-gateway` ran **two** at once — `<uuid>` and `<uuid>-<timestamp>` — both healthy, both carrying the same Traefik router, splitting its traffic across two image builds. `head -1` picked the right one and hid the other |
 | Every app container is named `<uuid>-<timestamp>` | Not with `is_consistent_container_name_enabled` — then it is the bare `<uuid>`. Match the prefix, never the suffix |
+| A sleeping app showing a ~10% 5xx rate is failing to wake | Those are the wake handshake's own internal `503`s (§9c), logged and counted like real errors. The client got `200` every time. Count the wakes before reading the rate as a fault |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong

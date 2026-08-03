@@ -740,13 +740,41 @@ flows through: the Traefik access log** — nothing is installed per app.
   string with no JSON in it — indistinguishable from a quiet log. Zero lines
   counted, no error, cursor pinned, and the next pass asks for a larger window,
   which fails more easily. Every analytic on the box froze for twelve hours that
-  way. A pass that counts nothing while the cursor falls behind now warns.
+  way.
+- **The stall test asks whether OUR lines were counted, never how old the cursor
+  is.** The cursor advances to the newest line the read reached
+  (`max(newest, horizon)`), and `horizon` moves on *any* stamped line — including
+  bot traffic to hostnames this platform does not own. So cursor age measures how
+  long the **box was idle**, which on a personal box is hours overnight, and a
+  single scanner hit is enough to make "nothing is newer than the cursor" false
+  while the pass is perfectly caught up. The test that survives is therefore
+  whether every hosted-app line in the window had **already been counted**
+  (`tally["app"] == tally["old"]`). What remains after that is reachable only
+  with `app == 0` — a window holding no hosted-app traffic at all, which is the
+  shape that means the log lost `RequestHost` or the domain suffix changed, and
+  `_diagnose` names it. Four separate attempts have now keyed this alarm on
+  cursor age and been withdrawn; see §12.
 - Rollups in `_paas`: `analytics_visits` (per app/visitor/day, with an `is_bot`
   flag), `analytics_first_seen` (cohorts), `analytics_perf` (requests / 4xx /
   5xx / summed latency), `analytics_latency` (additive histogram → p50/p95
   without storing raw samples), `analytics_agents` (top raw user-agent strings),
   `analytics_last_seen` (each app's last request, to the second — the other
   rollups are day-keyed and cannot say how long an app has been idle).
+- **A sleeping app's wake costs it a phantom 5xx.** The wake handshake in §9c is
+  a real HTTP exchange through the proxy, so the internal `503` the static host
+  answers its own marker request with is logged like any other response and
+  counted in `analytics_perf.err_server`. Every successful wake therefore adds
+  ~1 server error to the app's day. Measured 2026-08-03: `smartbill-mcp` woke at
+  00:38, 01:51, 03:40, 05:01, 06:21 and 07:47 and carried exactly 5–7
+  `err_server` with a `200` returned to the client every time. So a sleeping
+  app's error rate has a floor proportional to how often it wakes, and reading
+  `apps_stats` `server_error_pct` or the dashboard without knowing this invites
+  chasing an outage that never happened. It also feeds `alerts.check_once`,
+  which is thresholded (`ALERT_5XX_THRESHOLD`, 5) against the increase since the
+  previous ~2.5 min tick — one wake per tick stays well under it, so no false
+  alert has fired, but the margin is smaller than it looks. **Which access-log
+  line is the internal leg has not been established, so nothing filters it yet;
+  do not "fix" the counting on a guess.**
 - **Read-only MCP tools:** `analytics_overview` (uniques, hits, DAU/WAU/MAU,
   humans-vs-bots, per-app breakdown), `analytics_timeseries`, `analytics_cohorts`,
   `analytics_agents`, `analytics_recent` (live tail of raw requests), and
@@ -811,6 +839,10 @@ of that state now makes the distinction:
   `docker ps -a` and reports a missing container within 5 minutes. Deliberately
   **not** `restartable` — there is nothing to `docker start`, and retrying that
   every five minutes would just fail forever.
+- `alert_state` rows are keyed by app id and nothing deletes them when an app is
+  deleted (`space-invaders` still had a row from 2026-07-31). Harmless — the loop
+  iterates the `apps` table and never reads them — but it is state that only
+  grows, and the same caveat as the analytics rollups in §10.
 - `stats.app_runtime` falls back to `docker ps -a` rather than inferring from the
   running-only `docker stats`; `stats.app_resources` does the same, reusing the
   `ps -a` listing it already fetches for disk sizes, so the list view costs no
@@ -878,6 +910,20 @@ symptom and the platform's own status agreed with it.
   in-memory and rolls over in minutes, so "what deleted this overnight" is
   unanswerable after the fact. `docker-destroy-log.service` exists because the
   first investigation had to be reconstructed by inference.
+- **An alarm keyed on "how long since X happened" measures idleness, not
+  failure** — the analytics stall warning has now been written **four** times
+  against cursor *age* and withdrawn four times, because on a box that is quiet
+  all night an old cursor is the normal state and not evidence of anything. Each
+  rewrite narrowed the condition and each still fired against a demonstrably
+  healthy ingester — 26 warnings in 24h on the pass that finally settled it,
+  against rollups that matched the proxy log request-for-request. The guards that
+  failed all shared one shape: they asked whether anything at all was newer than
+  the cursor, and a single scanner hit on the bare IP makes that false while the
+  pass is perfectly caught up. Key the alarm on the thing that would actually be
+  broken — here, whether **our own** lines went uncounted — not on elapsed time
+  since the last success, and not on activity that belongs to nobody. A false
+  alarm is not harmless: it is what teaches the reader to skip the one channel
+  that will eventually carry a real failure.
 - **A background repair behind a long `sleep` may never run** — the auto-update
   loop sleeps an hour *before* its first pass and the timer restarts on every
   redeploy of the control plane, which redeploys more often than that. Anything
