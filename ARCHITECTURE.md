@@ -207,8 +207,13 @@ It runs *as one of its own apps* (`api`), which is why it can redeploy itself
 - Server `version` is a real semver and the long description lives in
   `instructions` — the connector chokes if the whole description blob lands in
   `serverInfo.version`.
-- Tools are annotated read-only / write / destructive (`ToolAnnotations`) so the
-  connector UI groups them instead of dumping everything in "Other tools".
+- Tools are annotated read-only / write / destructive (`ToolAnnotations`). This
+  groups them in the connector UI, but its load-bearing effect is that **the
+  connector's approval gate keys on it**: a `destructiveHint=True` tool prompts
+  before every call, so in an unattended Routine it blocks the run outright.
+  The annotation set is therefore an autonomy policy, not a label — `_READONLY`
+  must list every GET-backed tool, and anything genuinely needed by a scheduled
+  run must stay out of `_DESTRUCTIVE`. See README "Running a routine unattended".
 
 ### Two rules for the control plane's own logs
 

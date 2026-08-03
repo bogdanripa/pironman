@@ -520,11 +520,27 @@ if getattr(_mcp, "server", None) is not None:
     _mcp.server.version = "0.1.0"
     _mcp.server.instructions = SERVER_DESCRIPTION
 
-# Tag each tool read-only / write / destructive. The claude.ai connector UI
-# groups tools by these annotations (read-only vs makes-changes vs destructive);
-# without them fastapi-mcp emits none and everything lands in one "Other tools"
-# bucket. Also helps the model gauge a tool's blast radius. Guarded so a types
-# rename can't block startup.
+# Tag each tool read-only / write / destructive. Two things read these, and the
+# second is the one that bites: the claude.ai connector UI groups tools by them,
+# and the connector's approval gate keys on them. A `destructiveHint=True` tool
+# prompts before every call — including inside an unattended Routine, where there
+# is nobody to answer. This set is therefore not cosmetic; it decides which tools
+# a scheduled run can reach at all. Guarded so a types rename can't block startup.
+#
+# Verified 2026-08-03: the nightly audit fired at ~02:00 and sat blocked on its
+# very first call until 07:35, because its liveness probe is host_run_script and
+# that was tagged destructive. It resumed only because a human happened to
+# approve it. That routine's contract is "silence means healthy", so a run that
+# never starts looks exactly like a clean one — the failure this platform is
+# built against. host_run_script and db_run_script are deliberately NOT in
+# _DESTRUCTIVE for that reason; README "Running a routine unattended" records
+# what stands in place of the gate they used to carry.
+#
+# _READONLY must hold every GET-backed tool. Anything missing falls to the `else`
+# branch and is advertised as state-changing — which was true of
+# platform_tasks_health and platform_events, both plain GETs, the first being the
+# highest-signal check the audit makes. Derive this list from the route methods
+# (`grep operation_id app/routers/`), never from what a tool's name suggests.
 try:
     from mcp.types import ToolAnnotations  # noqa: E402
 
@@ -532,21 +548,17 @@ try:
                  "apps_env_list", "crons_list", "env_list", "github_secrets_list",
                  "analytics_overview", "analytics_timeseries", "analytics_cohorts",
                  "analytics_agents", "analytics_recent", "apps_stats",
-                 "apps_redirects_list"}
-    # Destructive means the tool's PURPOSE is removal — every call destroys
-    # something, so a prompt every time carries real information.
-    #
-    # db_run_script and host_run_script are deliberately NOT here, though they
-    # are the two tools that could do the most damage. The annotation is static
-    # per tool, so marking them destructive prompts identically for `docker ps`
-    # and for `rm -rf` — and the overwhelming majority of calls are reads. An
-    # approval that fires on every read is one you learn to click through, which
-    # is worse than no approval at all: it spends the reader's attention on the
-    # 99% that is harmless and has none left for the 1% that is not. Their real
-    # guard is elsewhere and is unaffected — both tool descriptions carry the
-    # "no guardrails, read the script back and confirm before it writes"
-    # instruction, and CLAUDE.md repeats it. That guard can tell a SELECT from a
-    # DROP; this flag cannot.
+                 "apps_redirects_list", "platform_tasks_health",
+                 "platform_events"}
+    # The test for this set is whether the tool's PURPOSE is removal: every call
+    # destroys something, so a prompt every time carries real information. That
+    # is what the two script tools fail — the annotation is static per tool, so
+    # marking them destructive prompts identically for `docker ps` and for
+    # `rm -rf`, and nearly every call is a read. An approval that fires on every
+    # read is one you learn to click through, which is worse than no approval:
+    # it spends attention on the harmless majority and has none left for the
+    # call that matters. Their guard is the tool description and CLAUDE.md,
+    # which can tell a SELECT from a DROP; this flag cannot.
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
                     "crons_delete", "env_delete", "github_secret_delete"}
     for _tool in getattr(_mcp, "tools", None) or []:

@@ -36,6 +36,9 @@ was false:
 | An app's uuid prefix identifies exactly **one** container, so `docker ps ... \| head -1` is safe | `wa-gateway` ran **two** at once — `<uuid>` and `<uuid>-<timestamp>` — both healthy, both carrying the same Traefik router, splitting its traffic across two image builds. `head -1` picked the right one and hid the other |
 | Every app container is named `<uuid>-<timestamp>` | Not with `is_consistent_container_name_enabled` — then it is the bare `<uuid>`. Match the prefix, never the suffix |
 | A sleeping app showing a ~10% 5xx rate is failing to wake | Those are the wake handshake's own internal `503`s (§9c), logged and counted like real errors. The client got `200` every time. Count the wakes before reading the rate as a fault |
+| "Connector tools run without permission prompts during a Routine" (the routine's own prompt said so) | A `destructiveHint=True` tool prompts anyway and **blocks the run**. The 2026-08-03 audit sat idle from ~02:00 to 07:35 on its first call. The prompt asserting something does not make the connector do it |
+| The MCP `ToolAnnotations` set is cosmetic — it groups tools in the connector UI | It is the **autonomy policy**: the approval gate keys on it, so the set decides which tools a scheduled run can reach at all (`app/main.py`) |
+| A routine that sent no Telegram ran and found nothing | It may never have started. "Reports by exception" makes *blocked* and *healthy* produce identical silence — confirm it ran before reading silence as an all-clear |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong
@@ -85,6 +88,32 @@ deploys" — the user should not have to carry the loop.
 The check itself is the same discipline as everything else: read the running
 image tag first, because a stale image explains every other symptom and
 explaining a symptom that has not changed yet wastes the round.
+
+## Running unattended (Routines)
+
+A scheduled run has nobody to answer a question, so anything that would pause is
+a stall, not a delay. Three rules follow.
+
+**The annotation set is the autonomy policy.** The connector's approval gate
+keys on `ToolAnnotations` in `app/main.py`: a `destructiveHint=True` tool prompts
+before every call and blocks a Routine outright. So moving a tool into
+`_DESTRUCTIVE` silently removes it from every scheduled run, and `_READONLY` must
+list every GET-backed tool — derive that from the route methods, never from what
+a name suggests. `host_run_script` and `db_run_script` are deliberately excluded
+from `_DESTRUCTIVE` so audits can run; README "Running a routine unattended" has
+the tradeoff.
+
+**Which means the prompt is the only guardrail left.** A root shell and arbitrary
+SQL now execute unprompted in a scheduled run. Nothing downstream will stop a
+destructive call, so a routine's MUST-NOT-without-asking list has to be written
+as if it is the last line of defence, because it is. When editing one, assume no
+human reads the output before the commands run.
+
+**Silence is a claim, not a result.** A routine that reports by exception is
+silent when healthy and equally silent when it never started, was denied, or died
+on its first call. Before treating "no alert" as an all-clear, confirm the run
+actually executed. The 2026-08-03 audit lost five and a half hours to exactly
+this and would have lost the whole night unnoticed.
 
 ## Facts about this box that are easy to get wrong
 

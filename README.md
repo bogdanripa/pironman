@@ -241,7 +241,40 @@ script's `exit_code` and is a 200 even when that is non-zero.
 
 There are no guardrails, and this is the machine everything else runs on. The
 tool's description tells the model to read the script back before anything that
-writes, and it is tagged destructive so the connector asks.
+writes. It is **not** tagged destructive: that annotation makes the connector
+prompt before every call, which stalls an unattended Routine indefinitely (see
+"Running a routine unattended"). Interactively the description is what asks; in a
+scheduled run nothing does.
+
+## Running a routine unattended
+
+A Routine fires on a schedule with nobody watching, so any tool that prompts
+stops the run dead. The connector's approval gate keys on the MCP annotations in
+`app/main.py`, so **the annotation set is the autonomy policy**:
+
+| Annotation | In a Routine |
+|---|---|
+| `readOnlyHint=True` | runs |
+| `readOnlyHint=False` (the `else` bucket) | untested — see below |
+| `destructiveHint=True` | **prompts, and the run blocks until a human answers** |
+
+`host_run_script` and `db_run_script` are kept out of `_DESTRUCTIVE` for exactly
+this reason. The cost is real and worth stating plainly: a root shell on the box
+and arbitrary SQL now execute in a scheduled run with no interactive
+confirmation. What replaces the gate is the routine's own prompt — its
+MUST-NOT-without-asking list is, as that prompt says, the only guardrail left.
+Write those lists as if nothing else will stop the model, because nothing will.
+
+**Whether the middle row prompts is not established.** On 2026-08-03 the audit
+was blocked by a destructive tool and, once approved, every later call ran — but
+that approval may have covered the session, so it proves nothing about the
+`else` bucket. The test is simply whether the next unattended run completes on
+its own; until one does, treat "makes-changes tools are fine" as unproven.
+
+**Symptom of getting this wrong:** the run produces no output at all. A routine
+that reports by exception is silent when healthy *and* silent when it never
+started, so check that it ran before reading silence as an all-clear. The
+2026-08-03 audit lost five and a half hours to precisely this.
 
 ## Test sequence — do not skip step 1
 
