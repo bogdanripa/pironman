@@ -533,9 +533,22 @@ try:
                  "analytics_overview", "analytics_timeseries", "analytics_cohorts",
                  "analytics_agents", "analytics_recent", "apps_stats",
                  "apps_redirects_list"}
+    # Destructive means the tool's PURPOSE is removal — every call destroys
+    # something, so a prompt every time carries real information.
+    #
+    # db_run_script and host_run_script are deliberately NOT here, though they
+    # are the two tools that could do the most damage. The annotation is static
+    # per tool, so marking them destructive prompts identically for `docker ps`
+    # and for `rm -rf` — and the overwhelming majority of calls are reads. An
+    # approval that fires on every read is one you learn to click through, which
+    # is worse than no approval at all: it spends the reader's attention on the
+    # 99% that is harmless and has none left for the 1% that is not. Their real
+    # guard is elsewhere and is unaffected — both tool descriptions carry the
+    # "no guardrails, read the script back and confirm before it writes"
+    # instruction, and CLAUDE.md repeats it. That guard can tell a SELECT from a
+    # DROP; this flag cannot.
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
-                    "crons_delete", "db_run_script", "host_run_script",
-                    "env_delete", "github_secret_delete"}
+                    "crons_delete", "env_delete", "github_secret_delete"}
     for _tool in getattr(_mcp, "tools", None) or []:
         if _tool.name in _READONLY:
             _tool.annotations = ToolAnnotations(readOnlyHint=True)
