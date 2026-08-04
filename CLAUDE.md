@@ -30,6 +30,9 @@ was false:
 | The watchdog would report tasks as "never completed" | It **crashed** on the missing table |
 | `api` could be found by its `pironman.app` label | `api` has no such label; only `web` does |
 | `api` is covered by "apps that must not sleep" | Its row says `sleep_when_idle = true` |
+| A repeated `analytics: nothing counted, cursor N minutes behind` WARNING means ingestion is stalled | Ingestion was **exact** — `analytics_perf` matched the proxy log request-for-request. All 43 such warnings were caught-up passes (tally `app == old`) |
+| The Sablier controller is the container named `sablier` | **No container has that name.** It is a Coolify app, so its container is `<uuid>-<timestamp>`; `sablier` is a Docker **network alias**. Find it by image, `sablierapp/sablier` |
+| `analytics_last_seen` lists only live apps (ARCHITECTURE.md said so) | It holds deleted apps too — `pingpong` and `analytics` are in it with no `apps` row. Only the `apps` table answers "does this app exist" |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong

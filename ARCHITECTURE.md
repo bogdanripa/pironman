@@ -120,7 +120,7 @@ Coolify's REST API plus direct Docker/DB access via the mounted socket.
 | `coolify-realtime` | Websockets for the UI |
 | `coolify-sentinel` | Coolify host metrics agent |
 | `coolify-proxy` | **Traefik v3.6** — the edge proxy, with the Sablier plugin |
-| `sablier` | `sablierapp/sablier` — scale-to-zero controller (:10000) |
+| *(a `<uuid>-<timestamp>` container)* | `sablierapp/sablier` — scale-to-zero controller (:10000). **Not named `sablier`:** it is itself a Coolify application, so its container carries the uuid+timestamp name like any app, and `docker ps --filter name=sablier` finds **nothing**. The name `sablier` that the middleware labels use (`sablierUrl=http://sablier:10000`) is a Docker **network alias** on the `coolify` network, not a container name. Find it by image. It has a Coolify `applications` row but **no `apps` row** — Coolify-managed, not platform-managed (see `CLAUDE.md`) |
 | `<uuid>-<timestamp>` | An **app** container. The name is the Coolify resource uuid + a deploy timestamp, so **it changes on every deploy** |
 | `api` (`paas-api`) | **This control plane.** Also an app, but self-managing |
 
@@ -761,8 +761,16 @@ would misstate history — but wrong for *navigation*: the dashboard's app filte
 built from `/analytics/overview`'s `per_app` and so offered long-deleted apps whose
 only possible result is their own old traffic. It reads `/stats/apps` instead, which
 comes from the `apps` table. The per-app traffic table still renders everything
-analytics holds. `analytics_last_seen` is the one table that tracks live apps only,
-which makes it a useful cross-check for orphans.
+analytics holds.
+
+`analytics_last_seen` is **not** an exception to that, though this file used to say
+it was. It is written from the same access-log app ids and nothing deletes its rows
+either, so it accumulates deleted apps exactly like the others — this box carries
+`pingpong` and `analytics`, neither of which has had an `apps` row for days. It is
+therefore no more a list of live apps than `analytics_visits` is; the `apps` table is
+the only answer to "does this app exist". What `analytics_last_seen` *is* good for is
+the question the day-keyed rollups cannot answer at all: how long an app has been
+idle, to the second.
 
 ---
 
@@ -850,6 +858,22 @@ symptom and the platform's own status agreed with it.
   as text, an internal hostname in otherwise valid metadata, a background loop
   swallowing its own exception. Every long debugging session here started with a
   green signal.
+- **…and never let success be answered with something that looks like a failure.**
+  The inverse costs less per incident and far more over time, because it trains
+  whoever reads the log to skim past the warning that will one day be real. The
+  analytics ingester warned *"nothing counted and the cursor is 38 minutes
+  behind"* ~30 times a day while its rollups matched the proxy log
+  request-for-request. `behind` is `now - cursor`, and the cursor advances to the
+  newest line of **any** kind — scanner hits on the bare IP included — so after a
+  quiet stretch it measures time since the last request, not time since ingestion
+  last worked. The "caught up" test meant to stop that asked whether *anything*
+  was newer than the cursor, which one bot hit makes false; the right question is
+  whether every **hosted-app** line was already counted.
+  **Signature: the warning's own tally has `app == old`** — every app line in the
+  window was already ingested, so nothing was missed. Before believing any such
+  warning, diff the two sources: `analytics_perf` for today against a per-host
+  count from `docker logs coolify-proxy`. They agreeing exactly is what proved
+  this one cosmetic.
 - **A shell "on the host" from inside a container inherits the container** —
   nsenter passes the caller's environment through and resolves `--wd` *before*
   the namespace switch, so a host shell needs `env -i` and a `cd /` run inside

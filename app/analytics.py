@@ -234,15 +234,13 @@ def _diagnose(t: dict) -> str:
                 f"*{DOMAIN_SUFFIX}* host with a usable client identity — check "
                 "that the access log still keeps RequestHost, User-Agent and "
                 "Cf-Connecting-Ip.")
-    # Reached only once the caught-up cases above have been ruled out, so the
-    # read HAS moved past the cursor and this pass simply found nothing worth
-    # counting in what it moved over — bot hits on the bare IP, hostnames this
-    # platform does not own. The old wording, "the normal quiet case", was
-    # accurate but was printed under a warning about a cursor tens of minutes
-    # behind, and the two together read as an incident. The quiet case no longer
-    # reaches here at all; this branch is the narrower one.
-    return ("The read did advance past the cursor, so this window held only "
-            "traffic that belongs to no hosted app.")
+    # Defensive only. The caller now treats "every hosted-app line was already
+    # counted" as caught up and logs it at debug, so by the time _diagnose is
+    # called the tally has no hosted-app lines at all — and `if not t["app"]`
+    # above has already returned. Anything reaching here contradicts that, so
+    # say so rather than inventing a reassuring explanation for it.
+    return ("Nothing counted, and none of the checks above explains why — the "
+            "tally is not a shape this should be able to produce.")
 
 
 def _stamp_of(line: str) -> str:
@@ -448,17 +446,32 @@ async def ingest_once() -> dict:
                 "analytics: the newest line read (%s) is OLDER than the cursor "
                 "(%s) — the read is returning the start of the log, not the "
                 "end. Lower MAX_LINES.", newest_line, cursor)
-        elif newest_line and cursor and newest_line <= cursor:
-            # Caught up, and the proxy has emitted nothing since. There is no
-            # fault here to report: the cursor is old because the BOX is idle,
-            # not because ingestion is stuck. Saying anything louder than this
-            # is what the previous code got wrong — it warned "the cursor is 35
-            # minutes behind", which measures how long since the last request,
-            # not how long since ingestion last worked. On a personal box that
-            # can be hours, and the alarm cost an hour of chasing a rotation bug
-            # that was not there.
-            _log.debug("analytics: caught up at %s; no new access-log lines "
-                       "since (%.0f minutes)", cursor, behind / 60)
+        elif (newest_line and cursor and newest_line <= cursor) or (
+                tally["app"] and tally["app"] == tally["old"]):
+            # Caught up. There is no fault here to report: the cursor is old
+            # because the BOX is idle, not because ingestion is stuck. Saying
+            # anything louder is what the code before this got wrong — it
+            # warned "the cursor is 35 minutes behind", which measures how long
+            # since the last request, not how long since ingestion last worked.
+            # On a personal box that can be hours, and the alarm cost an hour of
+            # chasing a rotation bug that was not there.
+            #
+            # Two ways to be sure, and the SECOND is the one that fires on a box
+            # facing the open internet. The first — nothing newer than the
+            # cursor at all — is very nearly unreachable, because the cursor
+            # advances to the newest line of ANY kind, bot hits on the bare IP
+            # included. So a quiet stretch ended by a single scanner request
+            # leaves newest_line ahead of the cursor and drops through to the
+            # warning below, which then calls a merely idle box a stall. That is
+            # the same misreading arriving by the other branch, and it was
+            # emitting ~30 warnings a day here while ingestion was provably
+            # exact against the proxy log.
+            #
+            # The second test names the real question: every hosted-app line in
+            # the window had already been counted, so nothing of ours was
+            # missed. What broke the silence belonged to no app of ours.
+            _log.debug("analytics: caught up at %s; nothing new belonging to a "
+                       "hosted app since (%.0f minutes)", cursor, behind / 60)
         elif behind > _STALL_AFTER:
             _log.warning(
                 "analytics: nothing counted and the cursor is %.0f minutes behind "
