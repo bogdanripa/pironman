@@ -292,7 +292,8 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
 
     async def one(app) -> dict:
         uuid = app["coolify_uuid"] or ""
-        cname = next((n for n in names if uuid and uuid in n), None)
+        live = [n for n in names if uuid and uuid in n]
+        cname = live[0] if live else None
         # `names` holds RUNNING containers only, so its absence cannot tell a
         # slept container from a deleted one. `disk` is built from `docker ps -a`,
         # so its keys answer that for free — no extra call.
@@ -317,6 +318,13 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
                       else "missing" if not exists
                       else "asleep" if app["sleep_when_idle"]
                       else "stopped"),
+            # An app is supposed to have exactly one container. When it has two,
+            # both carry the same Coolify-generated Traefik router and service,
+            # so Traefik round-robins between them and the older one answers with
+            # whatever image it was built from — a wrong-version outage that
+            # every other field here reports as healthy. Null unless it happens,
+            # so it costs a reader nothing until it means something.
+            "duplicate_containers": live if len(live) > 1 else None,
             "cpu_pct": s.get("cpu_pct"),
             "mem_mb": s.get("mem_mb"),
             "mem_pct": s.get("mem_pct"),

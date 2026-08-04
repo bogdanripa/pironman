@@ -147,20 +147,23 @@ def notify(text: str, api_uuid: str | None = None) -> None:
         print(f"could not send telegram: {e}")
 
 
-def container_for(app_id: str, uuid: str | None = None,
-                  include_stopped: bool = False) -> str | None:
-    """The container for `app_id`.
+def containers_for(app_id: str, uuid: str | None = None,
+                   include_stopped: bool = False) -> list[str]:
+    """EVERY container for `app_id`, newest first.
 
     By Coolify resource uuid FIRST, because that is the identity that always
-    exists. Coolify names containers <uuid>-<timestamp>: the timestamp changes on
-    every deploy, but the uuid prefix is stable and is what the apps table
-    stores.
+    exists. Coolify names containers <uuid>-<timestamp> — or a bare <uuid> when
+    the app has `is_consistent_container_name_enabled` — so the uuid is the
+    stable part either way, and it is what the apps table stores.
 
     The `pironman.app` label would be nicer, but it is only present on apps whose
     labels this platform has rewritten — routing and Sablier do that, adoption
     does not. On this box exactly one container carries it, and `api` is not that
     container. A watchdog that looked the control plane up by label would report
     it down for ever while it ran perfectly.
+
+    A list, not one name, because "an app has one container" is an assumption
+    that has already been false here (see the duplicate check in `check`).
     """
     if uuid:
         args = ["docker", "ps", "--filter", f"name=^{uuid}", "--format", "{{.Names}}"]
@@ -169,13 +172,19 @@ def container_for(app_id: str, uuid: str | None = None,
         _, out = sh(*args)
         names = [n for n in out.splitlines() if n.strip()]
         if names:
-            return names[0]
+            return names
     args = ["docker", "ps", "--filter", f"label=pironman.app={app_id}",
             "--format", "{{.Names}}"]
     if include_stopped:
         args.insert(2, "-a")
     _, out = sh(*args)
-    names = [n for n in out.splitlines() if n.strip()]
+    return [n for n in out.splitlines() if n.strip()]
+
+
+def container_for(app_id: str, uuid: str | None = None,
+                  include_stopped: bool = False) -> str | None:
+    """The app's current container — `docker ps` lists newest first."""
+    names = containers_for(app_id, uuid, include_stopped)
     return names[0] if names else None
 
 
@@ -206,6 +215,27 @@ def check(container: str) -> tuple[dict[str, str], list[str], dict[str, str]]:
         rows = []
     for app, uuid, sleeps in rows:
         uuids[app] = uuid
+        # 1a. Two containers for one app is a silent wrong-version outage.
+        #     Coolify writes the app's Traefik router and service onto the
+        #     CONTAINER, so a leftover carries the same router name, the same
+        #     rule and the same service as the current one — Traefik merges them
+        #     into one service with two servers and round-robins between them.
+        #     Half the requests then run whatever image the leftover was built
+        #     from, and every other signal reports success: the app is up, its
+        #     healthcheck passes, apps_stats names one healthy container.
+        #     Observed on this box after `is_consistent_container_name_enabled`
+        #     was turned on mid-life: the name changed from <uuid>-<timestamp>
+        #     to a bare <uuid>, and Coolify's own stop_running_container only
+        #     shuts down the NEW name in that mode, so the container running at
+        #     the moment of the flip was never stopped by any later deploy.
+        #     Checked before the sleep branch: what matters is how many are
+        #     RUNNING, which is a fault for a sleeping app too.
+        live = containers_for(app, uuid)
+        if len(live) > 1:
+            problems[f"duplicate:{app}"] = (
+                f"{app} has {len(live)} running containers ({', '.join(live)}) — "
+                f"they share one Traefik router, so requests are split across "
+                f"them and the older one serves stale code. Stop the leftover")
         # ALWAYS_ON wins over the flag. The control plane's row says
         # sleep_when_idle = true on this box, yet sablier.excluded() refuses to
         # enrol it and it must never stop — it runs the loops everything else

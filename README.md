@@ -171,6 +171,14 @@ is nothing to `docker start`; only a redeploy recreates it). Before this, sleepi
 apps were skipped outright, so the box's only alerting path had nothing to say
 while an app sat unreachable for nine hours.
 
+It also reports an app that has **more than one running container**
+(`<app> has 2 running containers …`). Both carry the same Coolify-generated
+Traefik router, so Traefik round-robins between them and the older one answers
+with a stale image — while both containers stay healthy and every other signal
+says the app is fine. Stop the leftover: `docker stop <name>`. Traefik's Docker
+provider ignores non-running containers, so the router drops to one server
+immediately, and `docker start` puts it back if you picked wrong.
+
 ## Destroy log
 
 ```

@@ -121,13 +121,21 @@ Coolify's REST API plus direct Docker/DB access via the mounted socket.
 | `coolify-sentinel` | Coolify host metrics agent |
 | `coolify-proxy` | **Traefik v3.6** — the edge proxy, with the Sablier plugin |
 | *(a `<uuid>-<timestamp>` container)* | `sablierapp/sablier` — scale-to-zero controller (:10000). **No container is named `sablier`**: it is itself a Coolify application, so it carries a uuid+timestamp name like any app and `--filter name=sablier` finds nothing. **Find it by image.** The `sablier` in `sablierUrl=http://sablier:10000` is a Docker **network alias**, not a container name. It has a Coolify `applications` row but no `apps` row — Coolify-managed, not platform-managed |
-| `<uuid>-<timestamp>` | An **app** container. The name is the Coolify resource uuid + a deploy timestamp, so **it changes on every deploy** |
+| `<uuid>-<timestamp>` | An **app** container. The name is the Coolify resource uuid + a deploy timestamp, so **it changes on every deploy** — unless the app has consistent naming on (below), when it is the bare uuid |
 | `api` (`paas-api`) | **This control plane.** Also an app, but self-managing |
 
 App container names look like `khmhpu3k4rd7a6vwzfq3t922-151340268225`. The stable
 identity is the **uuid prefix** (`coolify_uuid` in the `apps` table); the suffix
 changes each redeploy — a fact that matters for anything that references a
 container by name (see the Sablier gotcha in §9).
+
+**The suffix is not guaranteed.** Coolify's `generateApplicationContainerName()`
+returns the bare uuid when the app has
+`application_settings.is_consistent_container_name_enabled`, and uuid+timestamp
+otherwise. Both forms exist on this box. Match on the **uuid prefix**, never on
+the presence of a suffix — and never assume the prefix identifies exactly *one*
+container, because **turning that flag on mid-life orphans the container that was
+running at the time** (§12).
 
 Renaming them is not an option: Coolify manages containers by that name and would
 regenerate it on the next deploy. Instead they are made *resolvable* — the
@@ -845,6 +853,27 @@ symptom and the platform's own status agreed with it.
   `force_docker_cleanup` false. Assume nothing about filter semantics: this one
   survived two confident wrong diagnoses and was settled only by creating a
   labelled throwaway container and running the exact command against it.
+- **Two containers for one app split its traffic across two builds, and nothing
+  says so.** Coolify writes the Traefik router *onto the container*, so a
+  leftover carries the same router name, the same rule and the same service as
+  the current one. Traefik merges them into one service with two servers and
+  round-robins: half the requests run the older image. Every other signal reports
+  success — both containers are healthy, `apps_stats` names one of them, the app
+  answers 200.
+  **Signature: `docker ps` shows two names sharing the app's uuid prefix, and the
+  proxy access log shows one `ServiceName` alternating between two `ServiceAddr`
+  values.** That log check is the confirmation, because the labels alone only
+  show intent.
+  Observed cause here: `is_consistent_container_name_enabled` turned on
+  mid-life. The name changes from `<uuid>-<timestamp>` to a bare `<uuid>`, and
+  Coolify's `stop_running_container()` takes a *different branch* in that mode —
+  it shuts down only `$this->container_name`, skipping the branch that
+  enumerates and stops the app's other containers. So the container running at
+  the moment of the flip is never stopped by any later deploy. Only the flip
+  orphans one; deploys after it replace the bare-named container normally.
+  Remedy is `docker stop <leftover>` — Traefik's Docker provider ignores
+  non-running containers, so the router drops to one server at once.
+  `paas-watchdog` and `apps_stats.duplicate_containers` now report it.
 - **Instrument the disappearance, not just the symptom** — Docker's event stream is
   in-memory and rolls over in minutes, so "what deleted this overnight" is
   unanswerable after the fact. `docker-destroy-log.service` exists because the
