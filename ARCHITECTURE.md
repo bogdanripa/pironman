@@ -120,7 +120,7 @@ Coolify's REST API plus direct Docker/DB access via the mounted socket.
 | `coolify-realtime` | Websockets for the UI |
 | `coolify-sentinel` | Coolify host metrics agent |
 | `coolify-proxy` | **Traefik v3.6** — the edge proxy, with the Sablier plugin |
-| *(a `<uuid>-<timestamp>` container)* | `sablierapp/sablier` — scale-to-zero controller (:10000). **Not named `sablier`:** it is itself a Coolify application, so its container carries the uuid+timestamp name like any app, and `docker ps --filter name=sablier` finds **nothing**. The name `sablier` that the middleware labels use (`sablierUrl=http://sablier:10000`) is a Docker **network alias** on the `coolify` network, not a container name. Find it by image. It has a Coolify `applications` row but **no `apps` row** — Coolify-managed, not platform-managed (see `CLAUDE.md`) |
+| *(a `<uuid>-<timestamp>` container)* | `sablierapp/sablier` — scale-to-zero controller (:10000). **No container is named `sablier`**: it is itself a Coolify application, so it carries a uuid+timestamp name like any app and `--filter name=sablier` finds nothing. **Find it by image.** The `sablier` in `sablierUrl=http://sablier:10000` is a Docker **network alias**, not a container name. It has a Coolify `applications` row but no `apps` row — Coolify-managed, not platform-managed |
 | `<uuid>-<timestamp>` | An **app** container. The name is the Coolify resource uuid + a deploy timestamp, so **it changes on every deploy** |
 | `api` (`paas-api`) | **This control plane.** Also an app, but self-managing |
 
