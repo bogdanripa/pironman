@@ -106,6 +106,11 @@ WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT_SECONDS", "60"))
 # how long a genuinely dead backend takes to report itself.
 WAKE_RETRY_DELAY = float(os.environ.get("WAKE_RETRY_DELAY_SECONDS", "0.25"))
 WAKE_RETRY_BUDGET = float(os.environ.get("WAKE_RETRY_BUDGET_SECONDS", "15"))
+# Shorter, for a bare gateway error where "asleep" is a guess rather than a
+# marker we recognise. Long enough to cover a wake several times over now that
+# Sablier answers in ~0.5s, short enough that an app which genuinely returns 502
+# is not held for the full sleeping-app budget before its own error is shown.
+GATEWAY_RETRY_BUDGET = float(os.environ.get("GATEWAY_RETRY_BUDGET_SECONDS", "5"))
 
 # uvicorn already configures this one and it goes to stdout, so `apps_logs web`
 # shows it without a logging setup of our own.
@@ -265,6 +270,37 @@ def _is_down(r: httpx.Response) -> bool:
     return r.status_code == 503 and DOWN_HEADER in r.headers
 
 
+# Traefik's own answer when it HAS a router for the backend but cannot reach a
+# healthy container behind it. Not the same shape as _is_down: there the request
+# came back to us carrying our marker, here Traefik answers on its own account
+# and the reply is indistinguishable from the app's, because it is a plain HTTP
+# error with none of our headers on it.
+_GATEWAY_ERRORS = frozenset({502, 503, 504})
+
+
+def _is_gateway_error(r: httpx.Response) -> bool:
+    """True when the proxy — not the app — is reporting it could not reach the
+    backend.
+
+    This is the gap that let a wakeable app answer a caller with a 502. The
+    window exists on every deploy: for a second or two Traefik has the router
+    but no healthy server behind it, and it answers 502 itself. That is not our
+    marker, so the old check waved it through as if the app had said it, the
+    fast path returned it verbatim, and no wake was ever attempted. Measured on
+    the box: 502 after 20.0s and 24.6s on the first request following a deploy,
+    with a plain retry seconds later succeeding — the platform could have served
+    every one of them.
+
+    Deliberately excludes anything carrying DOWN_HEADER, which _is_down already
+    owns. A response the app itself generated with one of these codes is
+    retried too and that is accepted: 502/503/504 all mean the request was not
+    fulfilled, so re-sending cannot double-apply it, and if the app really is
+    broken its own error still reaches the caller — see the final send in
+    _proxy, which passes through whatever comes back once the budget is spent.
+    """
+    return r.status_code in _GATEWAY_ERRORS and DOWN_HEADER not in r.headers
+
+
 async def _proxy(request: Request, aid: str) -> Response:
     """Forward to the app's backend, waking it first if it turns out to be asleep.
 
@@ -283,9 +319,16 @@ async def _proxy(request: Request, aid: str) -> Response:
     """
     t0 = time.monotonic()
     sent = await _send(request, aid)
-    if sent and not _is_down(sent[1]):
+    if sent and not _is_down(sent[1]) and not _is_gateway_error(sent[1]):
         return _stream(*sent)          # fast path: awake, nothing logged
     probe = time.monotonic() - t0
+    # A bare gateway error might be a sleeping app OR an app that is genuinely
+    # answering 502, and we cannot tell the two apart from the response. So give
+    # it the shorter budget: a real wake resolves in well under a second once
+    # Sablier returns, while a broken app should surface its own error promptly
+    # rather than being retried for the full sleeping-app budget.
+    budget = WAKE_RETRY_BUDGET if (sent and _is_down(sent[1])) \
+        else GATEWAY_RETRY_BUDGET
 
     sablier = 0.0
     if sent:
@@ -305,13 +348,13 @@ async def _proxy(request: Request, aid: str) -> Response:
     # Traefik a moment to pick the container up, then try again — polling at a
     # flat cadence until the budget runs out, so we return as soon after
     # readiness as the cadence allows rather than at the next widening gap.
-    deadline = time.monotonic() + WAKE_RETRY_BUDGET
+    deadline = time.monotonic() + budget
     tries = 0
     while time.monotonic() < deadline:
         await asyncio.sleep(WAKE_RETRY_DELAY)
         tries += 1
         sent = await _send(request, aid)
-        if sent and not _is_down(sent[1]):
+        if sent and not _is_down(sent[1]) and not _is_gateway_error(sent[1]):
             _log.info("wake %s: served in %.2fs — probe %.2fs, sablier %.2fs, "
                       "then %d retr%s over %.2fs", aid, time.monotonic() - t0,
                       probe, sablier, tries, "y" if tries == 1 else "ies",
@@ -320,6 +363,18 @@ async def _proxy(request: Request, aid: str) -> Response:
         if sent:
             await sent[1].aclose()
             await sent[0].aclose()
+
+    # Budget spent. Ask once more and pass through whatever comes back, so an
+    # app that really is answering 502 surfaces ITS error and not an invented
+    # one of ours — the failure should read as the app's, because it is. Only a
+    # backend we cannot reach at all falls through to our own 502.
+    sent = await _send(request, aid)
+    if sent:
+        _log.warning("wake %s: still failing after %.2fs — probe %.2fs, sablier "
+                     "%.2fs, %d retries; passing the backend's %s through", aid,
+                     time.monotonic() - t0, probe, sablier, tries,
+                     sent[1].status_code)
+        return _stream(*sent)
 
     _log.warning("wake %s: UNREACHABLE after %.2fs — probe %.2fs, sablier "
                  "%.2fs, %d retries", aid, time.monotonic() - t0, probe,

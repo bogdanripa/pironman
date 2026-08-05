@@ -58,13 +58,14 @@ server.WAKE_RETRY_DELAY = 0.2
 # dead-backend cases, which would otherwise burn the full production budget
 # failing before the assertion runs.
 server.WAKE_RETRY_BUDGET = 1.0
+server.GATEWAY_RETRY_BUDGET = 1.0
 
 import httpx, uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
 
 STATE = {"up": False, "wakes": 0, "sablier_ok": True, "seen_host": None,
-         "seen_xfh": None, "asked_by": None}
+         "seen_xfh": None, "asked_by": None, "gateway": 0}
 
 proxy = FastAPI()
 
@@ -73,6 +74,14 @@ proxy = FastAPI()
 async def route(request: Request, p: str = ""):
     """The two Traefik routers, in priority order."""
     marker = request.headers.get(server.BACKEND_HEADER) == server.BACKEND_TOKEN
+    # Traefik answering 502 on its own account: it HAS a router for the backend
+    # but no healthy container behind it. Carries none of our headers, which is
+    # exactly why it used to be forwarded to the caller as if the app had said
+    # it. `gateway` counts down so a test can make the window transient, the way
+    # the real one is on a deploy.
+    if marker and STATE["gateway"] > 0:
+        STATE["gateway"] -= 1
+        return PlainTextResponse("Bad Gateway", status_code=502)
     if marker and STATE["up"]:
         # backend router matched -> the app itself
         STATE["seen_host"] = request.headers.get("host")
@@ -179,6 +188,25 @@ async def main():
         r = await c.get(base + "/api/thing", headers={**H, "Accept": "text/html"})
         check("navigation to an API path still wakes the backend",
               r.status_code == 200 and "MARKETING" not in r.text, r.text[:60])
+
+        print("\n[Traefik answers 502 while the backend is coming up]")
+        # The real bug: for a second or two after a deploy Traefik has the
+        # router but no healthy server, and answers 502 itself. It carries none
+        # of our headers, so it used to be streamed to the caller verbatim with
+        # no wake attempted — a request the platform could have served, failed.
+        STATE["up"] = True; STATE["gateway"] = 2; STATE["wakes"] = 0
+        r = await c.get(base + "/api/thing", headers=H)
+        check("a transient gateway 502 is retried, not handed to the caller",
+              r.status_code == 200 and r.json().get("backend"), r.text[:80])
+
+        print("\n[the app itself keeps answering 502]")
+        # The other side of the same coin: if it really is the app's error, the
+        # app's error is what the caller must get -- not an invented one of ours.
+        STATE["up"] = True; STATE["gateway"] = 9999; STATE["wakes"] = 0
+        r = await c.get(base + "/api/thing", headers=H)
+        check("a persistent 502 passes the backend's own response through",
+              r.status_code == 502 and "Bad Gateway" in r.text, r.text[:60])
+        STATE["gateway"] = 0
 
         print("\n[wake fails]")
         STATE["up"] = False; STATE["sablier_ok"] = False; STATE["wakes"] = 0
