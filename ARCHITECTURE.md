@@ -689,6 +689,42 @@ fallback — the two error shapes together are the signature of a deleted contai
 not a sleeping one (§9). Verified end to end on the box: `docker stop` →
 `Exited (137)`, request through the public host → `200`, container `Up`.
 
+### What a cold wake costs, and where the cost actually is
+
+**Sablier's blocking call is the whole of it.** Measured 2026-08-05 with the
+stage timings `_proxy` now logs: `probe 0.05s, sablier 10.02s, then 1 retry over
+0.27s`. The app itself answered on its own container IP at **0.76s** — so the
+container, the healthcheck and the retry loop were never the constraint, and
+four separate attempts to explain the ten seconds from the outside (healthcheck
+interval, a stale image, the retry schedule, Traefik's health filter) were each
+disproved by the next measurement. **Read the wake log line before theorising;
+it is there precisely because inference kept losing to it.**
+
+Sablier only re-checks readiness on a fixed tick —
+`--strategy.blocking.default-refresh-frequency`, **default 5s**. The container
+goes healthy at ~5.13s, a tenth of a second *after* the 5s tick, so the answer
+waits for the 10s tick. That is why the total was a near-constant 10.25-10.4s
+across every configuration tried: it is two ticks, not an accumulation.
+
+The box therefore sets **`SABLIER_STRATEGY_BLOCKING_DEFAULT_REFRESH_FREQUENCY=250ms`**
+as an environment variable on the Sablier *Coolify app*, which takes a cold wake
+from ~10.3s to **~5.5s** (measured over 11 consecutive cold wakes across
+ping-pong and smartbill-mcp). Two things about how it is set:
+
+- It must be an **env var**. Coolify's `start_command` is ignored for a
+  registry-image app — set it and the container still comes up `Cmd=["start"]`.
+- Restarting Sablier runs its `--provider.auto-stop-on-startup` (default true),
+  which stops every enrolled app that Sablier did not itself start. They wake on
+  the next request, but expect a brief blip on every Sablier redeploy.
+
+**The remaining ~5.3s is Docker's `--health-start-interval`** (default 5s),
+which schedules the *first* health probe; `interval` governs only later ones.
+Coolify exposes no column for it, `health_check_start_period=0` is silently
+floored back to 10s, and `--no-healthcheck` in `custom_docker_run_options` is
+regenerated away. So ~5.5s is the floor without changing the wake path itself —
+going below it means the static host forwarding straight to the container
+during the wake window, since the app is provably up at 0.76s.
+
 The one thing the static host must never do here is fall through to `index.html`.
 An unreachable backend that answers with the site's homepage looks like a working
 site — that is precisely how the failure above stayed invisible. It is a 502.
