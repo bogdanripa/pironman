@@ -107,12 +107,22 @@ async def list_envs(uuid: str) -> list[dict]:
 
 
 async def delete_env(uuid: str, key: str) -> None:
-    """UNVERIFIED shape. Remove a variable by name; a no-op if it is not set.
-    Coolify keys deletes by the env's own uuid, so look it up first."""
+    """Remove every variable with this name; a no-op if it is not set. Coolify
+    keys deletes by the env's own uuid, so look them up first.
+
+    **Every match, not the first.** Coolify stores a key TWICE — a production
+    row and an `is_preview` twin — even though set_env only ever posts
+    `is_preview: False`. Stopping at the first match therefore always left one
+    row behind, and a "deleted" variable stayed in Coolify's database
+    indefinitely. Verified 2026-08-05 on this box: `bt-gateway` still carried an
+    orphaned preview `INTERNAL_CRON_SECRET` from an earlier deletion, and a
+    probe on `ping-pong` reproduced it exactly. The orphan never reaches a
+    production container, which is why this went unnoticed — but a secret
+    someone asked to remove should not survive the request that removed it.
+    """
     for env in await list_envs(uuid):
         if env.get("key") == key:
             await _request("DELETE", f"/applications/{uuid}/envs/{env['uuid']}")
-            return
 
 
 async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
