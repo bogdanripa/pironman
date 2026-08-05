@@ -600,6 +600,13 @@ last request time (`analytics_last_seen`, to the second — the day-keyed rollup
 cannot answer "is anyone still using this?") from the same log, which feed the
 resource view below.
 
+An app fronted by the static host appears in the proxy log **twice** per request
+— the client's leg and the static host's forward to the backend. Only the client's
+leg is counted, so the numbers are what a visitor experienced, wake included;
+`analytics_recent` still shows both and marks the forward `internal: true`. See
+ARCHITECTURE §12 for how the two are told apart and for the one phantom `503` a
+cold wake still leaves behind.
+
 ### Live resources (`apps_stats`)
 
 `apps_stats` returns, per app in one call: running state, live CPU/RAM (from a
@@ -624,20 +631,29 @@ like outages. `alerts_test` sends a test message to confirm delivery. Unset, the
 loop is a no-op.
 
 **One-time host setup** — Traefik must actually write the access log, and keep
-the two headers the visitor id needs (real client IP comes from Cloudflare in
-`Cf-Connecting-Ip`; `User-Agent` sharpens the hash). Add these flags to the
-`coolify-proxy` command (Coolify → Server → Proxy → Configuration, then restart
-the proxy — a few seconds of edge downtime):
+three headers: the two the visitor id needs (real client IP comes from
+Cloudflare in `Cf-Connecting-Ip`; `User-Agent` sharpens the hash), and the
+static host's forwarding marker, which is the only thing that tells one of its
+internal hops from a client's request. Add these flags to the `coolify-proxy`
+command (Coolify → Server → Proxy → Configuration, then restart the proxy — a
+few seconds of edge downtime):
 
 ```
 --accesslog=true
 --accesslog.format=json
 --accesslog.fields.headers.names.User-Agent=keep
 --accesslog.fields.headers.names.Cf-Connecting-Ip=keep
+--accesslog.fields.headers.names.X-Pironman-Backend=keep
 ```
 
 Until that is enabled the tools simply report zeros — the rollup tables and loop
 are already live, so numbers start accruing the moment the proxy logs.
+
+The third flag is the newest and only affects fronted apps. Without it the
+ingester falls back to the router name, which catches most of the static host's
+internal hops but not the ones a *sleeping* app's wake produces — those are
+counted against the app as 5xx it never returned, and are what makes a cold wake
+look like an outage (ARCHITECTURE §12).
 
 ## Frontends (the `web` static host)
 

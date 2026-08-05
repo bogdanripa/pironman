@@ -862,21 +862,50 @@ flows through: the Traefik access log** — nothing is installed per app.
   without storing raw samples), `analytics_agents` (top raw user-agent strings),
   `analytics_last_seen` (each app's last request, to the second — the other
   rollups are day-keyed and cannot say how long an app has been idle).
-- **A sleeping app's wake costs it a phantom 5xx.** The wake handshake in §9c is
-  a real HTTP exchange through the proxy, so the internal `503` the static host
-  answers its own marker request with is logged like any other response and
-  counted in `analytics_perf.err_server`. Every successful wake therefore adds
-  ~1 server error to the app's day. Measured 2026-08-03: `smartbill-mcp` woke at
-  00:38, 01:51, 03:40, 05:01, 06:21 and 07:47 and carried exactly 5–7
-  `err_server` with a `200` returned to the client every time. So a sleeping
-  app's error rate has a floor proportional to how often it wakes, and reading
-  `apps_stats` `server_error_pct` or the dashboard without knowing this invites
-  chasing an outage that never happened. It also feeds `alerts.check_once`,
-  which is thresholded (`ALERT_5XX_THRESHOLD`, 5) against the increase since the
-  previous ~2.5 min tick — one wake per tick stays well under it, so no false
-  alert has fired, but the margin is smaller than it looks. **Which access-log
-  line is the internal leg has not been established, so nothing filters it yet;
-  do not "fix" the counting on a guess.**
+- **A fronted app's request is logged twice, and only the client's leg counts.**
+  The static host forwards to the backend through the proxy (§9b), so one
+  exchange produces at least two access-log lines, all carrying the app's real
+  Host. `analytics._internal_leg` drops the static host's own hops. Before it
+  did, every fronted app's request count was roughly doubled, its latency
+  histogram was padded with 1ms inner hops, and a cold wake charged it 7–9
+  server errors that no client ever saw.
+  - **The exact discriminator is the marker header** `X-Pironman-Backend`, which
+    `_send` stamps on every hop it makes — first probe, every retry — and which
+    nothing else sends. Traefik logs a request header only if told to keep it, so
+    this needs the proxy flag in README's one-time host setup.
+  - Without that flag the **router name is a partial fallback**, and the shape of
+    what it misses is the whole point. A forward normally lands on the app's own
+    router (whose rule requires the marker) and is caught. But while the
+    container is stopped that router does not exist, so the forward matches the
+    *frontend* router and returns to the static host, which answers `503` + the
+    down marker — the same internal request, logged under `fe-<id>`, and
+    indistinguishable there from a client's. **Both shapes were observed within
+    ten minutes on 2026-08-05:** one wake left seven `500`s on the backend router
+    (caught), the next left five `503`s on the frontend router (not). A single
+    measurement of a wake will show you one shape and let you believe it is the
+    only one — as it did here, until the second wake.
+  - `ClientHost` would separate them — it is the static host's container IP — and
+    is not usable: it changes on every redeploy of `web` and Docker recycles it.
+    `web`'s address that morning belonged to `wa-gateway` by the afternoon, so
+    keying on it would silently drop another app's real traffic.
+  - An app **nothing** fronts (`api`) is reached directly, so its backend-router
+    lines are real traffic: the fallback is keyed on the fronted set
+    (`routing.fronted_ids`), never on the router name alone. A line with no
+    `RouterName` is counted — a missing field must over-count visibly rather than
+    zero an app silently.
+- **So a sleeping app's error rate still has a floor** until the marker header is
+  captured: roughly one phantom 5xx per wake, sometimes more. Reading `apps_stats`
+  `server_error_pct` or the dashboard without knowing this invites chasing an
+  outage that never happened. It also feeds `alerts.check_once`, thresholded
+  (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
+  - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
+    wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
+    inside the loop (`web/server.py`) — right for latency, but every attempt is a
+    forward and every forward is a logged response, so one cold wake went from
+    ~1 counted 5xx to **7–9**. `smartbill-mcp` alerted on a wake that served its
+    client `200` in 3.2s. A faster wake must not be a louder one, and any future
+    change to the retry schedule is also a change to this app's error rate until
+    the header lands.
 - **Read-only MCP tools:** `analytics_overview` (uniques, hits, DAU/WAU/MAU,
   humans-vs-bots, per-app breakdown), `analytics_timeseries`, `analytics_cohorts`,
   `analytics_agents`, `analytics_recent` (live tail of raw requests), and

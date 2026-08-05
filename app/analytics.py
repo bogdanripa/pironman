@@ -33,8 +33,9 @@ import logging
 import re
 from datetime import date, datetime, timezone
 
-from . import autoupdate
+from . import autoupdate, routing
 from .config import ANALYTICS_PROXY, ANALYTICS_SALT, DOMAIN_SUFFIX
+from .routing import BACKEND_HEADER
 from .db import pool
 
 _log = logging.getLogger("pironman.analytics")
@@ -169,8 +170,70 @@ def _parse_line(line: str) -> dict | None:
     return {"app_id": app_id, "visitor": _visitor(ip, ua),
             "day": day, "start": start, "at": _moment(start), "is_bot": _is_bot(ua),
             "ua": (ua or "(none)")[:512],  # stored for the top-agents breakdown
+            # Both halves of _internal_leg below: the marker header the static
+            # host stamps on every forward (present only if the access log is
+            # configured to keep it), and which router ended up serving it.
+            "marker": (e.get(f"request_{BACKEND_HEADER}") or "").strip(),
+            "router": (e.get("RouterName") or "").split("@")[0].strip(),
             "status": int(status) if isinstance(status, (int, float)) else None,
             "dur_ms": (dur / 1e6) if isinstance(dur, (int, float)) else None}
+
+
+def _internal_leg(rec: dict, fronted: set[str]) -> bool:
+    """Whether this line is the static host's own forward rather than a request
+    from a client — i.e. the inner leg of one exchange logged twice.
+
+    A fronted app's request crosses the proxy at least twice: client -> static
+    host, then static host -> backend (§9b). Both lines carry the app's real
+    Host, so both used to be counted, and that was wrong in two directions at
+    once. Every fronted app's request count was roughly doubled; and a cold wake
+    put 7-9 server errors on the app that no client ever saw, because every
+    attempt in the wake loop is a forward and every forward is logged (§9c).
+
+    **The exact discriminator is the marker header**, `X-Pironman-Backend`, which
+    `web/server.py:_send` stamps on every hop it makes — first probe, every retry
+    — and which nothing else sends. Traefik logs a request header only if the
+    access log is told to keep it, so this half is live only once the proxy
+    carries `--accesslog.fields.headers.names.X-Pironman-Backend=keep` (README,
+    one-time host setup).
+
+    Until then the router name is a **partial** fallback, and the shape of what
+    it misses matters. A forward normally lands on the app's own router, whose
+    rule requires the marker — those are caught. But while the container is
+    stopped that router does not exist, so the forward matches the *frontend*
+    router and comes back to the static host, which answers `503` + the down
+    marker: same internal request, logged under `fe-<id>`, indistinguishable
+    here from a client's. Both shapes were observed within ten minutes on
+    2026-08-05 — one wake left seven `500`s on the backend router, the next left
+    five `503`s on the frontend router — so do not read the fallback as complete
+    just because a wake happened to produce the caught shape.
+
+    ClientHost would separate them (the static host's own container IP) and is
+    not usable: it changes on every redeploy of `web` and Docker recycles it —
+    that afternoon `web`'s former address belonged to `wa-gateway` — so keying on
+    it would silently drop another app's real traffic.
+
+    The outer leg is the honest one to keep: it carries the status the client
+    actually received and the full duration, cold wake included.
+
+    Two deliberate non-filters. An app nothing fronts (`api`) is reached
+    directly, so its backend-router lines ARE client traffic — which is why the
+    fallback needs `fronted` and cannot key on the router name alone. And a line
+    with no RouterName is counted rather than dropped: if that field ever goes
+    missing from the access log, the failure should be a visible over-count,
+    never a silent zero.
+
+    `fronted` comes from the same query that writes the routers, so the two
+    cannot disagree about which apps are fronted. They can disagree about *when*:
+    between an app becoming fronted and the label sync landing, its own router
+    still matches the public Host on its own, and that window's requests are
+    dropped rather than counted. Seconds, once, per app.
+    """
+    if rec.get("marker") == routing.BACKEND_TOKEN:
+        return True
+    if not rec["router"] or rec["app_id"] not in fronted:
+        return False
+    return rec["router"] != routing.fe_router(rec["app_id"])
 
 
 async def _read_since(cursor: str | None) -> str:
@@ -271,6 +334,12 @@ async def ingest_once() -> dict:
         cursor = await conn.fetchval(
             "SELECT v FROM analytics_state WHERE k = $1", _CURSOR_KEY)
 
+        # Which apps the static host fronts, and therefore whose backend-router
+        # lines are its own forwards rather than client traffic — see
+        # _internal_leg. Read once per pass: it changes only when an app is
+        # created, deleted or (un)fronted.
+        fronted = await routing.fronted_ids(conn)
+
         raw = await _read_since(cursor)
 
         # Aggregate the batch in memory so each (app, visitor, day) is one upsert.
@@ -307,7 +376,7 @@ async def ingest_once() -> dict:
         # what Coolify generates); JSON but no app hosts means the log is missing
         # RequestHost or the domain suffix changed; and everything older than the
         # cursor is the only case that is actually normal.
-        tally = {"lines": 0, "json": 0, "app": 0, "old": 0}
+        tally = {"lines": 0, "json": 0, "app": 0, "old": 0, "internal": 0}
         for line in raw.splitlines():
             stamp = _stamp_of(line)
             if stamp > horizon:
@@ -324,6 +393,13 @@ async def ingest_once() -> dict:
             if cursor and rec["start"] <= cursor:
                 tally["old"] += 1
                 continue  # already counted in an earlier pass
+            # Counted in the tally above but never in the rollups: it is a
+            # hosted-app line, so it is proof the log is being read correctly,
+            # but the client's own line for this same exchange is counted
+            # separately and counting both would double it.
+            if _internal_leg(rec, fronted):
+                tally["internal"] += 1
+                continue
             seen += 1
             if rec["start"] > newest:
                 newest = rec["start"]
@@ -447,7 +523,8 @@ async def ingest_once() -> dict:
                 "(%s) — the read is returning the start of the log, not the "
                 "end. Lower MAX_LINES.", newest_line, cursor)
         elif (newest_line and cursor and newest_line <= cursor) or (
-                tally["app"] and tally["app"] == tally["old"]):
+                tally["app"]
+                and tally["app"] == tally["old"] + tally["internal"]):
             # Caught up. There is no fault here to report: the cursor is old
             # because the BOX is idle, not because ingestion is stuck. Saying
             # anything louder is what the code before this got wrong — it
@@ -468,17 +545,19 @@ async def ingest_once() -> dict:
             # exact against the proxy log.
             #
             # The second test names the real question: every hosted-app line in
-            # the window had already been counted, so nothing of ours was
-            # missed. What broke the silence belonged to no app of ours.
+            # the window had already been counted — or was the static host's own
+            # forward, which is counted through its outer leg — so nothing of
+            # ours was missed. What broke the silence belonged to no app of ours.
             _log.debug("analytics: caught up at %s; nothing new belonging to a "
                        "hosted app since (%.0f minutes)", cursor, behind / 60)
         elif behind > _STALL_AFTER:
             _log.warning(
                 "analytics: nothing counted and the cursor is %.0f minutes behind "
                 "(%s). Read %d log lines, %d were JSON, %d were requests to a "
-                "hosted app, %d of those older than the cursor. %s",
+                "hosted app, %d of those older than the cursor, %d the static "
+                "host's own forwards. %s",
                 behind / 60, cursor, tally["lines"], tally["json"], tally["app"],
-                tally["old"], _diagnose(tally))
+                tally["old"], tally["internal"], _diagnose(tally))
     return {"lines_counted": seen, "cursor": mark or None}
 
 
@@ -593,8 +672,17 @@ async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
     which buries exactly the outlier worth looking at.
 
     The IP is the real client address (CF-Connecting-Ip behind Cloudflare), not
-    the hashed visitor id the rollups store — see the module docstring."""
+    the hashed visitor id the rollups store — see the module docstring.
+
+    Unlike the rollups this shows BOTH legs of a fronted app's request, flagged
+    `internal: true` for the static host's own forward (see _internal_leg). They
+    are shown rather than hidden because this is the view you reach for when a
+    wake misbehaves, and the inner leg is where the wake handshake's 5xx are —
+    but they are marked, because they are the pair that made a healthy app look
+    like it was throwing errors."""
     limit = max(1, min(limit, 200))
+    async with pool().acquire() as conn:
+        fronted = await routing.fronted_ids(conn)
     _, out = await autoupdate._docker(
         "logs", "--tail", str(limit * 8 + 200), ANALYTICS_PROXY, timeout=60)
     items = []
@@ -616,11 +704,16 @@ async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
         # to remember. Rounded to 0.1ms: the raw value carries nanosecond digits
         # that are noise at this scale and only make the column hard to read.
         dur = e.get("Duration")
+        router = (e.get("RouterName") or "").split("@")[0].strip()
         items.append({"time": e.get("StartUTC"), "app": aid,
                       "ip": _client_ip(e),
                       "method": e.get("RequestMethod"),
                       "path": e.get("RequestPath"),
                       "status": e.get("DownstreamStatus"),
+                      "internal": _internal_leg(
+                          {"app_id": aid, "router": router,
+                           "marker": (e.get(f"request_{BACKEND_HEADER}")
+                                      or "").strip()}, fronted),
                       "dur_ms": (round(dur / 1e6, 1)
                                  if isinstance(dur, (int, float)) else None)})
     return {"scope": app_id or "all apps", "requests": items[-limit:][::-1]}

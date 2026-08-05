@@ -250,6 +250,26 @@ def is_fronted(row) -> bool:
         and not sablier.excluded(row["id"])
 
 
+def fe_router(app_id: str) -> str:
+    """The name Traefik gives the static host's router for this app, as it
+    appears in the access log's RouterName (without the `@docker` provider
+    suffix). Derived from the label prefix so the two cannot drift."""
+    return _PREFIX[len("traefik.http.routers."):] + app_id
+
+
+async def fronted_ids(conn) -> set[str]:
+    """The ids of the apps the static host fronts — the same set `_sync` writes
+    routers for.
+
+    Exposed because a fronted app's traffic is logged TWICE at the proxy: once
+    on its `fe-<id>` router, which is the leg the client got, and once on its
+    own backend router, which only the static host can reach (its rule requires
+    the marker header). Analytics needs this set to tell the two apart.
+    """
+    return {r["id"] for r in await conn.fetch(_FRONTED, WEB_APP_ID)
+            if not sablier.excluded(r["id"])}
+
+
 # Apps the static host must front:
 #   - it has a bundle to serve;
 #   - it has redirect rules, which the static host applies even with no bundle;
