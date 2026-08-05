@@ -301,6 +301,21 @@ def _is_gateway_error(r: httpx.Response) -> bool:
     return r.status_code in _GATEWAY_ERRORS and DOWN_HEADER not in r.headers
 
 
+# Retried ONLY inside the wake loop, never on the first probe. A 500 is the most
+# common legitimate application error, so treating it as "not ready" anywhere
+# else would bury real failures behind a retry — but inside the loop we already
+# know the backend was asleep, we have already called Sablier, and what comes
+# back in that window is Traefik's, not the app's.
+#
+# Observed on the box 2026-08-05: the retry forward that follows a successful
+# wake answered 500 in **1ms** on the app's own router, while ping-pong's log
+# showed only `migrations ok` / `listening on 0.0.0.0:80` with no error, and
+# Sablier's log was clean. Nothing processed that request; the Traefik service
+# was momentarily inconsistent as it was re-created. The next request served
+# 200 in 5.26s. Roughly one wake in ten, always the first after a long idle.
+_WAKE_TRANSIENT = frozenset({500})
+
+
 async def _proxy(request: Request, aid: str) -> Response:
     """Forward to the app's backend, waking it first if it turns out to be asleep.
 
@@ -354,7 +369,8 @@ async def _proxy(request: Request, aid: str) -> Response:
         await asyncio.sleep(WAKE_RETRY_DELAY)
         tries += 1
         sent = await _send(request, aid)
-        if sent and not _is_down(sent[1]) and not _is_gateway_error(sent[1]):
+        if sent and not _is_down(sent[1]) and not _is_gateway_error(sent[1]) \
+                and sent[1].status_code not in _WAKE_TRANSIENT:
             _log.info("wake %s: served in %.2fs — probe %.2fs, sablier %.2fs, "
                       "then %d retr%s over %.2fs", aid, time.monotonic() - t0,
                       probe, sablier, tries, "y" if tries == 1 else "ies",

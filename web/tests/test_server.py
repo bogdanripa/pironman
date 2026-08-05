@@ -65,7 +65,8 @@ from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
 
 STATE = {"up": False, "wakes": 0, "sablier_ok": True, "seen_host": None,
-         "seen_xfh": None, "asked_by": None, "gateway": 0}
+         "seen_xfh": None, "asked_by": None, "gateway": 0,
+         "transient500": 0}
 
 proxy = FastAPI()
 
@@ -82,6 +83,15 @@ async def route(request: Request, p: str = ""):
     if marker and STATE["gateway"] > 0:
         STATE["gateway"] -= 1
         return PlainTextResponse("Bad Gateway", status_code=502)
+    # Traefik answering 500 in ~1ms as its service is re-created — seen on the
+    # box right after a successful wake, with the app's own log clean.
+    # Gated on "up": the real one appears on the retry that FOLLOWS a successful
+    # wake, not on the probe that discovers the app asleep. Firing it on the
+    # probe would test the opposite rule (an awake app's own 500, passed
+    # straight through) — which the next case covers deliberately.
+    if marker and STATE["up"] and STATE["transient500"] > 0:
+        STATE["transient500"] -= 1
+        return PlainTextResponse("Internal Server Error", status_code=500)
     if marker and STATE["up"]:
         # backend router matched -> the app itself
         STATE["seen_host"] = request.headers.get("host")
@@ -207,6 +217,25 @@ async def main():
         check("a persistent 502 passes the backend's own response through",
               r.status_code == 502 and "Bad Gateway" in r.text, r.text[:60])
         STATE["gateway"] = 0
+
+        print("\n[Traefik answers 500 in the wake window]")
+        # Only retried INSIDE the wake loop. A 500 is the commonest legitimate
+        # app error, so it must never be retried on the first probe -- see the
+        # next case, which asserts exactly that.
+        STATE["up"] = False; STATE["transient500"] = 1; STATE["wakes"] = 0
+        r = await c.get(base + "/api/thing", headers=H)
+        check("a transient 500 after the wake is retried, not passed on",
+              r.status_code == 200 and r.json().get("backend"), r.text[:80])
+
+        print("\n[an awake app's own 500 is NOT retried]")
+        # The backend is up, so the first probe reaches it and its 500 is the
+        # real answer. Retrying here would bury a genuine application failure.
+        STATE["up"] = True; STATE["transient500"] = 99; STATE["wakes"] = 0
+        r = await c.get(base + "/api/thing", headers=H)
+        check("an awake app's 500 goes straight to the caller",
+              r.status_code == 500, r.status_code)
+        check("and no wake was attempted for it", STATE["wakes"] == 0, STATE["wakes"])
+        STATE["transient500"] = 0
 
         print("\n[wake fails]")
         STATE["up"] = False; STATE["sablier_ok"] = False; STATE["wakes"] = 0
