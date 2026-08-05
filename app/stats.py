@@ -10,6 +10,7 @@ query, not a probe. Host totals come from `docker info`.
 import asyncio
 import re
 import shutil
+from datetime import datetime, timezone
 
 from . import autoupdate, provision
 from .analytics import LATENCY_BUCKETS_MS
@@ -18,6 +19,28 @@ from .db import pool
 
 _MEM_UNITS = {"B": 1 / 1048576, "KIB": 1 / 1024, "MIB": 1.0,
               "GIB": 1024.0, "TIB": 1048576.0}
+
+# How long two containers for one app must BOTH have been running before that is
+# a duplicate rather than a deploy in progress (measured here: under 30s).
+DUPLICATE_GRACE_S = 600
+
+
+def _age_s(started: str | None) -> float:
+    """Seconds since a Docker timestamp, or 0 if it will not parse.
+
+    Docker writes NANOsecond precision ('…T16:12:09.620469741Z') and
+    `fromisoformat` accepts only 3 or 6 fractional digits, so it is trimmed
+    first. Unparseable reads as 0 — i.e. "too new to judge", which keeps an
+    unreadable timestamp from manufacturing a duplicate report.
+    """
+    if not started:
+        return 0.0
+    v = re.sub(r"(\.\d{6})\d+", r"\1", started.strip().replace("Z", "+00:00"))
+    try:
+        at = datetime.fromisoformat(v)
+    except ValueError:
+        return 0.0
+    return (datetime.now(timezone.utc) - at).total_seconds()
 
 
 def _mem_mb(tok: str) -> float | None:
@@ -294,6 +317,13 @@ async def app_resources(include_db: bool = True, perf_days: int = 7) -> dict:
         uuid = app["coolify_uuid"] or ""
         live = [n for n in names if uuid and uuid in n]
         cname = live[0] if live else None
+        # A deploy runs two containers for a few seconds — Coolify starts the new
+        # one and stops the old once it is healthy — so only containers that have
+        # both been up a while are a duplicate rather than a deploy in flight.
+        # `life` is already fetched for state_since, so this costs no extra call.
+        if len(live) > 1:
+            live = [n for n in live
+                    if _age_s(life.get(n, {}).get("since")) > DUPLICATE_GRACE_S]
         # `names` holds RUNNING containers only, so its absence cannot tell a
         # slept container from a deleted one. `disk` is built from `docker ps -a`,
         # so its keys answer that for free — no extra call.

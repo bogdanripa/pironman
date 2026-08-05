@@ -38,6 +38,7 @@ nothing to start, and only a redeploy can recreate it.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -56,6 +57,9 @@ ALWAYS_ON = {API_APP, os.environ.get("STATIC_HOST_APP", "web")}
 # Restarting the same container in a tight loop turns one fault into a different
 # fault. Two consecutive failing runs (~10 minutes) before trying again.
 RESTART_COOLDOWN_RUNS = 2
+# How long two containers for one app must BOTH have been running before that
+# counts as a duplicate rather than a deploy in progress. See `settled`.
+DUPLICATE_GRACE_S = 600
 
 
 def sh(*args: str, check: bool = False) -> tuple[int, str]:
@@ -188,6 +192,48 @@ def container_for(app_id: str, uuid: str | None = None,
     return names[0] if names else None
 
 
+def docker_time(value: str) -> datetime | None:
+    """Docker's RFC3339 with NANOsecond precision -> datetime, or None.
+
+    `fromisoformat` accepts 3 or 6 fractional digits, and Docker writes 9
+    ('2026-08-04T16:12:09.620469741Z'), so parsing it directly raises. Trim to
+    microseconds rather than reaching for a date library — this script depends on
+    the stdlib on purpose (it has to keep working when the platform does not).
+    """
+    v = value.strip().replace("Z", "+00:00")
+    v = re.sub(r"(\.\d{6})\d+", r"\1", v)
+    try:
+        return datetime.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+def settled(names: list[str]) -> list[str]:
+    """Of `names`, the ones running longer than DUPLICATE_GRACE_S.
+
+    A deploy legitimately runs two containers at once for a moment: Coolify
+    starts the new one and stops the old once it reports healthy. Measured on
+    this box, that overlap cleared in under 30 seconds. Without a settling
+    period a watchdog pass landing inside it would report a duplicate that is
+    simply a deploy in progress — and an alert that cries wolf is worse than no
+    alert, because it teaches everyone to skim past the one that is real.
+    A genuine duplicate persists indefinitely (the observed one ran 12 hours),
+    so nothing is lost by waiting for the next pass.
+    """
+    if len(names) < 2:
+        return names
+    _, out = sh("docker", "inspect", *names, "--format",
+                "{{.Name}}\t{{.State.StartedAt}}")
+    now = datetime.now(timezone.utc)
+    old = []
+    for line in out.splitlines():
+        name, _, started = line.partition("\t")
+        at = docker_time(started)
+        if at and (now - at).total_seconds() > DUPLICATE_GRACE_S:
+            old.append(name.strip().lstrip("/"))
+    return old
+
+
 def container_state(name: str) -> tuple[str, str]:
     """(state, health). health is '' when the image declares no healthcheck."""
     _, out = sh("docker", "inspect", name, "--format",
@@ -230,7 +276,7 @@ def check(container: str) -> tuple[dict[str, str], list[str], dict[str, str]]:
         #     the moment of the flip was never stopped by any later deploy.
         #     Checked before the sleep branch: what matters is how many are
         #     RUNNING, which is a fault for a sleeping app too.
-        live = containers_for(app, uuid)
+        live = settled(containers_for(app, uuid))
         if len(live) > 1:
             problems[f"duplicate:{app}"] = (
                 f"{app} has {len(live)} running containers ({', '.join(live)}) — "
