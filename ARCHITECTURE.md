@@ -746,12 +746,28 @@ difference being that one flag:
 | as published (`StartInterval` unset → Docker's 5s) | 5.27s, 5.27s, 5.27s |
 | rebuilt with `--start-interval=250ms` | **0.52s, 0.52s, 0.52s** |
 
-With the static host's measured overhead (probe 0.01s + one retry 0.26s) that
-is a **~0.8s cold wake**. The scaffold therefore emits `--start-interval=250ms`
-on the HEALTHCHECK line it recommends (§5b), so an app that ever turns Coolify's
-check off gets the fast path for free. Turning it off platform-wide is a
-separate decision and has not been taken: Coolify decides deploy rollback on
-that check.
+**End to end through the public URL, that is a ~0.76s cold wake** — measured,
+not extrapolated: 14 consecutive cold wakes of `ping-pong` on an image carrying
+the flag, with `health_check_enabled = false`, all `200`, 0.749-1.02s. The full
+arc on this box is **10.3s → 5.5s → 0.76s**: Sablier's refresh tick, then
+Docker's health start-interval.
+
+Note what the log does *not* say afterwards. A fast wake produces **no**
+`wake …: served` line at all, because with no Coolify healthcheck the container
+is routable almost at once, the static host's first probe succeeds, and
+`_proxy` returns on the fast path — Traefik's own Sablier middleware did the
+waiting. Absence of the line is the signature of the fast path working, not of
+the wake path being skipped.
+
+The scaffold emits `--start-interval=250ms` on the HEALTHCHECK line it
+recommends (§5b) so a new app gets this for free. Two things it does NOT do:
+
+- **`health_check_enabled = false` is not set for you.** Coolify's configured
+  check overrides the image's, so the flag is inert until it is off — and
+  Coolify decides **deploy rollback** on that check. Trading rollback detection
+  for wake latency is a per-app decision, and it is not taken platform-wide.
+- An image built before this line still has the 5s default. The flag can only
+  be set *in the image*, so every existing app needs a rebuild.
 
 The one thing the static host must never do here is fall through to `index.html`.
 An unreachable backend that answers with the site's homepage looks like a working
