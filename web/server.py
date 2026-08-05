@@ -50,6 +50,7 @@ seconds; nothing shows an interstitial.
 """
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -105,6 +106,10 @@ WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT_SECONDS", "60"))
 # how long a genuinely dead backend takes to report itself.
 WAKE_RETRY_DELAY = float(os.environ.get("WAKE_RETRY_DELAY_SECONDS", "0.25"))
 WAKE_RETRY_BUDGET = float(os.environ.get("WAKE_RETRY_BUDGET_SECONDS", "15"))
+
+# uvicorn already configures this one and it goes to stdout, so `apps_logs web`
+# shows it without a logging setup of our own.
+_log = logging.getLogger("uvicorn.error")
 
 # Hashed build output is safe to cache forever; everything else is not.
 # Entry files, in preference order. index.htm is the legacy spelling; supporting
@@ -267,15 +272,31 @@ async def _proxy(request: Request, aid: str) -> Response:
     seconds. It is only when waking fails that this gives up, and then it says so
     plainly rather than falling through to the frontend — a dead backend that
     answers with the site's homepage is far harder to notice than a 502.
+
+    **The slow path logs its own breakdown**, because four separate attempts to
+    explain a ten-second cold wake from the outside — timing the healthcheck,
+    the image, the retry schedule, Sablier's refresh — each produced a confident
+    story that the next measurement killed. Every one of them was inferring the
+    inside of this function from the outside of it. The stage timings are cheap,
+    they only fire when an app was actually asleep, and they answer the question
+    directly instead of supporting another guess.
     """
+    t0 = time.monotonic()
     sent = await _send(request, aid)
     if sent and not _is_down(sent[1]):
-        return _stream(*sent)
+        return _stream(*sent)          # fast path: awake, nothing logged
+    probe = time.monotonic() - t0
 
+    sablier = 0.0
     if sent:
         await sent[1].aclose()
         await sent[0].aclose()
-        if not await _wake(aid):
+        t_wake = time.monotonic()
+        woke = await _wake(aid)
+        sablier = time.monotonic() - t_wake
+        if not woke:
+            _log.warning("wake %s: FAILED — probe %.2fs, sablier %.2fs, total "
+                         "%.2fs", aid, probe, sablier, time.monotonic() - t0)
             return JSONResponse(
                 {"error": "backend is not running and could not be started",
                  "app": aid}, status_code=502)
@@ -285,15 +306,24 @@ async def _proxy(request: Request, aid: str) -> Response:
     # flat cadence until the budget runs out, so we return as soon after
     # readiness as the cadence allows rather than at the next widening gap.
     deadline = time.monotonic() + WAKE_RETRY_BUDGET
+    tries = 0
     while time.monotonic() < deadline:
         await asyncio.sleep(WAKE_RETRY_DELAY)
+        tries += 1
         sent = await _send(request, aid)
         if sent and not _is_down(sent[1]):
+            _log.info("wake %s: served in %.2fs — probe %.2fs, sablier %.2fs, "
+                      "then %d retr%s over %.2fs", aid, time.monotonic() - t0,
+                      probe, sablier, tries, "y" if tries == 1 else "ies",
+                      time.monotonic() - t0 - probe - sablier)
             return _stream(*sent)
         if sent:
             await sent[1].aclose()
             await sent[0].aclose()
 
+    _log.warning("wake %s: UNREACHABLE after %.2fs — probe %.2fs, sablier "
+                 "%.2fs, %d retries", aid, time.monotonic() - t0, probe,
+                 sablier, tries)
     return JSONResponse({"error": "backend unreachable", "app": aid},
                         status_code=502)
 
