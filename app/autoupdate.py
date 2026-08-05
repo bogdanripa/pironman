@@ -18,8 +18,7 @@ import asyncio
 import logging
 
 from . import coolify, envs, events
-from .config import (GHCR_USER, GHCR_TOKEN, SABLIER_AUTO_ENROLL, app_fqdn,
-                     app_url)
+from .config import GHCR_USER, GHCR_TOKEN, SABLIER_AUTO_ENROLL, app_fqdn
 from .db import pool
 
 _log = logging.getLogger("pironman.autoupdate")
@@ -256,55 +255,8 @@ async def settle(app_id: str, uuid: str, before: str | None) -> dict:
             # redeploy, which would start the container straight back up and
             # leave the app awake anyway.
             if not await _maybe_enroll_sablier(c, app):
-                result["warm"] = await warm_after_deploy(app_id)
                 result["sleep"] = await sleep_after_deploy(app)
     return result
-
-
-async def warm_after_deploy(app_id: str, timeout: float = 30.0) -> dict | None:
-    """Send one request through the app's public URL before putting it to sleep,
-    so the first REAL caller after a deploy is not the one that pays for the
-    proxy catching up.
-
-    A deploy replaces the container, and its name changes with it (§3). Traefik
-    and Sablier both key on that name, and neither settles the instant the
-    deploy reports finished — measured here, the first request after a deploy
-    took 15-16s against ~0.8s for every one after it, and sometimes came back
-    500 outright while the app's own log stayed clean. That cost is unavoidable;
-    what is avoidable is a user paying it. So spend it here, where nobody is
-    waiting.
-
-    Deliberately through the **public URL** rather than straight at the
-    container: the point is to exercise the whole path a real caller uses —
-    Traefik's router, the Sablier middleware, the static host's forward — since
-    that path is exactly what has gone stale. Hitting the container directly
-    would warm nothing that matters.
-
-    Best-effort by construction. The request's outcome is recorded but never
-    raises: a deploy that verified is a good deploy whether or not this warm-up
-    answered, and failing it here would turn a cosmetic latency fix into a
-    deploy failure. `sleep_after_deploy` runs next regardless, so the app still
-    ends up asleep exactly as before — this only changes who absorbs the first
-    slow request.
-    """
-    import httpx
-    # app_url, NOT app_fqdn: the latter is the http:// ORIGIN Coolify stores
-    # (https there makes Traefik redirect and loop). A warm-up has to travel
-    # the public https path, which is the one that goes stale.
-    url = app_url(app_id) + "/"
-    t0 = asyncio.get_event_loop().time()
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as c:
-            r = await c.get(url)
-        took = asyncio.get_event_loop().time() - t0
-        _log.info("warmed %s after deploy: %s in %.2fs", app_id, r.status_code, took)
-        return {"warmed": True, "status": r.status_code, "seconds": round(took, 2)}
-    except Exception as e:
-        took = asyncio.get_event_loop().time() - t0
-        # Worth a line: a warm-up that cannot reach the app at all is the same
-        # symptom a user would have hit, just seen a few seconds earlier.
-        _log.warning("warm-up of %s failed after %.2fs: %s", app_id, took, e)
-        return {"warmed": False, "seconds": round(took, 2), "error": str(e)[:200]}
 
 
 async def check_and_update(conn, app, verify: bool = False) -> dict:
