@@ -324,9 +324,20 @@ function renderRecent() {
   const rows = _recent;
   if (!rows.length) { $('recent').innerHTML = '<span class="muted">No recent requests in the proxy buffer.</span>'; return; }
   const sc = s => (s >= 500) ? 'bad' : (s >= 400 ? 'warn' : '');
+  // Sub-millisecond precision is noise; seconds are what you are looking for
+  // when a request is slow, and reading "10254.3" as ten seconds takes a beat
+  // longer than it should. Flagged at 1s/5s because on this box a multi-second
+  // request is nearly always a sleeping app being woken, which is worth seeing
+  // as an outlier rather than averaging away.
+  const dur = ms => {
+    if (ms == null) return '—';
+    if (ms >= 1000) return (ms / 1000).toFixed(ms >= 10000 ? 0 : 1) + ' s';
+    return (ms >= 10 ? Math.round(ms) : ms) + ' ms';
+  };
+  const dc = ms => (ms == null) ? 'muted' : (ms >= 5000 ? 'bad' : (ms >= 1000 ? 'warn' : ''));
   const shown = rows.slice(0, _recentShown);
   const table =
-    `<div style="overflow-x:auto"><table><tr><th>Time · ${esc(TZ)}</th><th>App</th><th>Client IP</th><th>Method</th><th>URL</th><th class="n">Status</th></tr>` +
+    `<div style="overflow-x:auto"><table><tr><th>Time · ${esc(TZ)}</th><th>App</th><th>Client IP</th><th>Method</th><th>URL</th><th class="n">Status</th><th class="n">Took</th></tr>` +
     shown.map(r =>
       `<tr><td class="muted" title="${esc(r.time || '')}">${esc(localTime(r.time))}</td>` +
       `<td>${esc(r.app || '')}</td>` +
@@ -334,7 +345,8 @@ function renderRecent() {
       `<td class="ip" title="${esc(r.ip || '')}">${esc(r.ip || '—')}</td>` +
       `<td>${esc(r.method || '')}</td>` +
       `<td style="max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.path || '')}</td>` +
-      `<td class="n ${sc(r.status)}">${r.status ?? ''}</td></tr>`).join('') +
+      `<td class="n ${sc(r.status)}">${r.status ?? ''}</td>` +
+      `<td class="n ${dc(r.dur_ms)}" title="${r.dur_ms == null ? '' : esc(r.dur_ms + ' ms')}">${esc(dur(r.dur_ms))}</td></tr>`).join('') +
     '</table></div>';
   const remaining = rows.length - shown.length;
   const more = remaining > 0

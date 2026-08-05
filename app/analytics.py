@@ -583,8 +583,14 @@ async def top_agents(app_id: str | None = None, days: int = 30,
 
 async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
     """The most recent individual HTTP requests, newest first, read live from the
-    edge proxy log (not the rollups): time, app, client IP, method, path and
-    status. A tail, not history — only what is still in the proxy's log buffer.
+    edge proxy log (not the rollups): time, app, client IP, method, path, status
+    and how long the request took. A tail, not history — only what is still in
+    the proxy's log buffer.
+
+    `dur_ms` is the proxy's own measure of the whole exchange, so for the first
+    request to a sleeping app it includes the wake, which is seconds rather than
+    milliseconds. That is the point: the rollups only carry a per-day average,
+    which buries exactly the outlier worth looking at.
 
     The IP is the real client address (CF-Connecting-Ip behind Cloudflare), not
     the hashed visitor id the rollups store — see the module docstring."""
@@ -606,11 +612,17 @@ async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
         aid = host[: -len(DOMAIN_SUFFIX)]
         if not aid or "." in aid or (app_id and aid != app_id):
             continue
+        # Traefik reports request time in NANOseconds, as _parse_line also has
+        # to remember. Rounded to 0.1ms: the raw value carries nanosecond digits
+        # that are noise at this scale and only make the column hard to read.
+        dur = e.get("Duration")
         items.append({"time": e.get("StartUTC"), "app": aid,
                       "ip": _client_ip(e),
                       "method": e.get("RequestMethod"),
                       "path": e.get("RequestPath"),
-                      "status": e.get("DownstreamStatus")})
+                      "status": e.get("DownstreamStatus"),
+                      "dur_ms": (round(dur / 1e6, 1)
+                                 if isinstance(dur, (int, float)) else None)})
     return {"scope": app_id or "all apps", "requests": items[-limit:][::-1]}
 
 
