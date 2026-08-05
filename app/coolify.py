@@ -126,9 +126,48 @@ async def delete_env(uuid: str, key: str) -> None:
 
 
 async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
-    """Enable Coolify's healthcheck, which becomes a docker HEALTHCHECK on the
-    container. Sablier needs it to tell 'started' from 'ready' — without one,
-    the first request after a wake can hit a container that is still booting."""
+    """Record the healthcheck settings, but leave Coolify's own check OFF so the
+    **image's** HEALTHCHECK is what runs.
+
+    Sablier reports an instance ready only once its container is healthy, so
+    whatever governs health governs the cold wake. Coolify's configured check
+    overrides the image's and cannot express Docker's `--start-interval`, which
+    schedules the FIRST probe and defaults to **5s** — that 5s was the whole of
+    a cold wake once Sablier's own refresh tick was fixed. Coolify has no field
+    for it, and a `--health-start-interval` in `custom_docker_run_options` is
+    silently dropped by its docker-run-to-compose conversion (fifteen flags
+    allowlisted, no `--health-*`). The image's HEALTHCHECK is the only place it
+    can be set, and it only takes effect if Coolify is not overriding it.
+
+    Measured on this box: ping-pong, same image plus that one flag, went from a
+    5.5s cold wake to **0.76s** over 14 consecutive wakes.
+
+    **It stays ENABLED here, and the reason is worth writing down**, because
+    reading Coolify's source alone says the opposite. Coolify skips health
+    verification when `isHealthcheckDisabled() && custom_healthcheck_found ===
+    false`, which reads as "an image HEALTHCHECK keeps you covered". It does
+    not, for us: `custom_healthcheck_found` is only ever set by the build-pack
+    paths that see a Dockerfile, and `deploy_dockerimage_buildpack()` never
+    inspects the pulled image. Every app here is a registry image, and the
+    column is `false` for all of them on this box — including one whose image
+    demonstrably carries a HEALTHCHECK. Verified in the database, after the
+    source had suggested otherwise.
+
+    So turning this off does cost something real: Coolify stops waiting on
+    `.State.Health.Status` and stops **rolling a bad deploy back**, which is the
+    behaviour `autoupdate.verify_deploy` was written to detect rather than
+    replace. A broken container would stay live instead of the previous one
+    continuing to serve.
+
+    That is the whole trade — sub-second wakes against automatic rollback — and
+    it is per-app, not a platform default, so it is not taken here. Flip
+    `health_check_enabled` on an individual app when its wake latency matters
+    more than its rollback, and give that app's image a HEALTHCHECK carrying
+    `--start-interval` (the scaffold's line) so the flip actually buys the
+    speed. The autoupdate sweep warns about any container left with no
+    healthcheck at all, which is the state where both properties are lost
+    silently.
+    """
     await _request("PATCH", f"/applications/{uuid}", json={
         "health_check_enabled": True,
         "health_check_path": path,

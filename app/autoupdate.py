@@ -15,10 +15,13 @@ unchanged tag is a cheap no-op, so both paths are idempotent: they redeploy only
 when the tag's digest actually moved.
 """
 import asyncio
+import logging
 
 from . import coolify, envs, events
 from .config import GHCR_USER, GHCR_TOKEN, SABLIER_AUTO_ENROLL, app_fqdn
 from .db import pool
+
+_log = logging.getLogger("pironman.autoupdate")
 
 _ghcr_logged_in = False
 
@@ -390,4 +393,49 @@ async def check_all() -> list[dict]:
                         f"The previous version is still serving.")
             except Exception as e:
                 results.append({"id": app["id"], "updated": False, "error": str(e)})
+        try:
+            await warn_missing_healthchecks(c)
+        except Exception:
+            _log.exception("healthcheck audit failed")  # never abort the sweep
     return results
+
+
+async def warn_missing_healthchecks(conn) -> list[str]:
+    """Name any app container running without a HEALTHCHECK of any kind.
+
+    `set_healthcheck` deliberately leaves Coolify's own check off so the image's
+    governs — the image is the only place Docker's `--start-interval` can be
+    set, and that flag is the difference between a 5.5s cold wake and a 0.76s
+    one. Coolify still verifies a deploy in that arrangement, because it falls
+    back to reading `.State.Health.Status` when it finds a check in the image.
+
+    But only then. With no check anywhere, Coolify's own condition
+    (`isHealthcheckDisabled() && custom_healthcheck_found === false`) sets
+    `newVersionIsHealthy = true` and returns — so the deploy is reported
+    successful without being verified, and Sablier has nothing to distinguish a
+    started container from a ready one. Both losses are silent, and a deploy
+    that was never checked reads exactly like one that passed, which is the
+    failure this platform is built against (§12). Hence the warning: it is the
+    only thing standing between that state and nobody noticing.
+    """
+    rows = await conn.fetch(
+        "SELECT id, coolify_uuid FROM apps WHERE coolify_uuid IS NOT NULL "
+        "ORDER BY id")
+    missing = []
+    for r in rows:
+        name = await _container_name(r["coolify_uuid"])
+        if not name:
+            continue  # not running; nothing to inspect, and not our business here
+        rc, out = await _docker(
+            "inspect", "--format",
+            "{{if .Config.Healthcheck}}yes{{else}}no{{end}}", name, timeout=30)
+        if rc == 0 and out.strip() == "no":
+            missing.append(r["id"])
+    if missing:
+        _log.warning(
+            "no HEALTHCHECK on %s — Coolify is NOT verifying their deploys and "
+            "Sablier cannot tell a started container from a ready one. Add a "
+            "HEALTHCHECK to the image; apps_deploy_workflow prints the line, "
+            "and it needs --start-interval=250ms to wake in under a second.",
+            ", ".join(missing))
+    return missing
