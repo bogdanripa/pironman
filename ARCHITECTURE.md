@@ -1097,6 +1097,23 @@ symptom and the platform's own status agreed with it.
   the source: it describes what *should* happen on a fresh box, which is not the
   same as what this one is doing. See `CLAUDE.md` for the working rule and a
   table of the assumptions that turned out to be wrong.
+- **`docker logs` on the `api` container shows WARNING and above, and nothing
+  else** — so a near-empty log is the normal, healthy state, not a sign the
+  control plane is idle or its logging is broken. No module calls
+  `basicConfig`/`dictConfig` and the Dockerfile `CMD` sets no `--log-level`, so
+  the `pironman*` loggers reach no handler and Python's `logging.lastResort`
+  (level WARNING, to stderr) is the only sink. Everything below that is
+  discarded before it is written. Verified 2026-08-05 by two routes: no handler
+  is configured anywhere under `app/`; and `analytics.py`'s
+  `_log.info("analytics: counted %d lines, cursor now %s")` provably ran many
+  times over an 8h container life — the cursor tracked the newest proxy log line
+  and `analytics_perf` grew by thousands of requests — while the container's
+  entire log was 40 lines of uvicorn startup and access output with none of them.
+  **Consequence for diagnosis: an absent INFO line is not evidence.** Grep the
+  api log for `analytics:` *warnings* — those clear the bar and are the intended
+  stall signal (§12, the alarm-on-idleness lesson). Reading the absence of
+  `analytics: counted ...` as a stalled ingester inverts the truth; use
+  `platform_tasks_health` and the cursor-vs-newest-log-line comparison instead.
 
 **Checking it in isolation.** `web/tests/test_server.py` stands the real static
 host up against a fake Traefik and a fake Sablier and drives the paths that have

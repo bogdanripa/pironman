@@ -40,6 +40,7 @@ was false:
 | "Connector tools run without permission prompts during a Routine" (the routine's own prompt said so) | A `destructiveHint=True` tool prompts anyway and **blocks the run**. The 2026-08-03 audit sat idle from ~02:00 to 07:35 on its first call. The prompt asserting something does not make the connector do it |
 | The MCP `ToolAnnotations` set is cosmetic — it groups tools in the connector UI | It is the **autonomy policy**: the approval gate keys on it, so the set decides which tools a scheduled run can reach at all (`app/main.py`) |
 | A routine that sent no Telegram ran and found nothing | It may never have started. "Reports by exception" makes *blocked* and *healthy* produce identical silence — confirm it ran before reading silence as an all-clear |
+| A nearly empty `docker logs` on `api` means the control plane is idle, or its logging is broken | It means the log is doing its job. Nothing configures a handler, so `logging.lastResort` (**WARNING**, stderr) is the only sink and every INFO/DEBUG from `pironman*` is discarded. `analytics: counted N lines` ran repeatedly over 8h and appears **nowhere** — 40 lines total, all uvicorn. Grep for the *warnings*; the absence of an INFO line proves nothing (ARCHITECTURE §12) |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong
