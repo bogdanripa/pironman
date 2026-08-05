@@ -142,31 +142,46 @@ async def set_healthcheck(uuid: str, path: str = "/", port: int = 80) -> None:
     Measured on this box: ping-pong, same image plus that one flag, went from a
     5.5s cold wake to **0.76s** over 14 consecutive wakes.
 
-    **It stays ENABLED here, and the reason is worth writing down**, because
-    reading Coolify's source alone says the opposite. Coolify skips health
-    verification when `isHealthcheckDisabled() && custom_healthcheck_found ===
-    false`, which reads as "an image HEALTHCHECK keeps you covered". It does
-    not, for us: `custom_healthcheck_found` is only ever set by the build-pack
+    **It stays ENABLED, and there is no trade to make** — which took three
+    wrong turns to establish, so the answer is written down rather than the
+    reasoning that nearly won.
+
+    Coolify's compose healthcheck sets `test`, `interval`, `timeout`, `retries`
+    and `start_period`. It does **not** set `start_interval`, and Docker keeps
+    the image's value for a field the override does not mention. So an image
+    built with `HEALTHCHECK --start-interval=250ms` keeps that 250ms while
+    Coolify's check is fully in force. Verified on the box: bt-gateway's
+    container with `health_check_enabled = true` shows Coolify's own
+    curl-then-wget test alongside `StartInterval: 250000000`.
+
+    **Adding the flag to the image is the entire change.** Nothing here has to
+    be turned off, and turning it off is worse than useless:
+
+    | app | before | after (this check still ENABLED) |
+    |---|---|---|
+    | ping-pong | 10.3s | 0.77-1.04s |
+    | bt-gateway | ~5.5s | 1.39-2.98s |
+    | smartbill-mcp | ~5.5s | 1.01-3.27s |
+
+    Disabling it was measured too, and it made things worse: bt-gateway served
+    **2 of 6** cold wakes as 500 with its own log clean, because a wake that
+    returns sooner spends more of itself inside the window where Traefik's
+    Sablier plugin answers on its own account (§12). With the check enabled,
+    the same six wakes were 6/6.
+
+    It would also have cost real rollback protection, and not for the reason the
+    source suggests. Coolify skips verification when `isHealthcheckDisabled() &&
+    custom_healthcheck_found === false`, which reads as "an image HEALTHCHECK
+    keeps you covered" — but `custom_healthcheck_found` is only set by build-pack
     paths that see a Dockerfile, and `deploy_dockerimage_buildpack()` never
-    inspects the pulled image. Every app here is a registry image, and the
-    column is `false` for all of them on this box — including one whose image
-    demonstrably carries a HEALTHCHECK. Verified in the database, after the
-    source had suggested otherwise.
+    inspects the pulled image. Every app here is a registry image and the column
+    is `false` for all of them, including ones whose images demonstrably carry a
+    HEALTHCHECK. So disabling this really would stop Coolify rolling a bad
+    deploy back. Both facts point the same way: leave it on.
 
-    So turning this off does cost something real: Coolify stops waiting on
-    `.State.Health.Status` and stops **rolling a bad deploy back**, which is the
-    behaviour `autoupdate.verify_deploy` was written to detect rather than
-    replace. A broken container would stay live instead of the previous one
-    continuing to serve.
-
-    That is the whole trade — sub-second wakes against automatic rollback — and
-    it is per-app, not a platform default, so it is not taken here. Flip
-    `health_check_enabled` on an individual app when its wake latency matters
-    more than its rollback, and give that app's image a HEALTHCHECK carrying
-    `--start-interval` (the scaffold's line) so the flip actually buys the
-    speed. The autoupdate sweep warns about any container left with no
-    healthcheck at all, which is the state where both properties are lost
-    silently.
+    The autoupdate sweep still warns about a container with no healthcheck at
+    all, which is the one state where readiness gating and deploy verification
+    are lost together and silently.
     """
     await _request("PATCH", f"/applications/{uuid}", json={
         "health_check_enabled": True,

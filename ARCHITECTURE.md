@@ -736,21 +736,41 @@ container, not the request that "succeeded".
 
 **The one place it CAN be set is the image's own `HEALTHCHECK`**, which takes
 `--start-interval` (Docker 25+). Coolify's configured check overrides the
-image's, so this only bites for an app with `health_check_enabled = false` —
-but it is the whole difference between a five-second wake and a sub-second one.
-Measured on the real `ping-pong` image, same env, same Sablier, the only
-difference being that one flag:
+image's `test` and timings — but not this field, which it never writes, so the
+image's value survives and applies with Coolify's check fully enabled. That is
+the whole difference between a five-second wake and a sub-second one, and it
+costs nothing else. Measured on the real `ping-pong` image, same env, same
+Sablier, the only difference being that one flag:
 
 | ping-pong image | Sablier blocking call |
 |---|---|
 | as published (`StartInterval` unset → Docker's 5s) | 5.27s, 5.27s, 5.27s |
 | rebuilt with `--start-interval=250ms` | **0.52s, 0.52s, 0.52s** |
 
-**End to end through the public URL, that is a ~0.76s cold wake** — measured,
-not extrapolated: 14 consecutive cold wakes of `ping-pong` on an image carrying
-the flag, with `health_check_enabled = false`, all `200`, 0.749-1.02s. The full
-arc on this box is **10.3s → 5.5s → 0.76s**: Sablier's refresh tick, then
-Docker's health start-interval.
+**End to end through the public URL, that is a ~0.8s cold wake** — measured,
+not extrapolated. The full arc on this box is **10.3s → 5.5s → 0.8s**:
+Sablier's refresh tick, then Docker's health start-interval.
+
+**Adding the flag to the image is the whole change — Coolify's own healthcheck
+stays ENABLED.** Its compose healthcheck sets `test`, `interval`, `timeout`,
+`retries` and `start_period` and never `start_interval`, and Docker keeps the
+image's value for a field the override does not mention. A container therefore
+runs Coolify's test *and* the image's 250ms start-interval at once; bt-gateway
+with `health_check_enabled = true` shows exactly that. Measured across all three
+sleeping apps, with the check enabled throughout:
+
+| app | before | after |
+|---|---|---|
+| ping-pong | 10.3s | 0.77-1.04s |
+| bt-gateway | ~5.5s | 1.39-2.98s |
+| smartbill-mcp | ~5.5s | 1.01-3.27s |
+
+Disabling the check was tried and is **worse**: bt-gateway then served 2 of 6
+cold wakes as `500` with its own log clean — a faster wake spends more of itself
+inside the window where Traefik's Sablier plugin answers on its own account —
+against 6/6 with it enabled. It would also stop Coolify rolling a bad deploy
+back, because `custom_healthcheck_found` is never true for a registry image
+(§12).
 
 Note what the log does *not* say afterwards. A fast wake produces **no**
 `wake …: served` line at all, because with no Coolify healthcheck the container
@@ -760,14 +780,11 @@ waiting. Absence of the line is the signature of the fast path working, not of
 the wake path being skipped.
 
 The scaffold emits `--start-interval=250ms` on the HEALTHCHECK line it
-recommends (§5b) so a new app gets this for free. Two things it does NOT do:
-
-- **`health_check_enabled = false` is not set for you.** Coolify's configured
-  check overrides the image's, so the flag is inert until it is off — and
-  Coolify decides **deploy rollback** on that check. Trading rollback detection
-  for wake latency is a per-app decision, and it is not taken platform-wide.
-- An image built before this line still has the 5s default. The flag can only
-  be set *in the image*, so every existing app needs a rebuild.
+recommends (§5b), so a new app gets this for free with no platform-side step at
+all. The one thing it cannot help with: an image built before that line still
+carries Docker's 5s default, and the flag can only be set *in the image* — so
+every pre-existing app needs a rebuild to gain it, which is exactly how
+`bt-gateway`, `smartbill-mcp` and `wa-gateway` got it.
 
 The one thing the static host must never do here is fall through to `index.html`.
 An unreachable backend that answers with the site's homepage looks like a working
