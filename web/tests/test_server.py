@@ -54,11 +54,10 @@ os.environ["WAKE_TIMEOUT_SECONDS"] = "5"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import server  # noqa: E402
 server.WAKE_RETRY_DELAY = 0.2
-# Pinned equal to the initial delay so the backoff stays flat here: the retry
-# path is exercised by the dead-backend cases, which would otherwise spend the
-# full doubling budget failing.
-server.WAKE_RETRY_MAX_DELAY = 0.2
-server.WAKE_RETRIES = 5
+# The budget is wall-clock, so cap it here: the retry path is exercised by the
+# dead-backend cases, which would otherwise burn the full production budget
+# failing before the assertion runs.
+server.WAKE_RETRY_BUDGET = 1.0
 
 import httpx, uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402

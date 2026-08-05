@@ -52,6 +52,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -81,19 +82,29 @@ SABLIER_URL = os.environ.get("SABLIER_URL", "http://sablier:10000").rstrip("/")
 SABLIER_SESSION_DURATION = os.environ.get("SABLIER_SESSION_DURATION", "5m")
 WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT_SECONDS", "60"))
 # After Sablier reports the app ready, Traefik still has to notice the container
-# and pass its healthcheck filter. A few short retries cover that gap.
+# and pass its healthcheck filter. Short retries cover that gap.
 #
-# Backoff, not a flat delay. _wake() has already blocked until Sablier reported
-# the container ready, so all that is left is Traefik picking it up — which is
-# event-driven and usually well under a second. A flat 1.5s was therefore paid in
-# full on the FIRST attempt, every time, and a measured cold wake spent more of
-# its time asleep here than waiting for the app. Starting at 0.2s and doubling to
-# a 2s ceiling keeps roughly the same overall budget (~11s over 8 attempts) for
-# the rare container that really is slow, while the common case returns as soon
-# as Traefik is ready.
-WAKE_RETRIES = 8
-WAKE_RETRY_DELAY = 0.2
-WAKE_RETRY_MAX_DELAY = 2.0
+# FLAT cadence and a deadline, NOT a doubling backoff — and the difference is
+# most of a cold wake. What we are waiting on is an edge: the instant Docker
+# marks the container healthy and Traefik starts routing to it. That edge lands
+# at an arbitrary moment, so the penalty for missing it is the whole of the next
+# gap, and a schedule whose gaps grow is guaranteed to be at its worst exactly
+# when the edge is latest.
+#
+# Measured on this box, 2026-08-05, against the doubling schedule (attempts at
+# 0.35/0.55/0.95/1.75/3.35/5.35/7.35/9.35s): the app answered on its own
+# container IP at 0.76s and Docker marked it healthy at 5.39s — and the 5.35s
+# attempt missed that by 40ms, so nothing succeeded until 9.35s. Every cold wake
+# measured 10.25-10.41s, and over half of it was spent asleep in here. The
+# constancy was the tell: an accumulation varies, a missed slot does not.
+#
+# A flat 0.25s costs a handful of extra 503s against Traefik — which answers
+# them immediately, having no route — and returns within a quarter second of
+# whenever readiness actually happens. The budget is a wall-clock deadline
+# rather than an attempt count so that tuning the cadence cannot silently change
+# how long a genuinely dead backend takes to report itself.
+WAKE_RETRY_DELAY = float(os.environ.get("WAKE_RETRY_DELAY_SECONDS", "0.25"))
+WAKE_RETRY_BUDGET = float(os.environ.get("WAKE_RETRY_BUDGET_SECONDS", "15"))
 
 # Hashed build output is safe to cache forever; everything else is not.
 # Entry files, in preference order. index.htm is the legacy spelling; supporting
@@ -270,11 +281,12 @@ async def _proxy(request: Request, aid: str) -> Response:
                  "app": aid}, status_code=502)
 
     # Either the connection failed outright or we have just woken the app; give
-    # Traefik a moment to pick the container up, then try again.
-    delay = WAKE_RETRY_DELAY
-    for _ in range(WAKE_RETRIES):
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, WAKE_RETRY_MAX_DELAY)
+    # Traefik a moment to pick the container up, then try again — polling at a
+    # flat cadence until the budget runs out, so we return as soon after
+    # readiness as the cadence allows rather than at the next widening gap.
+    deadline = time.monotonic() + WAKE_RETRY_BUDGET
+    while time.monotonic() < deadline:
+        await asyncio.sleep(WAKE_RETRY_DELAY)
         sent = await _send(request, aid)
         if sent and not _is_down(sent[1]):
             return _stream(*sent)
