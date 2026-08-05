@@ -245,13 +245,27 @@ def _dockerfile_rules(health_path: str) -> str:
        apps_update; apps_get echoes it back). The platform configures the
        container's healthcheck from it when the container is first created, and
        that configured check is what Coolify runs and what a rollback is decided
-       on. The HEALTHCHECK line in your Dockerfile is a fallback — it is what
-       remains if that configuration call did not land — so point it at the same
-       path rather than at '/'. Two different paths is the one combination to
-       avoid: whichever check runs, it tests a route you did not mean.
+       on. The HEALTHCHECK line in your Dockerfile is the fallback that remains
+       if that configuration call did not land — so point it at the same path
+       rather than at '/'. Two different paths is the one combination to avoid:
+       whichever check runs, it tests a route you did not mean.
 
-    Example (note the curl install, the env-overridable :: bind, and the
-    HEALTHCHECK on {health_path} rather than '/'):
+       **Keep `--start-interval` on that line even though it looks redundant.**
+       It is the one healthcheck setting Coolify cannot express: its API has no
+       field for it, and a `--health-start-interval` passed through
+       `custom_docker_run_options` is silently dropped by Coolify's
+       docker-run-to-compose conversion, which allowlists 15 flags and no
+       `--health-*` among them. Docker's own default is **5s**, and that is the
+       delay before the FIRST probe runs — `--interval` governs only later ones.
+       For an app that sleeps, that 5s is most of a cold wake: measured on this
+       box, a container was answering on its own IP at 0.76s but was not marked
+       healthy until 5.13s, and Sablier will not report it ready until it is.
+       At `--start-interval=250ms` the same wake resolves in ~0.5s. So the line
+       only bites for an app whose Coolify healthcheck is disabled — but it
+       costs nothing to carry, and it is unsettable anywhere else.
+
+    Example (note the curl install, the env-overridable :: bind, the
+    HEALTHCHECK on {health_path} rather than '/', and --start-interval):
 
         FROM node:22-slim
         RUN apt-get update && apt-get install -y --no-install-recommends curl \\
@@ -268,6 +282,7 @@ def _dockerfile_rules(health_path: str) -> str:
         # healthcheck — and reading HOST keeps the same file runnable on a dev
         # box without IPv6.
         HEALTHCHECK --interval=10s --timeout=3s --start-period=10s \\
+          --start-interval=250ms \\
           CMD curl -fsS http://localhost:80{health_path} || exit 1
         CMD ["node", "server.js"]
     """)

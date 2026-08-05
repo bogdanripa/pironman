@@ -721,9 +721,37 @@ ping-pong and smartbill-mcp). Two things about how it is set:
 which schedules the *first* health probe; `interval` governs only later ones.
 Coolify exposes no column for it, `health_check_start_period=0` is silently
 floored back to 10s, and `--no-healthcheck` in `custom_docker_run_options` is
-regenerated away. So ~5.5s is the floor without changing the wake path itself —
-going below it means the static host forwarding straight to the container
-during the wake window, since the app is provably up at 0.76s.
+regenerated away.
+
+That last one is not a quirk, it is the design: Coolify converts
+`custom_docker_run_options` with `convertDockerRunToCompose()`, which allowlists
+fifteen flags — `--cap-add --cap-drop --security-opt --sysctl --device --init
+--ulimit --privileged --ip --ip6 --shm-size --dns --gpus --hostname
+--entrypoint` — and **silently drops** everything else, `--health-*` included
+(`bootstrap/helpers/docker.php`). `ApplicationDeploymentJob.php` emits
+`test/interval/timeout/retries/start_period` and never `start_interval`. So no
+amount of Coolify configuration can set it, and a flag that vanishes without an
+error is exactly the failure mode this repo is built against — check the
+container, not the request that "succeeded".
+
+**The one place it CAN be set is the image's own `HEALTHCHECK`**, which takes
+`--start-interval` (Docker 25+). Coolify's configured check overrides the
+image's, so this only bites for an app with `health_check_enabled = false` —
+but it is the whole difference between a five-second wake and a sub-second one.
+Measured on the real `ping-pong` image, same env, same Sablier, the only
+difference being that one flag:
+
+| ping-pong image | Sablier blocking call |
+|---|---|
+| as published (`StartInterval` unset → Docker's 5s) | 5.27s, 5.27s, 5.27s |
+| rebuilt with `--start-interval=250ms` | **0.52s, 0.52s, 0.52s** |
+
+With the static host's measured overhead (probe 0.01s + one retry 0.26s) that
+is a **~0.8s cold wake**. The scaffold therefore emits `--start-interval=250ms`
+on the HEALTHCHECK line it recommends (§5b), so an app that ever turns Coolify's
+check off gets the fast path for free. Turning it off platform-wide is a
+separate decision and has not been taken: Coolify decides deploy rollback on
+that check.
 
 The one thing the static host must never do here is fall through to `index.html`.
 An unreachable backend that answers with the site's homepage looks like a working
