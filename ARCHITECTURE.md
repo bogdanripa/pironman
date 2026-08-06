@@ -898,6 +898,18 @@ flows through: the Traefik access log** — nothing is installed per app.
   `server_error_pct` or the dashboard without knowing this invites chasing an
   outage that never happened. It also feeds `alerts.check_once`, thresholded
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
+  - **The floor is measurable exactly, so you never have to guess how much of an
+    error rate is phantom.** With the flag off, a fronted app's counted 5xx equals
+    the number of `fe-<id>` router 503s in the proxy log, and its counted requests
+    equal that router's line count — the backend-router legs are dropped in full.
+    Measured on 2026-08-06: `smartbill-mcp` had 264 `fe-` lines with 22 `503`s
+    against `analytics_perf` 262 requests / 22 `err_server`; `bt-gateway` 55 lines
+    with 8 `503`s against 54 / 8. Both exact. Meanwhile 361 and 85 backend-router
+    lines — carrying 123 and 42 `500`s — were correctly dropped and never reached
+    analytics. So the fallback is not partially broken: it drops one shape
+    perfectly and misses the other entirely, and the residual is countable with
+    `RouterName` alone. If the two numbers *don't* match, the extra errors are
+    real and belong to the app.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
     inside the loop (`web/server.py`) — right for latency, but every attempt is a

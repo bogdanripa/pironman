@@ -655,6 +655,22 @@ internal hops but not the ones a *sleeping* app's wake produces — those are
 counted against the app as 5xx it never returned, and are what makes a cold wake
 look like an outage (ARCHITECTURE §12).
 
+**Check whether the flags are actually live** — the proxy keeps running happily
+without them, so nothing complains and the only symptom is wrong numbers. Two
+independent reads, because the first alone only tells you what was configured:
+
+```sh
+# 1. what the proxy was started with
+docker inspect coolify-proxy --format '{{range .Config.Cmd}}{{println .}}{{end}}' | grep accesslog
+# 2. what it is actually logging — should be non-zero
+docker logs --since 6h coolify-proxy 2>&1 | grep -c 'X-Pironman-Backend'
+```
+
+A config change only takes effect on proxy restart, so the two can disagree;
+the second is the one that decides. This was found unapplied on 2026-08-06,
+a day after the commit that needed it — adding a required flag to this file
+does not add it to the box.
+
 ## Frontends (the `web` static host)
 
 An app can ship a backend (docker image), a static frontend (a zip of built
