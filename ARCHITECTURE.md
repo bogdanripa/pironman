@@ -884,19 +884,40 @@ flows through: the Traefik access log** — nothing is installed per app.
     (caught), the next left five `503`s on the frontend router (not). A single
     measurement of a wake will show you one shape and let you believe it is the
     only one — as it did here, until the second wake.
-  - `ClientHost` would separate them — it is the static host's container IP — and
-    is not usable: it changes on every redeploy of `web` and Docker recycles it.
-    `web`'s address that morning belonged to `wa-gateway` by the afternoon, so
-    keying on it would silently drop another app's real traffic.
+  - `ClientHost` separates them exactly — it is the static host's container IP —
+    but is not usable *as a stored key*: it changes on every redeploy of `web`
+    and Docker recycles it. `web`'s address that morning belonged to `wa-gateway`
+    by the afternoon, so keying on it would silently drop another app's real
+    traffic. **It is still the right tool for a one-off diagnosis**, where the
+    address is read live and cannot go stale, and it is the only check that does
+    not share an assumption with the router-name fallback. Resolve `web`'s
+    address first, then split the app's `fe-<id>` lines by `ClientHost`:
+
+    ```sh
+    docker inspect <web-container> --format \
+      '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}}{{end}}'
+    ```
+
+    On 2026-08-07 every one of `smartbill-mcp`'s nine `503`s came from
+    `fddf:6e69:23a7::4` (`web` itself) and all thirty client requests from the
+    bridge gateway `::1`, which settled in one command whether the app had served
+    a client an error. Note the proxy logs the **IPv6** address on this network
+    while `docker inspect`'s `.IPAddress` is the v4 one — read
+    `.GlobalIPv6Address` too or the two will not appear to match.
   - An app **nothing** fronts (`api`) is reached directly, so its backend-router
     lines are real traffic: the fallback is keyed on the fronted set
     (`routing.fronted_ids`), never on the router name alone. A line with no
     `RouterName` is counted — a missing field must over-count visibly rather than
     zero an app silently.
 - **So a sleeping app's error rate still has a floor** until the marker header is
-  captured: roughly one phantom 5xx per wake, sometimes more. Reading `apps_stats`
-  `server_error_pct` or the dashboard without knowing this invites chasing an
-  outage that never happened. It also feeds `alerts.check_once`, thresholded
+  captured: **exactly one phantom 5xx per cold wake**, on the `fe-<id>` router.
+  Measured on 2026-08-07, with the flag still absent from the proxy —
+  `smartbill-mcp` woke nine times and carried nine phantom `503`s, 1:1, against
+  zero real ones; it read an 18.75% `server_error_pct` (9 of 48) while every
+  client got `200`. That 1:1 makes a cheap sanity check: for a fronted app that
+  sleeps, count its `fe-<id>` 5xx and its cold wakes, and if they match, none of
+  them were real. Reading `apps_stats` `server_error_pct` or the dashboard
+  without knowing this invites chasing an outage that never happened. It also feeds `alerts.check_once`, thresholded
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`

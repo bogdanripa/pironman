@@ -655,6 +655,19 @@ internal hops but not the ones a *sleeping* app's wake produces — those are
 counted against the app as 5xx it never returned, and are what makes a cold wake
 look like an outage (ARCHITECTURE §12).
 
+**Check whether they are actually on** — this section says what to configure, not
+what the box is running, and the two drift. As of 2026-08-07 the third flag had
+never been applied here, two days after it was documented:
+
+```sh
+docker inspect coolify-proxy --format '{{range .Args}}{{println .}}{{end}}' | grep accesslog
+```
+
+That reads the running command, so it cannot be satisfied by an edit that was
+saved but never restarted into. A second, cheaper read is whether the header ever
+reaches the log at all — `docker logs --since 24h coolify-proxy | grep -c
+X-Pironman-Backend`, which is `0` when the flag is missing.
+
 ## Frontends (the `web` static host)
 
 An app can ship a backend (docker image), a static frontend (a zip of built
