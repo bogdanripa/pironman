@@ -40,6 +40,8 @@ was false:
 | "Connector tools run without permission prompts during a Routine" (the routine's own prompt said so) | A `destructiveHint=True` tool prompts anyway and **blocks the run**. The 2026-08-03 audit sat idle from ~02:00 to 07:35 on its first call. The prompt asserting something does not make the connector do it |
 | The MCP `ToolAnnotations` set is cosmetic — it groups tools in the connector UI | It is the **autonomy policy**: the approval gate keys on it, so the set decides which tools a scheduled run can reach at all (`app/main.py`) |
 | A routine that sent no Telegram ran and found nothing | It may never have started. "Reports by exception" makes *blocked* and *healthy* produce identical silence — confirm it ran before reading silence as an all-clear |
+| An app with traffic *after* its container's `FinishedAt`, still stopped, failed to wake | It served that traffic **without** waking. A fronted app's static bundle comes off `web` via the `fe-<id>` router and never touches the backend — `ping-pong` answered `/` and `/robots.txt` `200` in 5ms on 2026-08-07, stopped since 08-05. Check the **RouterName** of the traffic before calling it a wake failure; only a backend-router line needed the container |
+| A sleeping app's container exiting `137` was OOM-killed or crashed | `OOMKilled=false`. Sablier stops it, and `137` just means the app ignored `SIGTERM` until the grace period ran out — `ping-pong` does, `bt-gateway` and `smartbill-mcp` exit `0`. It says nothing about health |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong

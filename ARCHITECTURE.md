@@ -894,7 +894,7 @@ flows through: the Traefik access log** — nothing is installed per app.
     `RouterName` is counted — a missing field must over-count visibly rather than
     zero an app silently.
 - **So a sleeping app's error rate still has a floor** until the marker header is
-  captured: roughly one phantom 5xx per wake, sometimes more. Reading `apps_stats`
+  captured: one phantom 5xx per wake, measured. Reading `apps_stats`
   `server_error_pct` or the dashboard without knowing this invites chasing an
   outage that never happened. It also feeds `alerts.check_once`, thresholded
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
@@ -906,6 +906,26 @@ flows through: the Traefik access log** — nothing is installed per app.
     client `200` in 3.2s. A faster wake must not be a louder one, and any future
     change to the retry schedule is also a change to this app's error rate until
     the header lands.
+  - **Measured with the flag still absent, 2026-08-08:** the floor is exactly
+    **one** phantom 5xx per cold wake now that the backend-router shape is caught
+    — but it dominates what is left. `smartbill-mcp` that day: `analytics_perf`
+    `requests=106, err_server=19` (17.9%), of which **17** were the `fe-<id>`
+    `503`s. Two were real. The reported rate was an order of magnitude off the
+    1.9% clients actually saw, on an app that was serving fine.
+  - **How to check the ingester against the log by hand.** For a fronted app,
+    that day's `analytics_perf` row must equal, exactly, the count of access-log
+    lines whose `RouterName` is `fe-<id>` — 106 lines and 19 with `status >= 500`
+    matched the row request-for-request above. If they match, the ingester is
+    counting precisely what it means to and any remaining distortion is the
+    uncaught shape, not a bug in ingestion. Do this before suspecting the loop.
+  - **To separate the leaked lines by hand, use `ClientHost` — the thing the
+    ingester must not use.** The objection to it is recycling *over time*; at one
+    point in time it is exact. `docker inspect` `web`'s container for its current
+    address, and every log line bearing it is an internal forward. On 2026-08-08
+    that was `fddf:6e69:23a7::4`, and all 17 leaked `503`s carried it with a
+    `Duration` of 1ms, against 2667ms for the client's leg of the same wake — the
+    duration alone is nearly as good a tell, since a real client request never
+    completes in 1ms.
 - **Read-only MCP tools:** `analytics_overview` (uniques, hits, DAU/WAU/MAU,
   humans-vs-bots, per-app breakdown), `analytics_timeseries`, `analytics_cohorts`,
   `analytics_agents`, `analytics_recent` (live tail of raw requests), and

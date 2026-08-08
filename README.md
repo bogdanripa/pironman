@@ -655,6 +655,21 @@ internal hops but not the ones a *sleeping* app's wake produces — those are
 counted against the app as 5xx it never returned, and are what makes a cold wake
 look like an outage (ARCHITECTURE §12).
 
+**Check the third flag separately — its absence is silent.** The first two
+announce themselves (no access log, so every number is zero); a missing
+`X-Pironman-Backend=keep` leaves the tools reporting confident, wrong error
+rates, so nothing prompts you to look. It was documented here on 2026-08-05 and
+still not applied on 08-08, inflating `smartbill-mcp`'s reported server-error
+rate to 17.9% against a real 1.9%. Confirm it is live on the box, not just in
+this file:
+
+```
+docker inspect coolify-proxy --format '{{json .Config.Cmd}}' | tr ',' '\n' | grep accesslog
+```
+
+Editing the compose file alone is not enough — the flag reaches Traefik only on
+proxy restart, which drops every app's routing for a few seconds.
+
 ## Frontends (the `web` static host)
 
 An app can ship a backend (docker image), a static frontend (a zip of built
