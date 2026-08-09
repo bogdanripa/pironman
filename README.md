@@ -655,6 +655,16 @@ internal hops but not the ones a *sleeping* app's wake produces — those are
 counted against the app as 5xx it never returned, and are what makes a cold wake
 look like an outage (ARCHITECTURE §12).
 
+**Check which flags are actually live** rather than assuming the setup was done —
+they are proxy *command* arguments, so nothing in this repo reflects them:
+
+```
+docker inspect coolify-proxy --format '{{range .Args}}{{println .}}{{end}}' | grep accesslog
+```
+
+As of 2026-08-09 this box carries the first four and **not** the fifth, so every
+sleeping fronted app is still accruing fabricated 5xx.
+
 ## Frontends (the `web` static host)
 
 An app can ship a backend (docker image), a static frontend (a zip of built

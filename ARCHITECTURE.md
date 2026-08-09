@@ -1080,6 +1080,31 @@ symptom and the platform's own status agreed with it.
   warning, diff the two sources: `analytics_perf` for today against a per-host
   count from `docker logs coolify-proxy`. They agreeing exactly is what proved
   this one cosmetic.
+- **A fronted app's wake handshake is booked as the app's own 5xx until the proxy
+  is told to keep the marker header.** `_internal_leg` drops the static host's
+  inner legs on `X-Pironman-Backend`, but Traefik logs a request header only if
+  configured to keep it, and this box's proxy keeps only `User-Agent` and
+  `Cf-Connecting-Ip` — so the filter runs on its **partial** router-name
+  fallback. That fallback cannot catch the first probe of a *cold* wake: while
+  the container is stopped its own router does not exist, so the forward matches
+  the **frontend** router and is indistinguishable there from a client's request.
+  Every cold wake therefore books one fabricated 5xx against the app.
+  **Signature: on a sleeping fronted app, every `fe-<id>` 5xx has a `RequestPath`
+  ending in `?` and a duration of ~1ms**, while the client's own leg alongside it
+  is a `200` lasting seconds. The `?` comes from `web/server.py:_send` doing
+  `copy_with(query=request.url.query.encode())`, which renders an empty query as
+  a bare `?`; nothing a browser sends looks like that. Measured over 24h on
+  2026-08-09: 415 of 435 backend-router lines carried it, 253 of 253 real client
+  legs did not, and all 30 `fe-` 5xx did — smartbill-mcp 28, bt-gateway 2, with
+  `apps_stats` reporting exactly 28/255 = 10.98% server errors for an app that
+  never returned one, and `alert_state.err_server` carrying the same 28.
+  Use the `?` to **diagnose, never to filter**: it is a property of the current
+  forwarder, and a client may legitimately send a bare `?`. The real fix is the
+  proxy flag, and it costs a `coolify-proxy` restart.
+  This is worse than a wrong number. `alerts.py` notes the 5xx rate is the
+  **only** cover a sleeping app has, since such an app is never reported down —
+  so the one alarm standing between a failure-to-wake and silence is being fed
+  errors the wake itself manufactures.
 - **A shell "on the host" from inside a container inherits the container** —
   nsenter passes the caller's environment through and resolves `--wd` *before*
   the namespace switch, so a host shell needs `env -i` and a `cd /` run inside
