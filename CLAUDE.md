@@ -40,6 +40,7 @@ was false:
 | "Connector tools run without permission prompts during a Routine" (the routine's own prompt said so) | A `destructiveHint=True` tool prompts anyway and **blocks the run**. The 2026-08-03 audit sat idle from ~02:00 to 07:35 on its first call. The prompt asserting something does not make the connector do it |
 | The MCP `ToolAnnotations` set is cosmetic — it groups tools in the connector UI | It is the **autonomy policy**: the approval gate keys on it, so the set decides which tools a scheduled run can reach at all (`app/main.py`) |
 | A routine that sent no Telegram ran and found nothing | It may never have started. "Reports by exception" makes *blocked* and *healthy* produce identical silence — confirm it ran before reading silence as an all-clear |
+| A second container on the `paas-api` image, `Up Less than a second (health: starting)`, is a duplicate `api` — the very fault §12 warns about | It is **`host_run_script`'s own helper**, `pironman-host-<12 hex>`, and it appears because `docker ps` was run *through* it. The helper defaults to paas-api's image, so the tag matches exactly. Tells: a fresh random name each call, `nsenter -t 1 …`, `AutoRemove=true`, the `bridge` network, and no Traefik labels (ARCHITECTURE §5b) |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong

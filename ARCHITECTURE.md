@@ -266,6 +266,18 @@ The helper container carries the `nsenter` binary and contributes nothing else,
 which is why it defaults to paas-api's **own image** (already on the box, so no
 pull; `HOST_EXEC_IMAGE` overrides).
 
+That image choice has a consequence worth knowing before it costs a diagnosis:
+a `docker ps` run *from* `host_run_script` lists the helper executing it, named
+`pironman-host-<12 hex>`, carrying the same `ghcr.io/…/paas-api:sha-XXXXXXX` tag
+as the real control plane and reading `Up Less than a second (health: starting)`.
+It looks exactly like a second `api` container mid-deploy. It is not one: the
+name is `secrets.token_hex(6)` per call (a different one every script), it runs
+`nsenter -t 1 …`, it has `AutoRemove=true`, it sits on the default `bridge`
+network rather than Coolify's, and it carries **zero** Traefik labels — so it can
+take no traffic. `apps_stats` is not fooled either, since duplicate detection
+matches the app's uuid prefix and this name has none; only a human or agent
+reading raw `docker ps` output is.
+
 Three things there are easy to get wrong, and were:
 
 - **`env -i`.** nsenter passes the *caller's* environment through, so without it
