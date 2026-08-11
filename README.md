@@ -649,11 +649,24 @@ few seconds of edge downtime):
 Until that is enabled the tools simply report zeros — the rollup tables and loop
 are already live, so numbers start accruing the moment the proxy logs.
 
-The third flag is the newest and only affects fronted apps. Without it the
+The `X-Pironman-Backend` flag is the newest and only affects fronted apps. Without it the
 ingester falls back to the router name, which catches most of the static host's
 internal hops but not the ones a *sleeping* app's wake produces — those are
 counted against the app as 5xx it never returned, and are what makes a cold wake
-look like an outage (ARCHITECTURE §12).
+look like an outage (ARCHITECTURE §12). This is not a rounding error: on a
+measured day it was **74% of every server error the platform reported**, with one
+app reading 16.8% `server_error_pct` against a real client-facing rate of zero.
+
+Nothing on the box reports this flag as missing, and it is applied by hand rather
+than by a deploy, so a checkout can be current while the proxy is not. Check the
+**running** proxy, which is the only thing that answers it:
+
+```
+docker inspect coolify-proxy --format '{{.Config.Cmd}}' | tr ' ' '\n' | grep accesslog
+```
+
+All five lines above should come back. Treat `apps_stats`' `server_error_pct` for
+a fronted sleeping app as unreliable until they do.
 
 ## Frontends (the `web` static host)
 

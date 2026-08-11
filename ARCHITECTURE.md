@@ -885,18 +885,35 @@ flows through: the Traefik access log** — nothing is installed per app.
     measurement of a wake will show you one shape and let you believe it is the
     only one — as it did here, until the second wake.
   - `ClientHost` would separate them — it is the static host's container IP — and
-    is not usable: it changes on every redeploy of `web` and Docker recycles it.
-    `web`'s address that morning belonged to `wa-gateway` by the afternoon, so
-    keying on it would silently drop another app's real traffic.
+    is not usable **in code**: it changes on every redeploy of `web` and Docker
+    recycles it. `web`'s address that morning belonged to `wa-gateway` by the
+    afternoon, so keying on it would silently drop another app's real traffic.
+  - **It is still the way to attribute them after the fact**, which is how an
+    audit can measure the over-count without the flag. On this box `ClientHost`
+    is the container's own **IPv6 ULA** on the `coolify` network
+    (`fddf:6e69:23a7::/64`) — not a NAT'd address, so it does name the source
+    container — and `::1` is the network gateway, i.e. traffic arriving from
+    outside. So: an `fe-<id>` 5xx from `::1` is a client's, one from `web`'s
+    address is internal. Recycling is what makes this retrospective only —
+    resolve it by pinning `web`'s redeploy times from
+    `application_deployment_queues` and reading one address per interval. On
+    2026-08-11 `web` redeployed at 10:35:07 and moved `::4` → `::e`; its
+    `fe-<id>` 5xx stop at 10:31 on the old address and resume at 11:01 on the
+    new one, which is the shape that confirms both belong to `web`.
   - An app **nothing** fronts (`api`) is reached directly, so its backend-router
     lines are real traffic: the fallback is keyed on the fronted set
     (`routing.fronted_ids`), never on the router name alone. A line with no
     `RouterName` is counted — a missing field must over-count visibly rather than
     zero an app silently.
 - **So a sleeping app's error rate still has a floor** until the marker header is
-  captured: roughly one phantom 5xx per wake, sometimes more. Reading `apps_stats`
-  `server_error_pct` or the dashboard without knowing this invites chasing an
-  outage that never happened. It also feeds `alerts.check_once`, thresholded
+  captured, and the floor is most of the number rather than a rounding error.
+  Measured over a whole ordinary day (2026-08-11), **98 of the 133 server errors
+  counted across the fronted sleeping apps — 74% — originated inside `web`**:
+  `smartbill-mcp` 41 counted against **0** client-facing, `bt-gateway` 11 of 13,
+  `revolut-mcp` 46 of 79. `apps_stats` reported `smartbill-mcp` at 16.8%
+  `server_error_pct` on a day no client received a single 5xx from it. Reading
+  that field or the dashboard without knowing this invites chasing an outage that
+  never happened. It also feeds `alerts.check_once`, thresholded
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
@@ -1055,6 +1072,19 @@ symptom and the platform's own status agreed with it.
   since the last success, and not on activity that belongs to nobody. A false
   alarm is not harmless: it is what teaches the reader to skip the one channel
   that will eventually carry a real failure.
+- **One un-applied proxy flag makes every cold wake look like an outage, and
+  nothing in the platform reports the flag as missing.** `_internal_leg` needs
+  `X-Pironman-Backend` kept in the access log (§10, README one-time setup). The
+  code ships the dependency; the box only acquires it when a human edits the
+  proxy config, so a checkout can be fully up to date while the running proxy is
+  not — `git log` will never show it. Without the flag only the router-name
+  fallback runs, which drops the static host's forwards to a *running* backend
+  but not the ones a *sleeping* app's wake produces, and those are charged to the
+  app as 5xx no client ever received (74% of a normal day's total, §10).
+  **Signature: the app's `fe-<id>` 5xx lines carry `web`'s own `ClientHost`, and
+  `web`'s log shows `wake <app>: served in N s` immediately after each one** —
+  a served request and a counted server error for the same exchange. Check the
+  running `coolify-proxy`'s `.Config.Cmd` directly; the repo cannot answer it.
 - **A background repair behind a long `sleep` may never run** — the auto-update
   loop sleeps an hour *before* its first pass and the timer restarts on every
   redeploy of the control plane, which redeploys more often than that. Anything
