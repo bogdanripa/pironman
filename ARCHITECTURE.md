@@ -894,18 +894,36 @@ flows through: the Traefik access log** — nothing is installed per app.
     `RouterName` is counted — a missing field must over-count visibly rather than
     zero an app silently.
 - **So a sleeping app's error rate still has a floor** until the marker header is
-  captured: roughly one phantom 5xx per wake, sometimes more. Reading `apps_stats`
-  `server_error_pct` or the dashboard without knowing this invites chasing an
-  outage that never happened. It also feeds `alerts.check_once`, thresholded
+  captured: **exactly one** phantom 5xx per wake — the `fe-<id>` `503`, the only
+  shape the fallback cannot see. Measured 2026-08-12 with the fallback live and
+  the header still absent: 31 wakes across `bt-gateway`, `revolut-mcp` and
+  `smartbill-mcp` produced 31 counted server errors (9 / 6 / 16), while 151
+  backend-router `500`s from the same wakes were correctly dropped. Reading
+  `apps_stats` `server_error_pct` or the dashboard without knowing this invites
+  chasing an outage that never happened — those three read 13–20% over 7 days
+  with **zero** client-visible 5xx. It also feeds `alerts.check_once`, thresholded
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
+  - **To settle "is this rate real?" in one pass**, reconcile the two sides:
+    `analytics_perf.err_server` for the day against the count of `fe-<id>` 5xx
+    lines in the proxy log whose `ClientHost` is the static host's container IP
+    (`docker inspect` `web` for it *now* — it drifts, which is why the ingester
+    cannot key on it, but a one-off audit resolves it first and then it is exact).
+    Equal, app for app, means every recorded server error was internal. On
+    2026-08-12 they matched exactly. An anatomy of one wake, for what to expect:
+    client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
+    the container; five retries → `500` on the backend router (dropped); the sixth
+    → the app's own answer, which the client gets.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
     inside the loop (`web/server.py`) — right for latency, but every attempt is a
     forward and every forward is a logged response, so one cold wake went from
     ~1 counted 5xx to **7–9**. `smartbill-mcp` alerted on a wake that served its
-    client `200` in 3.2s. A faster wake must not be a louder one, and any future
-    change to the retry schedule is also a change to this app's error rate until
-    the header lands.
+    client `200` in 3.2s. A faster wake must not be a louder one. **The fallback
+    shipped in the same commit closed that particular hole**: the extra forwards
+    all land on the backend router and are dropped, so retry-schedule changes no
+    longer move the counted rate — only the one `fe-` `503` per wake survives, and
+    that is why the threshold has not fired since. Verified 2026-08-12, deltas of
+    1 against a threshold of 5.
 - **Read-only MCP tools:** `analytics_overview` (uniques, hits, DAU/WAU/MAU,
   humans-vs-bots, per-app breakdown), `analytics_timeseries`, `analytics_cohorts`,
   `analytics_agents`, `analytics_recent` (live tail of raw requests), and
