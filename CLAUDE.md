@@ -29,7 +29,7 @@ was false:
 | `docker logs --since` returned nothing | It returns lines normally |
 | The watchdog would report tasks as "never completed" | It **crashed** on the missing table |
 | `api` could be found by its `pironman.app` label | `api` has no such label; only `web` does |
-| `api` is covered by "apps that must not sleep" | Its row says `sleep_when_idle = true` |
+| `api` is covered by "apps that must not sleep" | Its row said `sleep_when_idle = true`. It reads `false` as of 2026-08-13 — the value drifted *after* the lesson, which is the lesson: read the row, do not assume either way |
 | A repeated `analytics: nothing counted, cursor N minutes behind` WARNING means ingestion is stalled | Ingestion was **exact** — `analytics_perf` matched the proxy log request-for-request. All 43 such warnings were caught-up passes (tally `app == old`) |
 | The Sablier controller is the container named `sablier` | **No container has that name.** It is a Coolify app, so its container is `<uuid>-<timestamp>`; `sablier` is a Docker **network alias**. Find it by image, `sablierapp/sablier` |
 | `analytics_last_seen` lists only live apps (ARCHITECTURE.md said so) | It holds deleted apps too — `pingpong` and `analytics` are in it with no `apps` row. Only the `apps` table answers "does this app exist" |
@@ -40,7 +40,9 @@ was false:
 | "Connector tools run without permission prompts during a Routine" (the routine's own prompt said so) | A `destructiveHint=True` tool prompts anyway and **blocks the run**. The 2026-08-03 audit sat idle from ~02:00 to 07:35 on its first call. The prompt asserting something does not make the connector do it |
 | The MCP `ToolAnnotations` set is cosmetic — it groups tools in the connector UI | It is the **autonomy policy**: the approval gate keys on it, so the set decides which tools a scheduled run can reach at all (`app/main.py`) |
 | A routine that sent no Telegram ran and found nothing | It may never have started. "Reports by exception" makes *blocked* and *healthy* produce identical silence — confirm it ran before reading silence as an all-clear |
-| README documents the five `--accesslog` flags as one-time setup, so the proxy has them | It has **four**. `X-Pironman-Backend=keep` was documented on 2026-08-05 and still was not applied a week later — documenting a host step does not perform it. Every fronted sleeping app therefore still carries one phantom 5xx per wake |
+| README documents the five `--accesslog` flags as one-time setup, so the proxy has them | It has **four**. `X-Pironman-Backend=keep` was documented on 2026-08-05 and still was not applied on 2026-08-13 — documenting a host step does not perform it. Every fronted sleeping app therefore still carries ~one phantom 5xx per wake |
+| `web`'s container IP, for matching `ClientHost` in the proxy log, is what `docker inspect` prints as `IPAddress` | That is the **v4**. The `coolify` network is dual-stack and `web` reaches the proxy over **IPv6**, so every internal leg logs its `GlobalIPv6Address`. Matching on the v4 hits zero rows — and because the check is "were these 5xx internal?", zero rows reads as *every phantom `503` was client-visible*. The wrong address family turns a healthy platform into a fabricated outage |
+| Reconciling `analytics_perf.err_server` against `fe-` 5xx log lines proves the "one phantom 5xx per wake" ratio | It proves only that the counted errors were internal. **Both sides are the same log lines**, so they agree by construction — the check cannot see the wake count at all. Sablier's dispatch log is the independent denominator, and against it the ratio is near one, not one |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong

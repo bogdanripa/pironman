@@ -894,11 +894,11 @@ flows through: the Traefik access log** — nothing is installed per app.
     `RouterName` is counted — a missing field must over-count visibly rather than
     zero an app silently.
 - **So a sleeping app's error rate still has a floor** until the marker header is
-  captured: **exactly one** phantom 5xx per wake — the `fe-<id>` `503`, the only
+  captured: **about one** phantom 5xx per wake — the `fe-<id>` `503`, the only
   shape the fallback cannot see. Measured 2026-08-12 with the fallback live and
-  the header still absent: 31 wakes across `bt-gateway`, `revolut-mcp` and
-  `smartbill-mcp` produced 31 counted server errors (9 / 6 / 16), while 151
-  backend-router `500`s from the same wakes were correctly dropped. Reading
+  the header still absent: `bt-gateway`, `revolut-mcp` and `smartbill-mcp` took
+  31 counted server errors (9 / 6 / 16), while 151 backend-router `500`s from the
+  same wakes were correctly dropped. Reading
   `apps_stats` `server_error_pct` or the dashboard without knowing this invites
   chasing an outage that never happened — those three read 13–20% over 7 days
   with **zero** client-visible 5xx. It also feeds `alerts.check_once`, thresholded
@@ -908,11 +908,31 @@ flows through: the Traefik access log** — nothing is installed per app.
     lines in the proxy log whose `ClientHost` is the static host's container IP
     (`docker inspect` `web` for it *now* — it drifts, which is why the ingester
     cannot key on it, but a one-off audit resolves it first and then it is exact).
-    Equal, app for app, means every recorded server error was internal. On
-    2026-08-12 they matched exactly. An anatomy of one wake, for what to expect:
+    **Take `web`'s IPv6 address, not its IPv4.** The `coolify` network has
+    `EnableIPv6=true` (`10.0.1.0/24` + `fddf:6e69:23a7::/64`) and `web` reaches
+    the proxy over v6, so `ClientHost` on every internal leg is its
+    `GlobalIPv6Address` — `.NetworkSettings.Networks.coolify.IPAddress` returns
+    the v4, which matches **nothing** and inverts the result: a fully healthy
+    platform reads as every phantom `503` being client-visible. Verified
+    2026-08-13 — all 60 `fe-` 5xx over 48h carried `fddf:6e69:23a7::e`, none the
+    v4 `10.0.1.14`, and no other container held that v6 address.
+    Equal, app for app, means every recorded server error was internal. It
+    matched exactly on 2026-08-12 and again on 2026-08-13 (5 / 2 / 21, zero
+    client-visible). An anatomy of one wake, for what to expect:
     client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
     the container; five retries → `500` on the backend router (dropped); the sixth
     → the app's own answer, which the client gets.
+  - **That reconciliation cannot establish the "per wake" ratio, only that the
+    errors were internal** — both sides of it are the same `fe-` log lines, so
+    they agree by construction. The independent denominator is Sablier's own
+    `request to start instance dispatched` count, and against it the floor is
+    near one but not exactly one: 2026-08-12 gave 10 / 7 / 16 dispatches against
+    9 / 6 / 16 counted, and 2026-08-13 gave 5 / 2 / 19 against 5 / 2 / 21 — off
+    by one in both directions, and `smartbill-mcp` taking **two more** counted
+    errors than it had dispatches. Why it is not exact is unproven; a dispatch is
+    logged per blocked request and Sablier coalesces concurrent ones, so
+    dispatches are not container starts either. Treat the floor as ~1 per wake,
+    and do not read a small excess as a fault.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
     inside the loop (`web/server.py`) — right for latency, but every attempt is a
