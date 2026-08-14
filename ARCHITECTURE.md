@@ -678,6 +678,19 @@ container and returns when it is ready, then retries. Sablier's own Docker
 provider lists stopped containers, so it can always find the group — it is only
 Traefik that cannot.
 
+**Only a request the static host cannot answer itself starts anything.** The
+forward, and therefore the wake, happens after the static host fails to match the
+path against its own published files. A hit on `/`, `/robots.txt` or any other
+frontend asset of a `kind: both` app is served from the static host at `200` on
+the `fe-<id>` router and the backend stays stopped. So `apps_stats` showing
+`state: asleep` with a `state_since` days old *and* a `last_seen` from today is
+consistent, not a contradiction — verified 2026-08-14: `ping-pong`'s container
+last ran 2026-08-05 (`FinishedAt 16:29:43`, `RestartCount 0`) while two bingbot
+hits that morning on `/robots.txt` and `/` were logged `RouterName
+fe-ping-pong@docker`, `ServiceName http-0-<web-uuid>@docker`, `200`. Before
+reading such a pair as a failed wake, check `RouterName` and `ServiceName`: the
+static host's own uuid there means the backend was never asked for.
+
 By **group**, not by name: enrollment tags the container `sablier.group=<app-id>`,
 a stable id, while its actual name is the Coolify uuid plus a deploy timestamp.
 `?names=<app-id>` returns `500 … No such container` — verified on the box. The caller sees one slow request; there is no interstitial.
