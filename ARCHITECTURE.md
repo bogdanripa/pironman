@@ -908,8 +908,21 @@ flows through: the Traefik access log** — nothing is installed per app.
     lines in the proxy log whose `ClientHost` is the static host's container IP
     (`docker inspect` `web` for it *now* — it drifts, which is why the ingester
     cannot key on it, but a one-off audit resolves it first and then it is exact).
+    **Take both of its addresses, and expect the v6 one to be the one that
+    matches.** The `coolify` network is dual-stack, and `web` reaches the proxy
+    over IPv6: on 2026-08-15 every one of its forwards logged `ClientHost`
+    `fddf:6e69:23a7::e`, and not one logged the `10.0.1.14` that
+    `{{.NetworkSettings.Networks}}.IPAddress` alone returns. Key on the v4 only
+    and the match rate is not merely poorer, it **inverts** — 100% of the
+    phantoms fall outside the filter and read as client-visible, so a healthy
+    platform reports an incident. Use `.GlobalIPv6Address` as well and treat a
+    `ClientHost` of either as internal.
     Equal, app for app, means every recorded server error was internal. On
-    2026-08-12 they matched exactly. An anatomy of one wake, for what to expect:
+    2026-08-12 they matched exactly, and again on 2026-08-15: `smartbill-mcp`
+    13/13 and `revolut-mcp` 1/1 for the day, `smartbill-mcp` 21/21,
+    `bt-gateway` 3/3 and `revolut-mcp` 1/1 the day before, with **zero** `fe-`
+    5xx from any address other than the static host's.
+    An anatomy of one wake, for what to expect:
     client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
     the container; five retries → `500` on the backend router (dropped); the sixth
     → the app's own answer, which the client gets.
