@@ -29,7 +29,7 @@ was false:
 | `docker logs --since` returned nothing | It returns lines normally |
 | The watchdog would report tasks as "never completed" | It **crashed** on the missing table |
 | `api` could be found by its `pironman.app` label | `api` has no such label; only `web` does |
-| `api` is covered by "apps that must not sleep" | Its row says `sleep_when_idle = true` |
+| `api` is covered by "apps that must not sleep" | Its row said `sleep_when_idle = true` — **when the finding was made**. Reversed since: `platform_events` id 1 dates an `unenrolled from sablier` to 2026-08-02T14:38:59Z, and on 2026-08-16 the row read `f`/`f` and the container carried zero sablier labels |
 | A repeated `analytics: nothing counted, cursor N minutes behind` WARNING means ingestion is stalled | Ingestion was **exact** — `analytics_perf` matched the proxy log request-for-request. All 43 such warnings were caught-up passes (tally `app == old`) |
 | The Sablier controller is the container named `sablier` | **No container has that name.** It is a Coolify app, so its container is `<uuid>-<timestamp>`; `sablier` is a Docker **network alias**. Find it by image, `sablierapp/sablier` |
 | `analytics_last_seen` lists only live apps (ARCHITECTURE.md said so) | It holds deleted apps too — `pingpong` and `analytics` are in it with no `apps` row. Only the `apps` table answers "does this app exist" |
@@ -46,6 +46,13 @@ The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong
 answers to the user before evidence corrected them. Two shipped in commit
 messages that had to be rewritten.
+
+**Read the right-hand column as a snapshot, not as current state.** It records
+what the box said on the day the assumption died; a flag can be flipped later and
+the row goes stale without anything flagging it — the `api` row already did. The
+row's lasting value is the *shape* of the mistake, so re-check the live value
+before acting on any specific one. That is the same rule the table teaches,
+applied to the table.
 
 ### How to check, per kind of claim
 
