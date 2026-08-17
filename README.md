@@ -255,7 +255,7 @@ stops the run dead. The connector's approval gate keys on the MCP annotations in
 | Annotation | In a Routine |
 |---|---|
 | `readOnlyHint=True` | runs |
-| `readOnlyHint=False` (the `else` bucket) | untested — see below |
+| `readOnlyHint=False` (the `else` bucket) | **runs** — see below |
 | `destructiveHint=True` | **prompts, and the run blocks until a human answers** |
 
 `host_run_script` and `db_run_script` are kept out of `_DESTRUCTIVE` for exactly
@@ -265,11 +265,14 @@ confirmation. What replaces the gate is the routine's own prompt — its
 MUST-NOT-without-asking list is, as that prompt says, the only guardrail left.
 Write those lists as if nothing else will stop the model, because nothing will.
 
-**Whether the middle row prompts is not established.** On 2026-08-03 the audit
-was blocked by a destructive tool and, once approved, every later call ran — but
-that approval may have covered the session, so it proves nothing about the
-`else` bucket. The test is simply whether the next unattended run completes on
-its own; until one does, treat "makes-changes tools are fine" as unproven.
+**The middle row is now settled: it does not prompt.** `host_run_script` is in
+neither set, so it lands in the `else` bucket — and on 2026-08-17 the nightly
+audit called it as its *first* call and about fifteen times after that, with no
+human in the session at any point, and completed. That is the test the earlier
+note asked for. Compare 2026-08-03, when the same first call sat blocked for five
+and a half hours with the tool tagged destructive: the difference is the
+annotation, not the caller. Verified for `readOnlyHint=False` with no
+`destructiveHint`; a tool that also sets `destructiveHint=True` still blocks.
 
 **Symptom of getting this wrong:** the run produces no output at all. A routine
 that reports by exception is silent when healthy *and* silent when it never

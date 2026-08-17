@@ -29,7 +29,7 @@ was false:
 | `docker logs --since` returned nothing | It returns lines normally |
 | The watchdog would report tasks as "never completed" | It **crashed** on the missing table |
 | `api` could be found by its `pironman.app` label | `api` has no such label; only `web` does |
-| `api` is covered by "apps that must not sleep" | Its row says `sleep_when_idle = true` |
+| `api` is covered by "apps that must not sleep" | Its row said `sleep_when_idle = true` at the time. *(Since corrected — verified 2026-08-17, `api` reads `f`/`f`. The lesson stands: read the row.)* |
 | A repeated `analytics: nothing counted, cursor N minutes behind` WARNING means ingestion is stalled | Ingestion was **exact** — `analytics_perf` matched the proxy log request-for-request. All 43 such warnings were caught-up passes (tally `app == old`) |
 | The Sablier controller is the container named `sablier` | **No container has that name.** It is a Coolify app, so its container is `<uuid>-<timestamp>`; `sablier` is a Docker **network alias**. Find it by image, `sablierapp/sablier` |
 | `analytics_last_seen` lists only live apps (ARCHITECTURE.md said so) | It holds deleted apps too — `pingpong` and `analytics` are in it with no `apps` row. Only the `apps` table answers "does this app exist" |
@@ -40,7 +40,10 @@ was false:
 | "Connector tools run without permission prompts during a Routine" (the routine's own prompt said so) | A `destructiveHint=True` tool prompts anyway and **blocks the run**. The 2026-08-03 audit sat idle from ~02:00 to 07:35 on its first call. The prompt asserting something does not make the connector do it |
 | The MCP `ToolAnnotations` set is cosmetic — it groups tools in the connector UI | It is the **autonomy policy**: the approval gate keys on it, so the set decides which tools a scheduled run can reach at all (`app/main.py`) |
 | A routine that sent no Telegram ran and found nothing | It may never have started. "Reports by exception" makes *blocked* and *healthy* produce identical silence — confirm it ran before reading silence as an all-clear |
-| README documents the five `--accesslog` flags as one-time setup, so the proxy has them | It has **four**. `X-Pironman-Backend=keep` was documented on 2026-08-05 and still was not applied a week later — documenting a host step does not perform it. Every fronted sleeping app therefore still carries one phantom 5xx per wake |
+| README documents the five `--accesslog` flags as one-time setup, so the proxy has them | It has **four**. `X-Pironman-Backend=keep` was documented on 2026-08-05 and was still missing on **2026-08-17**, twelve days later — documenting a host step does not perform it. Every fronted sleeping app therefore still carries one phantom 5xx per wake |
+| An enrolled app is either asleep or serving traffic — `sleep_when_idle = true` and intact labels mean it sleeps | A Sablier session can **fail to expire**. On 2026-08-17 `bt-gateway` sat awake, healthy and idle for 14h after a wake logged with `expiration=5m0s` and no matching `instance expired`; two apps woken in the *same second* expired on time. Every signal read healthy — `apps_stats` `running`, watchdog ok, no Sablier error. Check the *absence* of the expiry line, not the presence of a fault |
+| A container in `docker ps` is an app or a platform service | `pironman-host-<12 hex>` is `host_run_script`'s **own** throwaway helper, running paas-api's image — so an audit sees a second `paas-api:sha-…` container, "Up Less than a second", that no longer exists on the next call. A duplicate-container check must exclude it |
+| `host_run_script` gives you bash | It gives you **dash** (`/bin/sh`). `read -r -d ''` fails with `Illegal option -d` and leaves the variable **empty** — which is how a carefully written Telegram alert gets sent as an empty string and rejected. Heredoc into a file, then `curl --data-urlencode "text@/tmp/msg.txt"` |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong

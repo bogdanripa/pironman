@@ -281,8 +281,24 @@ Three things there are easy to get wrong, and were:
 This is the platform's escape hatch, not its front door: `apps_logs`, `apps_stats`
 and `db_run_script` cover their ground better, and this is a root shell on the
 machine all of them run on. It is admin-key-only (deploy keys are confined to
-their three deploy routes by `require_key`) and tagged destructive so the
-connector prompts.
+their three deploy routes by `require_key`). It is **not** in `_DESTRUCTIVE`, so
+the connector does **not** prompt — that is deliberate, because a
+`destructiveHint=True` tool blocks a scheduled routine outright (`app/main.py`,
+README "Running a routine unattended"). Verified 2026-08-17: the nightly audit
+calls it unprompted from end to end.
+
+The helper container is named `pironman-host-<12 hex>` and carries paas-api's own
+image, so during any call it appears in `docker ps` as a second container running
+`ghcr.io/bogdanripa/paas-api:sha-…` — with the health status of a container that
+started a moment ago. It is gone by the next call. Anything that audits `docker ps`
+for duplicate or unexpected containers has to know this, or it will report the
+tool that ran the audit.
+
+The shell is **dash**, not bash — `/bin/sh` on Raspberry Pi OS. Bashisms fail:
+`read -r -d ''` returns `Illegal option -d` and leaves the variable empty, which
+is how a multi-line message ends up sent as an empty string. Build multi-line
+text with a quoted heredoc into a file and read it back from there
+(`curl --data-urlencode "text@/tmp/msg.txt"`).
 
 ### Auth
 
@@ -563,6 +579,46 @@ guards, each blocking a distinct way this could strand an app:
   lifecycle: getting a backend safely *onto* the marker is not enough if nothing
   ever takes it back off. Anything that changes what `is_fronted()` returns has to
   end in a matching label write, never in an omission.
+
+### A session can fail to expire, and nothing on the platform reports it
+
+An enrolled app is not guaranteed to go back to sleep. Observed 2026-08-17:
+`bt-gateway` was woken at `09:13:28` and was still running, healthy and idle
+**14 hours later**. Sablier logged that wake as
+`request to start instance dispatched … expiration=5m0s` and then **never logged
+the matching `instance expired`**. `revolut-mcp` and `smartbill-mcp` were woken
+in the *same second* (`09:13:29`) and both expired on schedule at `09:18:33` — so
+the expiry machinery was demonstrably working at that exact moment, for other
+instances, in the same process. Labels were intact (all seven, `sessionDuration=5m`),
+`sablier_enrolled` was true, Sablier logged no error in 24h, and there had been no
+Coolify deploy. **The cause is not established**; what is established is that the
+outcome happens and that nothing surfaces it.
+
+Nothing surfaces it because every signal reads the same as an app that is
+legitimately serving: `apps_stats` says `running`, `paas-watchdog` says ok,
+`platform_tasks_health` is green, and the Sablier log is silent rather than wrong.
+The gap is that no check asks *"is an app with `sleep_when_idle = true` awake with
+no traffic behind it?"* — the one question that separates the two.
+
+**Signature, and how to confirm it in one pass:** for the app's live container,
+`docker logs <sablier> --since 168h` has a `dispatched` line with no `instance
+expired` line after it, while the container's `StartedAt` is hours old and *both*
+the proxy access log and the app's own request log show nothing since the wake.
+Counting per instance is the quick sweep:
+
+```sh
+docker logs --since 168h <sablier> | grep -E 'dispatched|instance expired instance'
+# per instance= …, dispatch count vs expired count
+```
+
+Read that count with care: container **churn** explains most of the gap on its
+own. An instance removed from its group mid-session (any redeploy) never expires,
+so a replaced container legitimately ends with `dispatch > expired`. Only a
+container that has *not* been replaced makes the difference real. Over the 7 days
+to 2026-08-17 the box showed 232 dispatches against 211 expiries, nearly all of it
+redeploy churn from 08-11; on the three current containers it was 30/27
+(`bt-gateway`), 129/124 (`smartbill-mcp`) and 17/17 (`revolut-mcp`) — so a stray
+session is intermittent and has previously self-corrected.
 
 > Verify enrollment on one app (`apps_sablier <app> true`) — confirm it sleeps
 > when idle and wakes on request — **before** flipping `SABLIER_AUTO_ENROLL` on,
@@ -913,6 +969,14 @@ flows through: the Traefik access log** — nothing is installed per app.
     client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
     the container; five retries → `500` on the backend router (dropped); the sixth
     → the app's own answer, which the client gets.
+  - **Cheaper still: count the wakes.** One phantom per wake means
+    `analytics_perf.err_server` for the day must equal the number of
+    `request to start instance dispatched` lines in the Sablier log for that app's
+    instance — no `ClientHost` lookup, no `fe-` filtering. Re-confirmed
+    2026-08-17, a second date and a second route: `smartbill-mcp` 30 wakes / 30
+    server errors, `revolut-mcp` 5 / 5, `bt-gateway` 3 / 3. Every 5xx on the
+    platform that day was internal. Equality is the all-clear; an *excess* over
+    the wake count is the only shape that means a real server error.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
     inside the loop (`web/server.py`) — right for latency, but every attempt is a
@@ -1055,6 +1119,17 @@ symptom and the platform's own status agreed with it.
   Remedy is `docker stop <leftover>` — Traefik's Docker provider ignores
   non-running containers, so the router drops to one server at once.
   `paas-watchdog` and `apps_stats.duplicate_containers` now report it.
+- **An app that never goes back to sleep is invisible to every health signal.** A
+  Sablier session can fail to expire: on 2026-08-17 `bt-gateway` stayed awake and
+  idle for 14h after a wake Sablier logged with `expiration=5m0s` and never
+  expired, while two apps woken in the same second expired on time. Nothing
+  reports it — `apps_stats` says `running`, `paas-watchdog` says ok, the Sablier
+  log is silent rather than wrong, and no check asks whether an app with
+  `sleep_when_idle = true` is awake with no traffic behind it. Same failure shape
+  as the rest of this list, one layer up: the absence of a stop event looks
+  identical to an app doing its job. **Signature: a `dispatched` line with no
+  `instance expired` after it, a `StartedAt` hours old, and no requests since the
+  wake in *either* the proxy log or the app's own** (§9). Cause unproven.
 - **Instrument the disappearance, not just the symptom** — Docker's event stream is
   in-memory and rolls over in minutes, so "what deleted this overnight" is
   unanswerable after the fact. `docker-destroy-log.service` exists because the
