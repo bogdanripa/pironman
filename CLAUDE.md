@@ -29,7 +29,7 @@ was false:
 | `docker logs --since` returned nothing | It returns lines normally |
 | The watchdog would report tasks as "never completed" | It **crashed** on the missing table |
 | `api` could be found by its `pironman.app` label | `api` has no such label; only `web` does |
-| `api` is covered by "apps that must not sleep" | Its row says `sleep_when_idle = true` |
+| `api` is covered by "apps that must not sleep" | Its row said `sleep_when_idle = true` — so the watchdog's `ALWAYS_ON` set, not the column, is what keeps it checked. (The row reads `false` as of 2026-08-18, and the container carries no Sablier labels; the lesson stands because the column is what drifted) |
 | A repeated `analytics: nothing counted, cursor N minutes behind` WARNING means ingestion is stalled | Ingestion was **exact** — `analytics_perf` matched the proxy log request-for-request. All 43 such warnings were caught-up passes (tally `app == old`) |
 | The Sablier controller is the container named `sablier` | **No container has that name.** It is a Coolify app, so its container is `<uuid>-<timestamp>`; `sablier` is a Docker **network alias**. Find it by image, `sablierapp/sablier` |
 | `analytics_last_seen` lists only live apps (ARCHITECTURE.md said so) | It holds deleted apps too — `pingpong` and `analytics` are in it with no `apps` row. Only the `apps` table answers "does this app exist" |
@@ -40,7 +40,8 @@ was false:
 | "Connector tools run without permission prompts during a Routine" (the routine's own prompt said so) | A `destructiveHint=True` tool prompts anyway and **blocks the run**. The 2026-08-03 audit sat idle from ~02:00 to 07:35 on its first call. The prompt asserting something does not make the connector do it |
 | The MCP `ToolAnnotations` set is cosmetic — it groups tools in the connector UI | It is the **autonomy policy**: the approval gate keys on it, so the set decides which tools a scheduled run can reach at all (`app/main.py`) |
 | A routine that sent no Telegram ran and found nothing | It may never have started. "Reports by exception" makes *blocked* and *healthy* produce identical silence — confirm it ran before reading silence as an all-clear |
-| README documents the five `--accesslog` flags as one-time setup, so the proxy has them | It has **four**. `X-Pironman-Backend=keep` was documented on 2026-08-05 and still was not applied a week later — documenting a host step does not perform it. Every fronted sleeping app therefore still carries one phantom 5xx per wake |
+| README documents the five `--accesslog` flags as one-time setup, so the proxy has them | It has **four**. `X-Pironman-Backend=keep` was documented on 2026-08-05 and was still absent thirteen days later on 2026-08-18. Documenting a host step does not perform it. Note a plain `docker restart` will not apply it either — `coolify-proxy` restarted on 2026-08-18 and came back with the same four flags, because a restart reuses the container's existing `Args`; the container has to be **recreated**. Every fronted sleeping app therefore still carries one phantom 5xx per wake |
+| `wake <id>: still failing … passing the backend's 502 through` is a wake failure | It is usually the opposite: the backend was **already up** and answering `502` on its own account. `_proxy` cannot tell that from a sleeping app, so it guesses and retries on the short budget. **Read the `sablier` stage** — ~0.02s means nothing was started (a real cold start is 0.77–1.78s here). On 2026-08-18 the two such warnings were `bt-gateway` relaying its third-party upstream's failure, `200` on the same path 3s later (§9c) |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong

@@ -779,6 +779,23 @@ is routable almost at once, the static host's first probe succeeds, and
 waiting. Absence of the line is the signature of the fast path working, not of
 the wake path being skipped.
 
+**And read the `sablier` sub-timing before believing a wake failed.** `wake <id>:
+still failing after Ns — … passing the backend's 502 through` does **not** mean
+the app could not be started. `_proxy` cannot tell a sleeping app from one that
+genuinely answers `502` (only the `503` + down-marker shape is unambiguous), so a
+bare gateway error takes the same path on a guess, with the shorter
+`GATEWAY_RETRY_BUDGET` (5s, vs 15s) — and the warning then reports a *live*
+backend's own error, correctly passed through. **The discriminator is the
+`sablier` stage: ~0.02s means Sablier found the instance already running and
+started nothing**, against 0.77–1.78s for a real cold start on this box.
+Verified 2026-08-18: two `wake bt-gateway: still failing … 10 retries; passing
+the backend's 502 through` warnings, both `sablier 0.02s`/`0.03s`; Sablier logged
+`instance is ready` 1.4ms after the dispatch; and the container's own log for the
+same seconds shows it up and answering `502 UPSTREAM_UNAVAILABLE` from its
+third-party upstream (`HTTP 400`), with `200` on the same path 3s later. The
+platform did nothing wrong and there was nothing to fix — an audit that stops at
+the warning text reports a wake fault that did not happen.
+
 The scaffold emits `--start-interval=250ms` on the HEALTHCHECK line it
 recommends (§5b), so a new app gets this for free with no platform-side step at
 all. The one thing it cannot help with: an image built before that line still
