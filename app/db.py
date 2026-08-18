@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS alert_state (
     err_server   bigint      NOT NULL DEFAULT 0,
     updated_at   timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE IF EXISTS alert_state
+    ADD COLUMN IF NOT EXISTS alerted_stuck boolean NOT NULL DEFAULT false;
 
 -- Per-app/day request counts by raw user-agent string, so the actual agents
 -- (browsers, crawlers, scripts) can be listed, not just the humans/bots split.

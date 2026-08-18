@@ -962,7 +962,8 @@ idle, to the second.
 ## 11. Alerting
 
 `app/alerts.py` runs a background loop that messages **Telegram** when an app goes
-**down**, **recovers**, or throws **new 5xx** errors. A consecutive-failure
+**down**, **recovers**, throws **new 5xx** errors, or **stays awake with nothing
+asking for it**. A consecutive-failure
 debounce keeps rolling redeploys from looking like outages. Configure with
 `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; unset, the loop is a no-op.
 `alerts_test` confirms delivery.
@@ -973,6 +974,35 @@ crashes on start, the errors its requests produce are the one thing that says so
 That check spent its whole life nested in a branch requiring an app to both sleep
 *and* have been alerted down, which meant it had never fired for anything. Treat
 it as load-bearing.
+
+**Scale-to-zero silently not happening.** Sablier occasionally loses an
+instance's expiry timer. The container then sits awake indefinitely, and the next
+request that arrives re-arms the timer, which fires normally — so it
+self-corrects, and the apps it strands are exactly the sparse-traffic ones that
+have no next request for hours. Measured 2026-08-18: `bt-gateway` woken
+2026-08-17T09:13:29, no expiry logged, 10 proxy hits (all within 3s of the wake)
+and then nothing for 21 hours; a request at 06:18:08 was answered `ready` in
+**1.3ms** — already running — and the re-armed session expired correctly at
+06:24:44, one second before the app logged its own `SIGTERM`. Over that 48h
+window: `bt-gateway` 9 dispatches / 6 expiries, `revolut-mcp` 10/9,
+`smartbill-mcp` 50/49, with one deficit each explained by a session open at the
+time — so roughly **2 lost expiries in 69 dispatches**. Not a Sablier restart
+(uptime 13 days, `RestartCount 0`), and not app-specific.
+
+Nothing reported it, because nothing was *wrong* in the terms anything measured:
+`apps_stats` said `running`, `paas-watchdog` said ok, and both were telling the
+truth. The loop now flags an app that `sleep_when_idle` **and** `sablier_enrolled`
+**and** has a running container **and** whose `last_seen` is older than
+`STUCK_AWAKE_AFTER` (six session durations, floor 30 min — analytics ingests every
+120s and this loop runs every 150s, so `last_seen` trails real traffic by minutes
+and the margin has to swallow that). It clears silently: the fault self-corrects
+often enough that a recovery message would fire about as often as the alert.
+
+Two deliberate blind spots. A `last_seen` of NULL is left alone — there is no age
+to measure and the alternative is alerting on every freshly created app. And
+`last_seen` is *edge* traffic, so for an app with a frontend, bundle hits keep it
+fresh while the backend gets nothing; the check errs toward silence, which is the
+right direction for a pager.
 
 **For a sleeping app, check existence — never state.** A sleeping app is *supposed*
 to be stopped, so "is it running" says nothing and alerting on it would fire every

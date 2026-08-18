@@ -1,4 +1,5 @@
 import os
+import re
 
 _REQUIRED = ["COOLIFY_TOKEN", "COOLIFY_PROJECT", "COOLIFY_SERVER",
              "COOLIFY_DESTINATION", "PAAS_DB_PASSWORD"]
@@ -116,6 +117,27 @@ HOST_EXEC_IMAGE = os.environ.get("HOST_EXEC_IMAGE", "")
 # for cross-origin reads (see app/cors.py).
 DASHBOARD_ORIGIN = os.environ.get(
     "DASHBOARD_ORIGIN", f"https://dashboard{DOMAIN_SUFFIX}")
+
+
+_GO_DURATION = re.compile(r"(\d+)\s*([smh])")
+
+
+def sablier_session_seconds(value: str | None = None) -> int:
+    """SABLIER_SESSION_DURATION expressed as seconds.
+
+    Sablier takes a Go duration string ("5m", "1h30m") because that is what goes
+    on the label; comparing an idle age against it needs a number. Unparseable
+    input falls back to five minutes rather than raising: the only caller is an
+    alert threshold, and a typo in an env var must not take the alerting loop
+    down with it — that would remove the monitoring instead of the fault.
+    """
+    raw = (SABLIER_SESSION_DURATION if value is None else value) or ""
+    units = {"s": 1, "m": 60, "h": 3600}
+    total = sum(int(n) * units[u] for n, u in _GO_DURATION.findall(raw.lower()))
+    if total <= 0:
+        bare = raw.strip()
+        total = int(bare) if bare.isdigit() else 300
+    return total
 
 
 def app_url(app_id: str) -> str:

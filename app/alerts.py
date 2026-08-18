@@ -2,7 +2,8 @@
 
 A background loop (started in main.lifespan) checks every app on a short interval
 and messages Telegram when something changes state: an app that was running goes
-down, a downed app recovers, or an app starts throwing new 5xx responses. State
+down, a downed app recovers, an app starts throwing new 5xx responses, or a
+scale-to-zero app stays awake with nothing asking for it. State
 lives in the alert_state table so only edges alert, not every tick.
 
 Three bits of noise control:
@@ -17,13 +18,20 @@ Three bits of noise control:
 
 Unconfigured (no Telegram token/chat), check_once returns immediately.
 """
-from datetime import date
+from datetime import date, datetime, timezone
 
 from . import notify, stats
-from .config import ALERT_5XX_THRESHOLD, app_url
+from .config import ALERT_5XX_THRESHOLD, app_url, sablier_session_seconds
 from .db import pool
 
 DOWN_AFTER = 2  # consecutive missed checks before an app counts as down
+
+# How long a scale-to-zero app may sit awake with no traffic before that is a
+# fault rather than a lull. Six sessions, floor 30 minutes: analytics ingests
+# every 120s and this loop runs every 150s, so last_seen trails real traffic by
+# a few minutes and the margin has to swallow that without crying wolf. Costs
+# nothing in sensitivity — the case this was written for sat awake 21 hours.
+STUCK_AWAKE_AFTER = max(6 * sablier_session_seconds(), 1800)
 
 
 async def check_once() -> dict:
@@ -36,13 +44,18 @@ async def check_once() -> dict:
         # forever. Their traffic is served by the shared static host, which is
         # itself an app and is monitored like any other.
         apps = await conn.fetch(
-            "SELECT id, coolify_uuid, sleep_when_idle FROM apps "
+            "SELECT id, coolify_uuid, sleep_when_idle, sablier_enrolled FROM apps "
             "WHERE coolify_uuid IS NOT NULL ORDER BY id")
         perf = await conn.fetch(
             "SELECT app_id, err_server FROM analytics_perf WHERE day = CURRENT_DATE")
         err_today = {r["app_id"]: r["err_server"] for r in perf}
         state = {r["app_id"]: dict(r) for r in
                  await conn.fetch("SELECT * FROM alert_state")}
+        # Edge traffic per app. Holds rows for deleted apps too, so it is read
+        # as a lookup against the apps list rather than iterated.
+        last_seen = {r["app_id"]: r["last_seen"] for r in await conn.fetch(
+            "SELECT app_id, last_seen FROM analytics_last_seen")}
+        now = datetime.now(timezone.utc)
 
         running_names = list((await stats._container_stats()).keys())
         sent = 0
@@ -63,6 +76,7 @@ async def check_once() -> dict:
             fail_count = 0 if (running or sleeps) else (
                 (prev["fail_count"] if prev else 0) + 1)
             alerted_down = bool(prev["alerted_down"]) if prev else False
+            alerted_stuck = bool(prev.get("alerted_stuck")) if prev else False
             messages = []
 
             if prev is not None and not sleeps:
@@ -77,6 +91,38 @@ async def check_once() -> dict:
                 # rather than leaving a stale "down" flag that suppresses a later
                 # genuine recovery message.
                 alerted_down = False
+
+            # The inverse of the exemption above. A scale-to-zero app whose
+            # container is up long after anything last asked for it is not
+            # sleeping when it should be. Sablier drops an instance's expiry
+            # timer occasionally — 2 of 69 dispatches over one 48h window — and
+            # the container then sits awake until some later request happens to
+            # re-arm it. Nothing else reports this, because nothing else is
+            # wrong: apps_stats says "running" and the task watchdog says ok,
+            # and both are telling the truth. bt-gateway sat awake 21 hours.
+            #
+            # Needs sablier_enrolled, not just sleep_when_idle: an app that
+            # wants to sleep but was never enrolled has no expiry to lose, and
+            # flagging it here would report a known configuration gap as a
+            # recurring fault. A NULL last_seen (never any traffic) is left
+            # alone — there is no age to measure, and the alternative is
+            # alerting on every freshly created app.
+            seen = last_seen.get(aid)
+            idle = (now - seen).total_seconds() if seen else None
+            stuck = bool(sleeps and running and app["sablier_enrolled"]
+                         and idle is not None and idle > STUCK_AWAKE_AFTER)
+            if stuck and not alerted_stuck:
+                messages.append(
+                    f"\U0001f634 <b>{aid}</b> is awake but has served nothing "
+                    f"for {idle / 3600:.1f}h — scale-to-zero is not "
+                    f"happening\n{app_url(aid)}")
+                alerted_stuck = True
+            elif alerted_stuck and not stuck:
+                # Cleared without a message. This fault self-corrects the moment
+                # any request re-arms the timer, so a recovery note would fire
+                # about as often as the alert and train the reader to skim past
+                # both.
+                alerted_stuck = False
 
             # 5xx: baseline is the prior count only within the same day (the
             # counter resets each day, so a day rollover baselines from 0). This
@@ -99,13 +145,15 @@ async def check_once() -> dict:
 
             await conn.execute(
                 "INSERT INTO alert_state "
-                "(app_id, fail_count, alerted_down, err_day, err_server, updated_at) "
-                "VALUES ($1, $2, $3, CURRENT_DATE, $4, now()) "
+                "(app_id, fail_count, alerted_down, alerted_stuck, "
+                " err_day, err_server, updated_at) "
+                "VALUES ($1, $2, $3, $4, CURRENT_DATE, $5, now()) "
                 "ON CONFLICT (app_id) DO UPDATE SET "
                 "fail_count = EXCLUDED.fail_count, "
                 "alerted_down = EXCLUDED.alerted_down, "
+                "alerted_stuck = EXCLUDED.alerted_stuck, "
                 "err_day = EXCLUDED.err_day, err_server = EXCLUDED.err_server, "
                 "updated_at = now()",
-                aid, fail_count, alerted_down, err)
+                aid, fail_count, alerted_down, alerted_stuck, err)
 
     return {"apps_checked": len(apps), "alerts_sent": sent}
