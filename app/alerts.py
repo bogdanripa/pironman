@@ -18,6 +18,7 @@ Three bits of noise control:
 
 Unconfigured (no Telegram token/chat), check_once returns immediately.
 """
+import re
 from datetime import date, datetime, timezone
 
 from . import notify, stats
@@ -32,6 +33,26 @@ DOWN_AFTER = 2  # consecutive missed checks before an app counts as down
 # a few minutes and the margin has to swallow that without crying wolf. Costs
 # nothing in sensitivity — the case this was written for sat awake 21 hours.
 STUCK_AWAKE_AFTER = max(6 * sablier_session_seconds(), 1800)
+
+
+def _docker_time(raw: str | None) -> datetime | None:
+    """Docker's RFC3339 timestamp -> datetime, or None.
+
+    Docker writes nine fractional digits; fromisoformat accepts three or six and
+    nothing else, so the tail is trimmed rather than parsed. A value that will
+    not parse returns None, which the caller treats as "cannot tell" and stays
+    quiet — the wrong direction to guess in is the one that pages someone.
+    """
+    if not raw:
+        return None
+    text = raw.replace("Z", "+00:00")
+    m = re.match(r"(.*\.\d{6})\d*([+-]\d\d:\d\d)$", text)
+    if m:
+        text = m.group(1) + m.group(2)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 async def check_once() -> dict:
@@ -58,6 +79,9 @@ async def check_once() -> dict:
         now = datetime.now(timezone.utc)
 
         running_names = list((await stats._container_stats()).keys())
+        # state + since (StartedAt while running) for every container, needed to
+        # tell "up for hours with no traffic" from "just woken".
+        lifecycle = await stats._lifecycle()
         sent = 0
 
         for app in apps:
@@ -107,9 +131,24 @@ async def check_once() -> dict:
             # recurring fault. A NULL last_seen (never any traffic) is left
             # alone — there is no age to measure, and the alternative is
             # alerting on every freshly created app.
+            # Measured from the LATER of the last request and the container's
+            # own start. Measuring from last_seen alone fired on every wake: a
+            # just-woken app has an ancient last_seen by definition, and the
+            # ingest that would refresh it runs up to two minutes behind, so
+            # bt-gateway and revolut-mcp were both paged within a minute of
+            # waking at 2026-08-19T06:06:26 after a legitimate 21.7h asleep. The
+            # margin could never have covered that: the staleness is the whole
+            # sleep, not the lag. A container up for three minutes cannot have
+            # been stuck awake for hours, whatever last_seen says.
             seen = last_seen.get(aid)
-            idle = (now - seen).total_seconds() if seen else None
+            cname = next((n for n in lifecycle if uuid and uuid in n), None)
+            awake_since = _docker_time((lifecycle.get(cname) or {}).get("since")
+                                       if cname else None)
+            base = max([t for t in (seen, awake_since) if t is not None],
+                       default=None)
+            idle = (now - base).total_seconds() if base else None
             stuck = bool(sleeps and running and app["sablier_enrolled"]
+                         and seen is not None and awake_since is not None
                          and idle is not None and idle > STUCK_AWAKE_AFTER)
             if stuck and not alerted_stuck:
                 messages.append(

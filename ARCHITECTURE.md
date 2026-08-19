@@ -1009,11 +1009,22 @@ time — so roughly **2 lost expiries in 69 dispatches**. Not a Sablier restart
 Nothing reported it, because nothing was *wrong* in the terms anything measured:
 `apps_stats` said `running`, `paas-watchdog` said ok, and both were telling the
 truth. The loop now flags an app that `sleep_when_idle` **and** `sablier_enrolled`
-**and** has a running container **and** whose `last_seen` is older than
-`STUCK_AWAKE_AFTER` (six session durations, floor 30 min — analytics ingests every
-120s and this loop runs every 150s, so `last_seen` trails real traffic by minutes
-and the margin has to swallow that). It clears silently: the fault self-corrects
-often enough that a recovery message would fire about as often as the alert.
+**and** has a running container **and** has been idle longer than
+`STUCK_AWAKE_AFTER` (six session durations, floor 30 min). It clears silently: the
+fault self-corrects often enough that a recovery message would fire about as often
+as the alert.
+
+**Idle is measured from the later of `last_seen` and the container's own
+`StartedAt`, and the second half is not optional.** The first version measured
+from `last_seen` alone and paged on every wake: a just-woken app has an ancient
+`last_seen` by definition, and the ingest that would refresh it runs up to two
+minutes behind. `bt-gateway` and `revolut-mcp` were both flagged within a minute
+of waking at 2026-08-19T06:06:26 — "awake but has served nothing for 21.6h" —
+after a completely legitimate 21.7h *asleep*, which their own logs show as
+`SIGTERM` at 08-18 08:25:23 and `server.listening` at 06:06:27. No margin could
+have covered it: the staleness is the whole sleep, not the lag. A container up
+for three minutes cannot have been stuck awake for hours, whatever `last_seen`
+says.
 
 Two deliberate blind spots. A `last_seen` of NULL is left alone — there is no age
 to measure and the alternative is alerting on every freshly created app. And
