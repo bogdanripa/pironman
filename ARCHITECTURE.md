@@ -901,10 +901,22 @@ flows through: the Traefik access log** — nothing is installed per app.
     (caught), the next left five `503`s on the frontend router (not). A single
     measurement of a wake will show you one shape and let you believe it is the
     only one — as it did here, until the second wake.
-  - `ClientHost` would separate them — it is the static host's container IP — and
-    is not usable: it changes on every redeploy of `web` and Docker recycles it.
-    `web`'s address that morning belonged to `wa-gateway` by the afternoon, so
+  - `ClientHost` would separate them — it is the static host's container address —
+    and is not usable: it changes on every redeploy of `web` and Docker recycles
+    it. `web`'s address that morning belonged to `wa-gateway` by the afternoon, so
     keying on it would silently drop another app's real traffic.
+  - **That address is `web`'s IPv6, not its IPv4.** The forward leaves `web` over
+    the `coolify` network's IPv6 ULA, so every internal line — `fe-` and
+    backend-router alike — logs `ClientHost` as e.g. `fddf:6e69:23a7::e`, never
+    `10.0.1.x`. Verified 2026-08-19: all 46 `fe-` 5xx lines in 30h carried that
+    one address, `docker inspect web` reported it as `GlobalIPv6Address`, and no
+    other container on the box held it. This matters because the obvious
+    `docker inspect` format — `.NetworkSettings.Networks.*.IPAddress`, and the
+    top-level `.NetworkSettings.IPAddress` — returns **only the IPv4**, so an
+    audit that follows the recipe below with it matches *zero* lines and reads as
+    "the reconciliation failed" rather than "you asked the wrong question". Read
+    `.GlobalIPv6Address`. Corroborate with `request_User-Agent`: the forward is
+    `python-httpx/…`, `web`'s own client.
   - An app **nothing** fronts (`api`) is reached directly, so its backend-router
     lines are real traffic: the fallback is keyed on the fronted set
     (`routing.fronted_ids`), never on the router name alone. A line with no
@@ -922,11 +934,15 @@ flows through: the Traefik access log** — nothing is installed per app.
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
   - **To settle "is this rate real?" in one pass**, reconcile the two sides:
     `analytics_perf.err_server` for the day against the count of `fe-<id>` 5xx
-    lines in the proxy log whose `ClientHost` is the static host's container IP
-    (`docker inspect` `web` for it *now* — it drifts, which is why the ingester
-    cannot key on it, but a one-off audit resolves it first and then it is exact).
-    Equal, app for app, means every recorded server error was internal. On
-    2026-08-12 they matched exactly. An anatomy of one wake, for what to expect:
+    lines in the proxy log whose `ClientHost` is the static host's container
+    **IPv6** (`docker inspect web --format '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}'`
+    *now* — it drifts, which is why the ingester cannot key on it, but a one-off
+    audit resolves it first and then it is exact; the IPv4 field matches nothing,
+    see above). Equal, app for app, means every recorded server error was
+    internal. They matched exactly on 2026-08-12 and again on 2026-08-19
+    (`bt-gateway` 3, `revolut-mcp` 4, `smartbill-mcp` 28 — `fe-` 503s against
+    `analytics_perf.err_server`, with 184 backend-router `500`s from the same
+    wakes correctly dropped). An anatomy of one wake, for what to expect:
     client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
     the container; five retries → `500` on the backend router (dropped); the sixth
     → the app's own answer, which the client gets.
