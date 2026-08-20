@@ -922,14 +922,32 @@ flows through: the Traefik access log** — nothing is installed per app.
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
   - **To settle "is this rate real?" in one pass**, reconcile the two sides:
     `analytics_perf.err_server` for the day against the count of `fe-<id>` 5xx
-    lines in the proxy log whose `ClientHost` is the static host's container IP
-    (`docker inspect` `web` for it *now* — it drifts, which is why the ingester
-    cannot key on it, but a one-off audit resolves it first and then it is exact).
-    Equal, app for app, means every recorded server error was internal. On
-    2026-08-12 they matched exactly. An anatomy of one wake, for what to expect:
-    client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
-    the container; five retries → `500` on the backend router (dropped); the sixth
-    → the app's own answer, which the client gets.
+    lines in the proxy log whose `ClientHost` is the static host's own address.
+    Equal, app for app, means every recorded server error was internal. Matched
+    exactly on 2026-08-12 and again on 2026-08-20 (14 / 7 / 2 for
+    `smartbill-mcp` / `bt-gateway` / `revolut-mcp`). An anatomy of one wake, for
+    what to expect: client → `fe-` router; the forward → `503` (counted,
+    phantom); Sablier starts the container; five retries → `500` on the backend
+    router (dropped); the sixth → the app's own answer, which the client gets.
+  - **Take that address from `GlobalIPv6Address`, not `IPAddress`.** Every
+    `ClientHost` this proxy logs is IPv6, so matching against the IPv4 that
+    `docker inspect` reports first matches **nothing** — and zero phantom lines
+    reads as "every recorded server error was client-visible", the exact inverse
+    of the truth. On 2026-08-20 `web` was `10.0.1.14` and
+    `fddf:6e69:23a7::e`; only the latter appears in the log. Both still drift on
+    redeploy, which is why the ingester cannot key on either — resolve it at
+    audit time. The complement is the sharper test and does not drift: the
+    `coolify` network's **gateway**, `fddf:6e69:23a7::1`, is the `ClientHost` of
+    everything arriving from outside the docker network, so a `fe-` 5xx from the
+    gateway is a client-visible one.
+  - **Within the `fe-` leg the status code separates the two**, and the phantom
+    is only ever the `503`: that is the static host answering *itself* "backend
+    has no route" (`server.py`, `503` + `DOWN_HEADER`). A `500` on the `fe-`
+    router is a backend that answered, relayed to the client with its status
+    intact — real, and the app's own business. Both land in `err_server`, so
+    counting all `fe-` 5xx as phantom over-credits. On 2026-08-20 `bt-gateway`'s
+    7 split exactly that way: 3 × `503` from `::e` (phantom) and 4 × `500` from
+    `::1` — one client's retries against its third-party upstream, 0.02s apart.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
     inside the loop (`web/server.py`) — right for latency, but every attempt is a
