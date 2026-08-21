@@ -1047,9 +1047,12 @@ of that state now makes the distinction:
   **not** `restartable` — there is nothing to `docker start`, and retrying that
   every five minutes would just fail forever.
 - `alert_state` rows are keyed by app id and nothing deletes them when an app is
-  deleted (`space-invaders` still had a row from 2026-07-31). Harmless — the loop
-  iterates the `apps` table and never reads them — but it is state that only
-  grows, and the same caveat as the analytics rollups in §10.
+  deleted (`space-invaders` still had a row from 2026-07-31, still there on
+  2026-08-21). Harmless — `alerts.py` does `SELECT * FROM alert_state` but reads
+  the result as a **lookup keyed off the `apps` list**, so a row with no `apps`
+  row is loaded and never acted on; its `updated_at` stays frozen while every
+  live app's is rewritten each tick, which is how to tell one at a glance. Still
+  state that only grows, the same caveat as the analytics rollups in §10.
 - `stats.app_runtime` falls back to `docker ps -a` rather than inferring from the
   running-only `docker stats`; `stats.app_resources` does the same, reusing the
   `ps -a` listing it already fetches for disk sizes, so the list view costs no
