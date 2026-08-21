@@ -189,9 +189,25 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                     code=$(curl -s -o /dev/null -w '%{{http_code}}' "$url" || echo 000)
                     case "$code" in
                       2*) echo "up (HTTP $code)"; exit 0 ;;
-                      # 404 is retried, not failed: during rollover the request can
-                      # still reach the outgoing container.
-                      000|404|502|503|504) echo "waiting ($code)"; sleep 6 ;;
+                      # Each of these is retried rather than failed, because
+                      # each is something a deploy still in progress produces.
+                      # 404: mid-rollover the request can still reach the
+                      # outgoing container. 500: an app with
+                      # is_consistent_container_name_enabled cannot run two
+                      # containers at once, so its deploy stops the old one
+                      # before starting the new, and the edge answers 500 across
+                      # that gap. Measured on wa-gateway, run 32463472876 -- this
+                      # step sampled once, hit the gap, and failed a deploy that
+                      # had actually succeeded: the container was already up,
+                      # healthy, and serving the new image.
+                      #
+                      # Retrying 500 gives up no failure detection. The loop is
+                      # bounded at 40 attempts x 6s, so an app genuinely serving
+                      # 500 still fails, about four minutes later. All this stops
+                      # is one transient sample being treated as terminal, which
+                      # is already how 502, 503 and 504 are handled -- 500 was
+                      # the inconsistent one.
+                      000|404|500|502|503|504) echo "waiting ($code)"; sleep 6 ;;
                       *) echo "$url answered HTTP $code — the health path must "
                          echo "return 2xx without authentication"; exit 1 ;;
                     esac
