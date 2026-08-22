@@ -43,7 +43,7 @@ traffic analytics are harvested automatically from the shared proxy log.
 | `/usr/local/bin/paas-cron-dispatch` | Host cron dispatcher (every minute) |
 | `/usr/local/bin/paas-watchdog` | Host liveness watchdog (every 5 minutes) |
 | `/var/lib/paas-watchdog/state.json` | Watchdog's edge-trigger state |
-| `/var/log/paas-cron.log`, `/var/log/paas-watchdog.log` | Their output |
+| `/var/log/paas-cron.log`, `/var/log/paas-watchdog.log` | Their output. The cron log gets a line only when a job actually fires, so with no enabled crons it stops growing entirely — its mtime is a measure of cron activity, never of dispatcher liveness (use `task_heartbeat`). The watchdog writes every pass, so its tail *is* current. |
 | `/usr/local/bin/docker-destroy-log` | Records every container **destroy** event (§9) |
 | `/etc/systemd/system/docker-destroy-log.service` | Runs it, `Restart=always`, enabled at boot |
 | `/var/log/docker-destroy.log` | Its output — rotated weekly, kept 8 weeks |
@@ -387,6 +387,19 @@ not queue — the second starts against a config the first is still changing, an
 which container survives is a coin toss. This is not hypothetical: an app whose CI
 ships a frontend and a backend runs both jobs at once, and the frontend upload
 can itself rewrite routing labels and redeploy.
+
+**The overlap window has a signature in the proxy log.** While two containers of
+one app are both up, Traefik sees the same router name defined twice and logs
+`Router defined multiple times with different configurations`, naming both
+container-scoped configs under one `routerName=http-0-<uuid>`. On 2026-08-22
+`snake` was deployed three times inside four minutes (17:09:17, 17:11:15,
+17:12:13, all `finished`) and the proxy logged exactly that at 17:11:22 for
+`lcu72…-170917451537` and `lcu72…-171115817234`; by 17:12 one container
+remained and the error stopped. So a *transient* pair around a deploy resolves
+itself — it is the pair that persists (the `wa-gateway` case in CLAUDE.md, two
+healthy containers splitting one router's traffic indefinitely) that is the
+fault. Grep the proxy log for this string when traffic to one app looks like it
+is hitting two different builds.
 
 There is exactly one control-plane process, so an in-process lock is enough
 (`app/locks.py`). Two scopes: `app_lock(id)` at every API entry point that
