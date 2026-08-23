@@ -214,6 +214,12 @@ async def apply_image(app_id: str, image: str) -> dict:
             except Exception:
                 pass  # a missing healthcheck must not strand a created app
             if row["internal"]:
+                # Creating it with no domain was not enough: Coolify assigns a
+                # sslip.io host and routes it publicly. Clear it explicitly, and
+                # fail loudly if that does not take -- an internal service left
+                # publicly reachable is the one outcome worth stopping a deploy
+                # for, and it would otherwise look exactly like success.
+                await coolify.clear_domain(uuid)
                 # A readable, stable address for the apps that will call it:
                 # http://rag:80 rather than http://<uuid>:80. Logged rather than
                 # raised -- the app is already created, and envs.internal_urls

@@ -326,9 +326,17 @@ connector prompts.
 ## 6b. Internal services (`rag`)
 
 An **internal app** is reachable from other containers on this box and from
-nowhere else. The mechanism is one field: it is created in Coolify with **no
-domain**, and Coolify derives an application's Traefik labels from its domain —
-so there is no router, no certificate and no public hostname. A database is
+nowhere else. Coolify derives an application's Traefik labels from its domain, so
+an app with no domain gets no router, no certificate and no public hostname.
+
+**Creating it without a domain is not enough, and assuming otherwise shipped a
+publicly reachable service.** Given no `domains` field, Coolify assigns
+`<uuid>.<server-ip>.sslip.io` and generates a full router for it. `rag` came up
+answering `http://5mrrbblh3fk7kutcs5bgcwed.5.12.126.43.sslip.io/healthz` with
+`200` from the open internet — an unauthenticated service with a URL fetcher, on
+the machine that hosts the platform. The domain has to be **cleared explicitly
+after creation** (`coolify.clear_domain`), and the proof is the container's
+label set: zero `traefik.*` labels, the same as the Postgres container. A database is
 unreachable from outside for exactly this reason, and `docker inspect` on the
 Postgres container shows the same thing: `coolify.managed=true` and zero
 `traefik.*` labels.
@@ -340,8 +348,14 @@ alias** — `applications.custom_network_aliases`, a JSON array Coolify
 regenerates into the compose on every deploy — so `rag` answers at
 `http://rag:80`. That is the same mechanism that makes the Sablier controller
 reachable as `sablier`, which is a network alias and not a container name (§9).
-The alias is recorded in `apps.internal_alias` only once Coolify confirms it;
-NULL means callers fall back to the uuid, which is uglier but always resolves.
+The alias is recorded in `apps.internal_alias` only once Coolify confirms it.
+Two details cost a deploy to find: the API wants `custom_network_aliases` as a
+**string** and 422s a list ("The custom network aliases field must be a string"),
+then stores it as a JSON array — what goes in and what comes back are different
+shapes. And the uuid fallback is **not** reliable: a container's network aliases
+are its container *name*, which is `<uuid>-<timestamp>` unless the app has a
+consistent container name, so `http://<uuid>:80` does not resolve for most apps.
+The friendly alias is the address, not a convenience.
 
 Databases cannot have one: `custom_network_aliases` exists on `applications`
 only, not on `standalone_postgresqls` or `standalone_mongodbs`, so `DATABASE_URL`

@@ -69,6 +69,19 @@ async def create_app(image: str, fqdn: str, app_id: str | None = None) -> str:
     return data["uuid"]
 
 
+async def clear_domain(uuid: str) -> None:
+    """Remove an application's domain, so Traefik generates no router for it.
+
+    Necessary because creating an application WITHOUT a domain does not leave it
+    without one: Coolify assigns `<uuid>.<server-ip>.sslip.io` and generates a
+    full router for it. Measured on the box -- rag came up answering
+    http://5mrrbblh3fk7kutcs5bgcwed.5.12.126.43.sslip.io/healthz with 200 from
+    the public internet, on an app created with no `domains` field at all. The
+    domain has to be cleared explicitly, after creation.
+    """
+    await _request("PATCH", f"/applications/{uuid}", json={"domains": ""})
+
+
 async def set_network_alias(uuid: str, alias: str) -> bool:
     """Give an application a friendly DNS name on the shared network.
 
@@ -85,8 +98,11 @@ async def set_network_alias(uuid: str, alias: str) -> bool:
     silently ignored field would leave <ID>_URL pointing at a name that does not
     resolve, which fails at the first call from another app rather than here.
     """
+    # A STRING, not a list. Coolify 422s a list with "The custom network
+    # aliases field must be a string", then stores it as a JSON array -- so
+    # what goes in and what comes back are different shapes.
     await _request("PATCH", f"/applications/{uuid}",
-                   json={"custom_network_aliases": [alias]})
+                   json={"custom_network_aliases": alias})
     try:
         got = await get_app(uuid)
     except Exception:
