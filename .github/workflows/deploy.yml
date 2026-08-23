@@ -2,10 +2,20 @@ name: deploy
 on:
   push:
     branches: [main]
-    # web/ has its own workflow (deploy-web.yml) and docs don't change the image,
-    # so skip the slow emulated arm64 build when only those change.
+    # Each of these has its own workflow, and none of them is part of the
+    # paas-api image, so a change to one must not trigger this build -- it is a
+    # slow emulated arm64 compile, and worse, it redeploys the control plane. A
+    # sibling deploy that is mid-flight talks to that control plane, so an
+    # unnecessary rebuild here does not just waste minutes: it can restart the
+    # API underneath another workflow's deploy and leave its outcome unwritten.
     paths-ignore:
       - 'web/**'
+      - 'rag/**'
+      - 'dashboard/**'
+      - '.github/workflows/deploy-web.yml'
+      - '.github/workflows/deploy-rag.yml'
+      - '.github/workflows/deploy-dashboard.yml'
+      - '.github/workflows/verify.yml'
       - '**.md'
 
 # Recursive self-deploy: this builds the arm64 paas-api image, pushes it to
