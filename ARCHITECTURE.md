@@ -1047,7 +1047,7 @@ flows through: the Traefik access log** — nothing is installed per app.
   (`ALERT_5XX_THRESHOLD`, 5) against the increase since the previous ~2.5 min tick.
   - **To settle "is this rate real?" in one pass**, reconcile the two sides:
     `analytics_perf.err_server` for the day against the count of `fe-<id>` 5xx
-    lines in the proxy log whose `ClientHost` is the static host's container IP
+    lines in the proxy log whose `ClientHost` is the static host's own address
     (`docker inspect` `web` for it *now* — it drifts, which is why the ingester
     cannot key on it, but a one-off audit resolves it first and then it is exact).
     Equal, app for app, means every recorded server error was internal. On
@@ -1055,6 +1055,30 @@ flows through: the Traefik access log** — nothing is installed per app.
     client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
     the container; five retries → `500` on the backend router (dropped); the sixth
     → the app's own answer, which the client gets.
+  - **Take that address from `GlobalIPv6Address`, not `IPAddress`.** The `coolify`
+    network is dual-stack and the static host's forwards arrive over **IPv6**, so
+    matching `ClientHost` against `web`'s IPv4 — which is what `docker inspect
+    --format '{{.IPAddress}}'` hands you — matches **zero** lines and reports every
+    phantom 5xx as client-visible. Measured 2026-08-23 on `gepetel`: keyed on
+    `10.0.1.13`, 0 of 147 5xx were internal; keyed on `fddf:6e69:23a7::d`, 121 were.
+    Same trap as rag's SSRF guard, which is why that checks both families
+    (§6b) — this box's private network is as much `fddf:6e69:23a7::/48` as
+    `10.0.1.0/24`.
+  - **Three `ClientHost` values are worth recognising on sight**, all verified on
+    2026-08-23: `::d` — whatever `web` currently holds — is the static host's own
+    forward; `::1` is the network gateway, so **every external client** arrives
+    from it (`Cf-Connecting-Ip` carries the real one); `10.0.1.1` is the host
+    itself, which in practice means `paas-cron-dispatch` calling `127.0.0.1`.
+    A corroborating signature, exact across all 474 of that day's `gepetel` lines:
+    the static host's forward re-issues the path with a **trailing `?`** (261/261),
+    a client's leg never has one (0/188).
+  - **A `502` on the `fe-<id>` router is the shape that IS client-visible** — the
+    static host answering a client after its forward failed — and it is counted,
+    correctly. Do not fold it in with the phantom `503`. Of `gepetel`'s 70 counted
+    server errors that day, 45 were phantom `fe-` `503`s and 25 were real `fe-`
+    `502`s, all 25 inside the 10:58–11:07 window of four failed Coolify deploys
+    (queue rows 390/393/395/397) and none after the deploy that succeeded at 11:10.
+    Bound the window before reading a day's total as a live fault.
   - **That threshold fired on 2026-08-05, and the cause was a latency fix.** The
     wake loop had just moved to a flat 0.25s retry cadence and to retrying `500`
     inside the loop (`web/server.py`) — right for latency, but every attempt is a
