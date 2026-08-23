@@ -71,21 +71,32 @@ jobs:
             ghcr.io/bogdanripa/pironman-rag:${{ steps.tag.outputs.value }}
 
       # RAG_PAAS_KEY is the `rag` app's own scoped deploy key -- not PAAS_KEY
-      # (scoped to `api`) and not WEB_PAAS_KEY. Tolerant of the app not existing
-      # yet so the first build can publish an image before the app is created.
-      # The control plane redeploys itself often and answers 404 or 5xx while it
-      # restarts, so transient codes are retried rather than believed. 500 is in
-      # that list for the same reason it is in the generated workflow: an app
-      # with a consistent container name stops the old container before starting
-      # the new, and the edge answers 500 across that gap.
+      # (scoped to `api`) and not WEB_PAAS_KEY. The control plane redeploys
+      # itself often and answers 404 or 5xx while it restarts, so transient
+      # codes are retried rather than believed. 500 is in that list for the same
+      # reason it is in the generated workflow: an app with a consistent
+      # container name stops the old container before starting the new, and the
+      # edge answers 500 across that gap.
+      #
+      # The body carries the image, and that is not optional: `rag` is
+      # registered as a bare id, so the FIRST /refresh is what creates its
+      # container -- and a call with no image is answered 400, "this app has no
+      # backend yet". That is why rag had never deployed; the 400 at 10:47 on
+      # 2026-08-23 was this step, not a transient.
       - name: Trigger deploy on the Pi
+        id: refresh
         run: |
           for i in $(seq 1 10); do
             code=$(curl -sS -o /tmp/out -w '%{http_code}' -X POST \
               -H "Authorization: Bearer ${{ secrets.RAG_PAAS_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d '{"image":"ghcr.io/bogdanripa/pironman-rag:latest"}' \
               "https://api-coolify.bogdanripa.com/apps/rag/refresh" || echo 000)
             case "$code" in
-              2*) cat /tmp/out; echo; echo "deployed and verified ($code)"; exit 0 ;;
+              2*) cat /tmp/out; echo
+                  python3 -c "import json;print('id='+json.load(open('/tmp/out')).get('deploy',''))" \
+                    >> $GITHUB_OUTPUT
+                  exit 0 ;;
               404|000|500|502|503|504)
                   echo "attempt $i: $code — control plane may be restarting, retrying"
                   sleep 10 ;;
@@ -94,6 +105,33 @@ jobs:
             esac
           done
           cat /tmp/out; echo
-          echo "gave up after 10 attempts (last: $code)."
-          echo "502 means the deploy rolled back — check: apps_logs rag"
+          echo "gave up after 10 attempts (last: $code)"
+          exit 1
+
+      # 202 above means QUEUED, not deployed -- the hook cannot wait for the
+      # verification, because Cloudflare cuts the request at ~100s. This is
+      # where the deploy passes or fails, and for `rag` it is the ONLY place it
+      # can: rag is an internal service with no public hostname, so there is no
+      # health URL to poll as a second opinion. A rollback leaves the previous
+      # container serving and is invisible from anywhere else.
+      - name: Wait for the deploy to be verified
+        run: |
+          url="https://api-coolify.bogdanripa.com/apps/rag/refresh?deploy=${{ steps.refresh.outputs.id }}"
+          for i in $(seq 1 60); do
+            body=$(curl -sS -H "Authorization: Bearer ${{ secrets.RAG_PAAS_KEY }}" "$url" || echo '{}')
+            state=$(printf '%s' "$body" | python3 -c "import json,sys;print(json.load(sys.stdin).get('state',''))" 2>/dev/null || echo)
+            case "$state" in
+              succeeded) echo "deploy verified on the box"; exit 0 ;;
+              failed) printf '%s\n' "$body"
+                      echo "the new container never came up healthy, so Coolify rolled it"
+                      echo "back — check: apps_logs rag"
+                      exit 1 ;;
+              running|"") sleep 5 ;;
+              unknown) printf '%s\n' "$body"
+                       echo "::error::the box lost track of this deploy, and rag has no"
+                       echo "public health path to fall back on — check apps_logs rag"
+                       exit 1 ;;
+            esac
+          done
+          echo "::error::no verdict after 5 minutes — check: apps_logs rag"
           exit 1
