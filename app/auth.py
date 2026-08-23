@@ -35,15 +35,23 @@ async def require_key(request: Request, authorization: str = Header(None)) -> st
         raise HTTPException(401, "invalid api key")
 
     # A per-app deploy key (app_id set) is least-privilege: it may only ship its
-    # own app — trigger its backend deploy (POST /apps/<id>/refresh), redeploy it
-    # explicitly (PUT /apps/<id>/code) or upload its frontend bundle
+    # own app — trigger its backend deploy (POST /apps/<id>/refresh), ask how that
+    # deploy ended (GET /apps/<id>/refresh), redeploy it explicitly
+    # (PUT /apps/<id>/code) or upload its frontend bundle
     # (PUT /apps/<id>/frontend) — and nothing else, on no other app. Unscoped keys
     # (app_id NULL) are admin keys and pass through. Enforced here, centrally, so
     # no endpoint can forget the check.
+    #
+    # The GET is here because the POST no longer waits: it answers 202 and the
+    # verification finishes off-request, so the only way CI can still tell a
+    # rolled-back deploy from a good one is to come back and ask. Withholding it
+    # would leave the key able to start a deploy it cannot find out the result of,
+    # which is the same blindness in a different place.
     _DEPLOY_ROUTES = {
         ("PUT", "/apps/{app_id}/code"),
         ("PUT", "/apps/{app_id}/frontend"),
         ("POST", "/apps/{app_id}/refresh"),
+        ("GET", "/apps/{app_id}/refresh"),
     }
     if row["app_id"] is not None:
         route = request.scope.get("route")
@@ -53,7 +61,7 @@ async def require_key(request: Request, authorization: str = Header(None)) -> st
                 and target == row["app_id"]):
             raise HTTPException(
                 403, "this key is scoped to a single app and can only deploy that "
-                     "app (POST /apps/<id>/refresh, PUT /apps/<id>/code or "
-                     "PUT /apps/<id>/frontend)")
+                     "app (POST or GET /apps/<id>/refresh, PUT /apps/<id>/code "
+                     "or PUT /apps/<id>/frontend)")
 
     return row["label"] or str(row["id"])

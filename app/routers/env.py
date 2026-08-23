@@ -4,6 +4,23 @@ Shared variables (tag ``env``) apply to every app; per-app variables (tag
 ``apps``) apply to one and override a shared key of the same name. Both are
 stored in the _paas registry and pushed into Coolify; a change redeploys the
 affected app(s) so it actually reaches the running container.
+
+**A variable can be set before the app has a container.** It used to be a 400 —
+"registered but has never deployed, push to its deploy branch and retry" — and
+that instruction is a deadlock for any app that reads its configuration at
+import. The OpenAI SDK throws on a missing key at construction, and it is far
+from alone; such an app cannot survive the boot that would give it a container
+to configure. Its first deploy crash-loops, Coolify rolls it back, and the
+retry lands on the same 400. That is not hypothetical: gepetel's first four
+deploys failed exactly this way on 2026-08-23 (`Missing credentials ...
+OPENAI_API_KEY`, healthcheck unhealthy, rolled back).
+
+So a write to an app with no container is *staged*: it goes into the registry
+and nothing is pushed or redeployed. `autoupdate.apply_image` calls
+`envs.sync_env` before it calls `coolify.deploy`, so the staged values are
+already in Coolify's config when the first container is created — the app boots
+configured, first time. That ordering is what makes this work; do not move the
+deploy ahead of the sync.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -11,7 +28,7 @@ from pydantic import BaseModel, Field
 from ..auth import require_key
 from ..db import pool
 from ..locks import app_lock
-from .. import apperr, coolify, envs
+from .. import coolify, envs
 
 # Columns sync_env needs to recompose an app's environment and redeploy it.
 _APP_COLS = ("id, coolify_uuid, has_frontend, db_engine, db_user, db_password, db_name")
@@ -38,10 +55,11 @@ class EnvValue(BaseModel):
                     "several changes and let the next code deploy pick them up.")
 
 
-# Only an app with a container has an environment to push into. A frontend-only
-# app has no Coolify application at all, so every call here would 404 against
-# uuid NULL — and a shared-variable change, which walks every app, would abort
-# partway through on the first one it met.
+# Only an app with a container has an environment to PUSH into. An app with no
+# Coolify application would 404 against uuid NULL — and a shared-variable
+# change, which walks every app, would abort partway through on the first one it
+# met. Such an app is not skipped so much as deferred: the value is in
+# shared_env, and sync_env reads it when the app's first container is created.
 _WITH_CONTAINER = "coolify_uuid IS NOT NULL"
 
 
@@ -135,15 +153,29 @@ async def env_delete(key: str, redeploy: bool = True):
 
 # --- per-app: apps_env_* ---------------------------------------------------
 
-async def _require_app_row(conn, app_id: str, needs_container: bool = False):
+async def _require_app_row(conn, app_id: str):
     row = await conn.fetchrow(f"SELECT {_APP_COLS} FROM apps WHERE id = $1", app_id)
     if not row:
         raise HTTPException(404, "no such app")
-    if needs_container and not row["coolify_uuid"]:
-        raise HTTPException(400, apperr.no_container(
-            app_id, row, "it has no environment to set",
-            "Put configuration in the bundle, or give the app a backend."))
     return row
+
+
+def _staged_note(row) -> str:
+    """What to tell a caller who set a variable on an app that has no container.
+
+    An app with a frontend but no image may genuinely never have one, and the
+    variable then reaches nothing — worth saying, since the alternative is a
+    secret that looks configured and is not. But it is a note, not a refusal:
+    an app can gain a backend later, and refusing would rebuild the same
+    deadlock one step further along.
+    """
+    if row["has_frontend"] and not row["coolify_uuid"]:
+        return ("stored, but this app has no container to receive it — static "
+                "files are served as they are. It will be applied if the app "
+                "gains a backend; put configuration the bundle needs into the "
+                "bundle instead.")
+    return ("stored and will be applied to this app's first container, which "
+            "its first CI deploy creates. Nothing to redeploy yet.")
 
 
 @app_router.get("/{app_id}/env", operation_id="apps_env_list",
@@ -177,6 +209,14 @@ async def apps_env_set(app_id: str, key: str, body: EnvValue):
     the same name exists, this value overrides it for this app only.
 
     With redeploy=true (the default) the app is redeployed so the value is live.
+
+    **Safe to call before the app has ever deployed.** An app that is registered
+    but has no container yet takes the value as *staged* (`staged: true`): it is
+    stored now and injected when its first CI deploy creates the container, so
+    an app that reads its config at import — an OpenAI client, a database driver
+    — boots configured the first time rather than crash-looping into a rollback.
+    Set the app's secrets straight after apps_create; there is no need to wait
+    for a deploy, and waiting is the thing that used to deadlock.
     """
     try:
         envs.validate_key(key)
@@ -184,15 +224,19 @@ async def apps_env_set(app_id: str, key: str, body: EnvValue):
         raise HTTPException(422, str(e))
 
     async with pool().acquire() as c:
-        row = await _require_app_row(c, app_id, needs_container=True)
+        row = await _require_app_row(c, app_id)
         await c.execute(
             "INSERT INTO app_env (app_id, key, value) VALUES ($1, $2, $3) "
             "ON CONFLICT (app_id, key) DO UPDATE SET value = $3, updated_at = now()",
             app_id, key, body.value)
+        if not row["coolify_uuid"]:
+            return {"app_id": app_id, "key": key,
+                    "preview": envs.mask(body.value), "staged": True,
+                    "redeployed": False, "note": _staged_note(row)}
         await _apply(c, row, body.redeploy)
 
     return {"app_id": app_id, "key": key, "preview": envs.mask(body.value),
-            "redeployed": body.redeploy}
+            "staged": False, "redeployed": body.redeploy}
 
 
 @app_router.delete("/{app_id}/env/{key}", status_code=200,
@@ -202,15 +246,28 @@ async def apps_env_delete(app_id: str, key: str, redeploy: bool = True):
     """Delete one of an app's own variables. If a shared variable of the same
     name exists, the app falls back to that shared value rather than losing the
     key entirely.
+
+    A variable staged on an app that has no container yet is simply dropped from
+    the registry — it was never pushed anywhere, so there is nothing to unset and
+    nothing to redeploy.
     """
     async with pool().acquire() as c:
-        row = await _require_app_row(c, app_id, needs_container=True)
+        row = await _require_app_row(c, app_id)
         gone = await c.execute(
             "DELETE FROM app_env WHERE app_id = $1 AND key = $2", app_id, key)
         if gone.endswith("0"):
             raise HTTPException(404, "no such variable on this app")
+        if not row["coolify_uuid"]:
+            # Nothing was ever pushed to Coolify, so there is nothing to unset
+            # there and nothing to redeploy — removing the staged row is the
+            # whole operation.
+            return {"app_id": app_id, "key": key, "staged": True,
+                    "redeployed": False,
+                    "note": "removed before this app had a container, so it was "
+                            "never pushed anywhere"}
         # Drop it, then re-sync so a shared default of the same name comes back.
         await coolify.delete_env(row["coolify_uuid"], key)
         await _apply(c, row, redeploy)
 
-    return {"app_id": app_id, "key": key, "redeployed": redeploy}
+    return {"app_id": app_id, "key": key, "staged": False,
+            "redeployed": redeploy}

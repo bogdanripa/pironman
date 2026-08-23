@@ -16,6 +16,13 @@ mistake they did not make. That happened: a backend app was created, and every
 `apps_env_set` on it answered "this is a frontend-only app", which reads as
 "you created it wrong" rather than "not yet". Deciding on `has_frontend` costs
 one column and removes the ambiguity.
+
+Note what this is NOT for. `apps_env_set` no longer raises it: telling someone
+to "deploy it once, then retry" is a deadlock when the missing variable is the
+reason the deploy fails, so setting a variable on a container-less app now
+stages it instead (see routers/env.py). Reach for this only where the operation
+genuinely needs a container to act on and no amount of deferring helps — sleep
+enrollment has nothing to enroll.
 """
 
 

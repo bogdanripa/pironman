@@ -427,23 +427,43 @@ flowchart LR
     GH -->|build linux/arm64| IMG[image]
     IMG -->|push :latest + :sha| GHCR[ghcr.io]
     GH -->|curl POST /apps/ID/refresh · Bearer PAAS_KEY| API[paas-api]
+    API -->|202 Accepted · deploy id| GH
     API -->|docker pull + inspect digest| GHCR
     API -->|digest changed → set_image + deploy| CO[Coolify]
     CO --> APP[new container]
+    API -->|verify_deploy → deploys table| DB[(_paas)]
+    GH -->|poll GET /apps/ID/refresh?deploy=| DB
 ```
 
 1. CI builds an **arm64** image, pushes to `ghcr.io` tagged `:latest` (+ `:sha`).
-2. CI calls `POST /apps/<id>/refresh` with the app's scoped `PAAS_KEY`.
+2. CI calls `POST /apps/<id>/refresh` with the app's scoped `PAAS_KEY`. That
+   answers **202 Accepted** with a deploy id and does the work off-request.
 3. `paas-api` pulls the watched tag through the host Docker daemon, and **only if
    the image digest actually moved** re-points Coolify at the new image and
    redeploys. Also runs **hourly** regardless.
+4. CI polls `GET /apps/<id>/refresh?deploy=<id>` for the verdict.
 
 Deploys are **verified**: Coolify rolls a failed deploy back silently, leaving
 the previous container serving while every signal reports success, so
 `autoupdate.verify_deploy` confirms the container was actually replaced and came
-up healthy. `/refresh` and `/code` return 502 when it was not (CI goes red), and
-the hourly sweep alerts. The control plane is exempt — it cannot watch its own
-replacement.
+up healthy. `/code` returns 502 when it was not. `/refresh` cannot answer inline
+— that verification is bounded at 150s and Cloudflare cuts the request at ~100s,
+which on 2026-08-23 turned two correct `502`s into `524`s — so it records the
+result in the `deploys` table and CI reads it back from `GET
+/apps/<id>/refresh`, going red on `state: failed`. The hourly sweep and a failed
+`/refresh` both alert on Telegram. The control plane is exempt — it cannot watch
+its own replacement.
+
+Polling the app's health endpoint is **not** a substitute for that verdict: a
+rollback leaves the previous container serving, so the app answers healthily
+while running the code from before the deploy. The workflow does both — the
+verdict catches a rollback, the health check catches an app that starts, reports
+healthy and still serves errors.
+
+An app's environment variables can be set before it has a container;
+`apps_env_set` stages them and `apply_image` syncs them into Coolify ahead of
+the first deploy. Without that, an app that reads config at import cannot boot
+the container you would need in order to configure it.
 
 `/refresh` accepts no caller-supplied image — it only makes the box re-check the
 tag it already watches — so the key is defence in depth rather than the only thing

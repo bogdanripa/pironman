@@ -31,6 +31,13 @@ jobs:
       # The box watches :latest and redeploys when the digest moves; this triggers
       # the check now instead of waiting for the hourly sweep. PAAS_KEY is the
       # app's scoped deploy key — it can only deploy this one app.
+      #
+      # This answers 202 = QUEUED, not deployed. The real thing the omitted
+      # retry logic does is poll GET /apps/<id>/refresh?deploy=<id> afterwards
+      # for the box's verdict, which is the only way to catch a deploy Coolify
+      # rolled back — a rollback leaves the PREVIOUS container serving, so the
+      # app answers its healthcheck while running the old code. Get the real
+      # workflow from apps_deploy_workflow rather than copying this.
       - name: Trigger deploy
         run: |
           curl -fsS -X POST \

@@ -401,7 +401,13 @@ async def create_app(body: CreateApp):
             "only deploy this app.",
             "2. Call apps_deploy_workflow and write what it returns into the "
             "app's repo: the backend job, the frontend job, or both.",
-            "3. Push to main. The first deploy creates whatever the app needs — "
+            "3. Set the app's secrets now with apps_env_set — before the first "
+            "deploy, not after. They are staged until the container exists and "
+            "injected when it is created. An app that reads config at import (an "
+            "OpenAI client, a database driver) throws on a missing key, so "
+            "without them its first container fails its healthcheck and is "
+            "rolled back, leaving nothing to configure.",
+            "4. Push to main. The first deploy creates whatever the app needs — "
             "there is no tool here to deploy by hand.",
         ],
     }

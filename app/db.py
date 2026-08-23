@@ -214,6 +214,23 @@ CREATE TABLE IF NOT EXISTS platform_events (
 );
 CREATE INDEX IF NOT EXISTS platform_events_at ON platform_events (at DESC);
 CREATE INDEX IF NOT EXISTS platform_events_app ON platform_events (app_id, at DESC);
+
+-- One row per CI deploy triggered through POST /apps/<id>/refresh. That call
+-- answers 202 and finishes the work off-request, so the outcome has nowhere to
+-- be returned to — this is where it goes, and GET /apps/<id>/refresh reads it
+-- back. In Postgres rather than in memory because the control plane is itself
+-- an app on this box and redeploys often: an in-memory record would vanish
+-- exactly when a caller is mid-poll, turning a known result into an unknown one.
+-- `ok` is NULL while the deploy is still running. See app/deploys.py.
+CREATE TABLE IF NOT EXISTS deploys (
+    id          text PRIMARY KEY,
+    app_id      text NOT NULL,
+    queued_at   timestamptz NOT NULL DEFAULT now(),
+    finished_at timestamptz,
+    ok          boolean,
+    detail      jsonb
+);
+CREATE INDEX IF NOT EXISTS deploys_app ON deploys (app_id, queued_at DESC);
 """
 
 

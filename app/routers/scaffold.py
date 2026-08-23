@@ -145,12 +145,18 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
               # that the box watches the tag itself and this just asks it to check
               # now rather than at the next hourly sweep. Authenticated with this
               # app's scoped deploy key (PAAS_KEY), which can only deploy this one
-              # app. A 2xx means the new container came up healthy — the platform
-              # verifies that before answering, so a rolled-back deploy fails this
-              # step instead of going green. The control plane redeploys itself
-              # often and answers 404 while it restarts, so transient codes are
-              # retried rather than believed.
+              # app. The control plane redeploys itself often and answers 404
+              # while it restarts, so transient codes are retried rather than
+              # believed.
+              #
+              # 202 means QUEUED, not deployed. The hook used to hold the
+              # connection open until it had verified the deploy, but Cloudflare
+              # fronts that API and cuts a request at ~100s, so the deploys worth
+              # hearing about were the ones this step could not hear about — two
+              # measured at 125s, both answered 524, both hiding a real verdict.
+              # It now returns a deploy id and the next step collects the result.
               - name: Trigger deploy on the Pi
+                id: refresh
                 run: |
                   for i in $(seq 1 10); do
                     code=$(curl -sS -o /tmp/out -w '%{{http_code}}' -X POST \\
@@ -159,21 +165,54 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                       -d '{{"image": "ghcr.io/{GHCR_OWNER}/{repo_name}:latest"}}' \\
                       "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh" || echo 000)
                     case "$code" in
-                      2*) cat /tmp/out; echo; exit 0 ;;
+                      2*) cat /tmp/out; echo
+                          python3 -c "import json;print('id='+json.load(open('/tmp/out')).get('deploy',''))" \\
+                            >> $GITHUB_OUTPUT
+                          exit 0 ;;
                       404|000|503|504) echo "attempt $i: $code, retrying"; sleep 10 ;;
                       401) echo "PAAS_KEY is not this app's deploy key"; exit 1 ;;
-                      502) cat /tmp/out; echo
-                           echo "deploy rolled back — the new container never became healthy"
-                           echo "check: apps_logs {app_id}"; exit 1 ;;
                       *)  cat /tmp/out; echo; echo "refresh failed ($code)"; exit 1 ;;
                     esac
                   done
                   echo "gave up after 10 attempts"; exit 1
 
-              # /refresh verifies the deploy server-side and returns non-2xx if
-              # the container failed and Coolify rolled it back, so this step is a
-              # second opinion: it also catches an app that starts and answers
-              # healthily but serves errors.
+              # The verdict the 202 could not carry. This is the ONLY step that
+              # can tell a rolled-back deploy from a good one: Coolify rolls a
+              # failed deploy back silently and the PREVIOUS container keeps
+              # serving, so the app answers its healthcheck perfectly well with
+              # the old code still running. Health polling cannot see that. This
+              # can, because the box compared container start times.
+              #
+              # 'unknown' is not failed. It means the control plane was recycled
+              # mid-deploy and never wrote the outcome down — real, since the
+              # control plane is itself an app on this box. Guessing 'failed'
+              # there would red a good build, so this warns and lets the health
+              # check below have the last word.
+              - name: Wait for the deploy to be verified
+                run: |
+                  url="https://api-coolify.bogdanripa.com/apps/{app_id}/refresh?deploy=${{{{ steps.refresh.outputs.id }}}}"
+                  for i in $(seq 1 60); do
+                    body=$(curl -sS -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" "$url" || echo '{{}}')
+                    state=$(printf '%s' "$body" | python3 -c "import json,sys;print(json.load(sys.stdin).get('state',''))" 2>/dev/null || echo)
+                    case "$state" in
+                      succeeded) echo "deploy verified on the box"; exit 0 ;;
+                      failed) printf '%s\\n' "$body"
+                              echo "the new container never came up healthy, so Coolify rolled"
+                              echo "the deploy back — the PREVIOUS version is still serving and"
+                              echo "will answer the health check below. check: apps_logs {app_id}"
+                              exit 1 ;;
+                      running|"") sleep 5 ;;
+                      unknown) printf '%s\\n' "$body"
+                               echo "::warning::the box lost track of this deploy; falling through"
+                               echo "to the health check, which cannot detect a rollback"
+                               exit 0 ;;
+                    esac
+                  done
+                  echo "::warning::no verdict after 5 minutes; falling through to the health check"
+
+              # A second opinion on top of the server-side verdict: this one also
+              # catches an app that starts, reports healthy and still serves
+              # errors on the path that matters.
               #
               # It requests the app's health_path ({health_path}), not '/', and
               # requires a 2xx. That distinction matters on an app that also has a
@@ -372,11 +411,20 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
         "or two, an image with native dependencies to compile can take 15+ "
         "minutes. Do not size a polling loop off either number — watch the run, "
         "or time the first one and use that.",
-        f"The 'wait for healthy' step requests this app's health_path "
-        f"({health_path}) and requires a 2xx, so a green run means the container "
-        "answered. If this app also ships a frontend, keep health_path on a path "
-        "the BACKEND owns: '/' is served by the static bundle from the CDN with "
-        "no container involved, so a '/' check passes even with a dead API.",
+        "The deploy is checked twice, and the two catch different things. "
+        "'Wait for the deploy to be verified' polls the box's own verdict "
+        "(GET /apps/<id>/refresh): the /refresh POST answers 202 the moment the "
+        "deploy is queued — it cannot wait for the result, because Cloudflare "
+        "cuts the request at ~100s — so this is where a rollback is caught. It "
+        "is the ONLY step that can catch one: Coolify rolls a failed deploy back "
+        "silently and the previous container keeps serving, so the app's health "
+        "endpoint answers perfectly while running the OLD code.",
+        f"'Wait for the new version to be healthy' then requests this app's "
+        f"health_path ({health_path}) and requires a 2xx, which additionally "
+        "catches an app that starts, reports healthy and still serves errors. If "
+        "this app also ships a frontend, keep health_path on a path the BACKEND "
+        "owns: '/' is served by the static bundle from the CDN with no container "
+        "involved, so a '/' check passes even with a dead API.",
         "The workflow needs ONE secret: PAAS_KEY, this app's scoped deploy key. "
         "Set it yourself with github_secret_set — apps_create returns the key as "
         "`paas_key` and apps_deploy_key re-issues one — rather than asking the "
@@ -387,6 +435,13 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
         "that the box watches the tag itself and redeploys only when the digest "
         "actually changes. It also sweeps hourly, so a missed or failed /refresh "
         "call delays a deploy rather than losing it.",
+        "Set the app's secrets BEFORE the first push, with apps_env_set. An app "
+        "with no container yet takes them as staged and they are injected when "
+        "the first container is created. This is not an optimisation: an app "
+        "that reads config at import (an OpenAI client, a database driver) "
+        "throws on a missing key, so without them its first container fails its "
+        "healthcheck and is rolled back — leaving no container to configure and "
+        "a build that will fail the same way every time.",
         "The app must already exist here before the first workflow run (create it "
         "with apps_create). New apps have auto-update on by default; toggle it "
         "with apps_autoupdate.",
@@ -414,7 +469,9 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
             "No human step. Do not build the image locally.",
             "0. Install PAAS_KEY in the app's repo with github_secret_set, using "
             "the key from apps_create (or apps_deploy_key). Do this first: the "
-            "workflow's deploy step fails without it.",
+            "workflow's deploy step fails without it. Set the app's own secrets "
+            "now too (apps_env_set) — they are staged until the first container "
+            "exists, and an app that needs one at import cannot boot without it.",
             "1. Write `workflow` verbatim to `workflow_path` in the app's repo "
             "and commit it. If something about it does not fit — the branch, the "
             "repository name — call this tool again with that parameter rather "

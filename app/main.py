@@ -6,7 +6,8 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI
 
 from .db import init_pool, ensure_schema, close_pool, pool
-from . import heartbeat, autoupdate, analytics, alerts, events, routing, sablier
+from . import (heartbeat, autoupdate, analytics, alerts, events, routing,
+               sablier, deploys)
 from .cors import CorsMiddleware
 from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
@@ -435,7 +436,8 @@ async def lifespan(_: FastAPI):
     # invisible to every reader, which is how a dead cron dispatcher went
     # unnoticed while the watchdog reported everything current.
     await heartbeat.register()
-    await events.trim()  # bound the recycle log; best-effort, never fatal
+    await events.trim()   # bound the recycle log; best-effort, never fatal
+    await deploys.trim()  # and the CI deploy log, same contract
     await _sync_routes("startup")
     tasks = [asyncio.create_task(_autoupdate_loop()),
              asyncio.create_task(_analytics_loop()),
@@ -541,7 +543,8 @@ _mcp = FastApiMCP(
     description=SERVER_DESCRIPTION,
     # apps_frontend_deploy takes a raw zip body — a CI call, not something a model
     # can meaningfully construct, so it stays REST-only like apps_update_code.
-    exclude_operations=["apps_update_code", "apps_refresh", "apps_frontend_deploy",
+    exclude_operations=["apps_update_code", "apps_refresh", "apps_refresh_status",
+                        "apps_frontend_deploy",
                         # plumbing reached through apps_update, which expresses
                         # intent ("give this app a backend") rather than mechanism
                         # ("set its image"). Deploys are CI's job, not a tool call.

@@ -305,6 +305,38 @@ the call also carries the image CI just built, and on an app's **first** deploy
 that image is what creates its container: registration writes a bare id, and the
 pipeline is the only thing that knows what the app runs.
 
+**`POST /apps/<id>/refresh` answers `202 Accepted`** with a deploy id, and the
+work happens off-request. It used to block until `verify_deploy` finished, which
+is bounded at 150s — but Cloudflare fronts this API and cuts a request at ~100s,
+so the deploys worth hearing about were exactly the ones CI could not hear
+about. Two `POST /apps/gepetel/refresh` calls on 2026-08-23 ran 125.0s at the
+edge and both ended `499`.
+
+Be precise about what those were, because the obvious reading argues for the
+wrong fix. They were not slow successes: Coolify had **failed and rolled both
+back inside 20s** (deployment queue rows 390/393 — healthcheck unhealthy,
+`wget: not found`, the app crashing on a missing key). `verify_deploy` cannot
+see Coolify's verdict, so it polls the container to its own deadline, and the
+524 arrived before the `502` this hook was about to return correctly. The 150s
+budget is therefore not too short and must not be raised — Coolify decides in
+8-49s here, so a longer one would only delay honest failures.
+
+`GET /apps/<id>/refresh?deploy=<id>` returns that verdict (`state` is
+`succeeded`, `failed`, `running` or `unknown`), read from the `deploys` table so
+it survives the control plane's own redeploys. **CI must gate on it**, and the
+generated workflow does: it is the only check that can catch a rollback, because
+a rollback leaves the previous container serving and the app's health endpoint
+answers perfectly well with the old code in place. A failure also raises a
+Telegram alert, as the hourly sweep's does.
+
+An app's environment can be set **before it has a container**. `apps_env_set` on
+a registered-but-never-deployed app stages the value (`staged: true`) and
+`apply_image` syncs it into Coolify before the first deploy, so the container
+boots configured. That is not a nicety: an app that reads config at import — the
+OpenAI SDK throws on a missing key — cannot survive the boot that would give it
+a container to configure, so the old "deploy it once, then retry" 400 was a
+deadlock, and it is what failed gepetel's first four deploys.
+
 New apps have auto-update on, watching the tag they were created with;
 `apps_autoupdate` toggles it (off to hold a manual rollback). `app/autoupdate.py`
 holds the routine. `apps_update_code` plus a scoped deploy key remain the
@@ -521,8 +553,12 @@ waits for the app's container to have a start time *later* than the one observed
 before the deploy — proving it was genuinely replaced, not merely survived — and
 to be running without an unhealthy healthcheck.
 
-- **`POST /apps/<id>/refresh`** returns **502** when the deploy rolled back, so
-  CI goes red instead of green.
+- **`POST /apps/<id>/refresh`** answers 202 and verifies off-request; the
+  verdict is read back from **`GET /apps/<id>/refresh?deploy=<id>`**, which the
+  generated workflow polls, so CI goes red instead of green. It cannot be
+  returned inline — that wait is longer than Cloudflare's request ceiling (see
+  "Auto-update"). A failure also alerts on Telegram, because nobody is watching
+  a background deploy either.
 - **`PUT /apps/<id>/code`** does the same, except for the control plane itself
   (`CONTROL_PLANE_APP`, default `api`), which cannot observe its own replacement
   — that request is served by the container being replaced.
