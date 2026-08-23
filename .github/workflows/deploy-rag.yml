@@ -1,0 +1,99 @@
+name: deploy-rag
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rag/**'
+      - '.github/workflows/deploy-rag.yml'
+
+# Builds the RAG service (rag/) -- document ingest and hybrid retrieval.
+# Path-filtered like deploy-web.yml so a change here does not trigger a slow
+# emulated arm64 build of paas-api, or vice versa.
+#
+#   image  = ghcr.io/bogdanripa/pironman-rag
+#   app id = rag
+#
+# Deploys the secretless way: the box watches :latest and redeploys when the
+# digest moves, so CI only pokes /refresh.
+
+concurrency:
+  group: deploy-rag
+  cancel-in-progress: true
+
+jobs:
+  # The guard in fetch.py is the security boundary of this service -- it takes
+  # URLs from anonymous callers and runs on the machine hosting the platform, so
+  # a regression there is an SSRF hole into the private network, not a bug. The
+  # suite also covers the two silent-failure modes: a document that indexes
+  # nothing while reporting ready, and a truncated document that answers queries
+  # about its missing half without saying so.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install fastapi==0.115.6 httpx==0.28.1 numpy selectolax pypdf python-docx python-pptx
+      - run: python rag/tests/test_rag.py
+
+  deploy:
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # Same PAT as deploy.yml and deploy-web.yml: it owns the bogdanripa/*
+          # package namespace, which avoids the package-linkage step a fresh
+          # GITHUB_TOKEN would need.
+          password: ${{ secrets.GHCR_PAT }}
+
+      - id: tag
+        run: echo "value=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./rag
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/bogdanripa/pironman-rag:latest
+            ghcr.io/bogdanripa/pironman-rag:${{ steps.tag.outputs.value }}
+
+      # RAG_PAAS_KEY is the `rag` app's own scoped deploy key -- not PAAS_KEY
+      # (scoped to `api`) and not WEB_PAAS_KEY. Tolerant of the app not existing
+      # yet so the first build can publish an image before the app is created.
+      # The control plane redeploys itself often and answers 404 or 5xx while it
+      # restarts, so transient codes are retried rather than believed. 500 is in
+      # that list for the same reason it is in the generated workflow: an app
+      # with a consistent container name stops the old container before starting
+      # the new, and the edge answers 500 across that gap.
+      - name: Trigger deploy on the Pi
+        run: |
+          for i in $(seq 1 10); do
+            code=$(curl -sS -o /tmp/out -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer ${{ secrets.RAG_PAAS_KEY }}" \
+              "https://api-coolify.bogdanripa.com/apps/rag/refresh" || echo 000)
+            case "$code" in
+              2*) cat /tmp/out; echo; echo "deployed and verified ($code)"; exit 0 ;;
+              404|000|500|502|503|504)
+                  echo "attempt $i: $code — control plane may be restarting, retrying"
+                  sleep 10 ;;
+              401) echo "unauthorized — RAG_PAAS_KEY must be the 'rag' app's deploy key"; exit 1 ;;
+              *)   cat /tmp/out; echo; echo "refresh failed ($code)"; exit 1 ;;
+            esac
+          done
+          cat /tmp/out; echo
+          echo "gave up after 10 attempts (last: $code)."
+          echo "502 means the deploy rolled back — check: apps_logs rag"
+          exit 1
