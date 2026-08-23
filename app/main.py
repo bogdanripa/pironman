@@ -228,9 +228,9 @@ data), not only at create time.
 **Internal services** are reachable from apps on this box and from nowhere else,
 the same way a database is: they are created with no domain, so Traefik generates
 no router and there is no public hostname to reach. Their address arrives in the
-environment on every deploy, exactly like DATABASE_URL — read it from there, do
-not hardcode it, because the host is a Coolify uuid that changes if the service
-is rebuilt.
+environment on every deploy, exactly like DATABASE_URL — read it from there
+rather than hardcoding it, so the app keeps working if the service is ever
+rebuilt.
 
 `RAG_URL` — document retrieval. POST a document, get a 16-character id back,
 then ask questions scoped to the ids you hold. It accepts PDF, Word, PowerPoint,

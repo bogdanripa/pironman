@@ -67,15 +67,18 @@ async def internal_urls(conn) -> dict[str, str]:
     on every deploy is the same contract as DATABASE_URL: read it from the
     environment, never write it down.
 
-    The address is the container's network alias on the shared `coolify`
-    network, which is the bare uuid (the container itself is usually named
-    <uuid>-<timestamp>, so the alias is the stable half).
+    The host is the app's friendly network alias where Coolify accepted one
+    (http://rag:80 -- the same mechanism that makes the Sablier controller
+    answer at `sablier`), and its uuid where it did not. The uuid always works
+    because Coolify aliases every container to it; the friendly name is simply
+    readable and survives a rebuild.
     """
     rows = await conn.fetch(
-        "SELECT id, coolify_uuid FROM apps "
+        "SELECT id, coolify_uuid, internal_alias FROM apps "
         "WHERE internal = true AND coolify_uuid IS NOT NULL")
     return {re.sub(r"[^A-Z0-9]", "_", r["id"].upper()) + "_URL":
-            "http://%s:80" % r["coolify_uuid"] for r in rows}
+            "http://%s:80" % (r["internal_alias"] or r["coolify_uuid"])
+            for r in rows}
 
 
 async def sync_env(conn, uuid: str, app_id: str, db_engine, db_user,

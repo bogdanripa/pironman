@@ -334,11 +334,24 @@ Postgres container shows the same thing: `coolify.managed=true` and zero
 `traefik.*` labels.
 
 Everything on the box shares one Docker network (`coolify`), and each container
-carries its uuid as a network alias, so an internal service answers at
-`http://<coolify_uuid>:80`. That address is injected into every app's
-environment on each deploy as `<ID>_URL` (so `rag` becomes `RAG_URL`), the same
-contract as `DATABASE_URL` — composed fresh each time, because the uuid changes
-if the service is rebuilt. It is injected *after* the user's own variables, so a
+carries its uuid as a network alias, so an internal service always answers at
+`http://<coolify_uuid>:80`. Where Coolify accepts one it also gets a **friendly
+alias** — `applications.custom_network_aliases`, a JSON array Coolify
+regenerates into the compose on every deploy — so `rag` answers at
+`http://rag:80`. That is the same mechanism that makes the Sablier controller
+reachable as `sablier`, which is a network alias and not a container name (§9).
+The alias is recorded in `apps.internal_alias` only once Coolify confirms it;
+NULL means callers fall back to the uuid, which is uglier but always resolves.
+
+Databases cannot have one: `custom_network_aliases` exists on `applications`
+only, not on `standalone_postgresqls` or `standalone_mongodbs`, so `DATABASE_URL`
+keeps composing a uuid host. A `docker network connect --alias` would attach to
+the container rather than the resource, and so would vanish on a rebuild —
+precisely the event that makes the uuid inconvenient.
+
+The address is injected into every app's environment on each deploy as
+`<ID>_URL` (so `rag` becomes `RAG_URL`), the same contract as `DATABASE_URL`,
+composed fresh each time. It is injected *after* the user's own variables, so a
 variable of the same name cannot shadow it into pointing somewhere else.
 
 **Internal apps never sleep.** Scale-to-zero is driven by the Sablier middleware

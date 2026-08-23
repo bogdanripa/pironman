@@ -213,6 +213,23 @@ async def apply_image(app_id: str, image: str) -> dict:
                 await coolify.set_healthcheck(uuid, row["health_path"] or "/")
             except Exception:
                 pass  # a missing healthcheck must not strand a created app
+            if row["internal"]:
+                # A readable, stable address for the apps that will call it:
+                # http://rag:80 rather than http://<uuid>:80. Logged rather than
+                # raised -- the app is already created, and envs.internal_urls
+                # falls back to the uuid, which always resolves.
+                try:
+                    if await coolify.set_network_alias(uuid, app_id):
+                        await c.execute(
+                            "UPDATE apps SET internal_alias = $1 WHERE id = $2",
+                            app_id, app_id)
+                    else:
+                        _log.warning(
+                            "network alias %r did not take for %s; callers will "
+                            "use the uuid address instead", app_id, app_id)
+                except Exception as exc:
+                    _log.warning("could not set network alias for %s: %s",
+                                 app_id, exc)
             # Internal apps must not sleep. Scale-to-zero is driven by the
             # Sablier middleware on a Traefik router, and an internal app has
             # no router — so nothing would ever wake it and the first caller

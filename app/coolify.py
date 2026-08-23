@@ -5,6 +5,7 @@ The others are the documented shape but were not tested — if a deploy or env
 injection misbehaves, check these first against /docs in a browser.
 """
 import base64
+import json
 import httpx
 from . import events
 from .config import (
@@ -66,6 +67,37 @@ async def create_app(image: str, fqdn: str, app_id: str | None = None) -> str:
         body["name"] = app_id
     data = await _request("POST", "/applications/dockerimage", json=body)
     return data["uuid"]
+
+
+async def set_network_alias(uuid: str, alias: str) -> bool:
+    """Give an application a friendly DNS name on the shared network.
+
+    Containers are otherwise reachable only at their uuid, which is unreadable
+    and changes if the resource is rebuilt. Coolify stores this as a JSON array
+    and regenerates the compose from it on every deploy, so the alias survives
+    redeploys -- unlike `docker network connect --alias`, which is attached to a
+    container and dies with it.
+
+    Precedent on this box: the Sablier controller is reached at `sablier`
+    purely because its application carries custom_network_aliases ["sablier"].
+
+    Read back rather than assumed, and returns whether it actually took: a
+    silently ignored field would leave <ID>_URL pointing at a name that does not
+    resolve, which fails at the first call from another app rather than here.
+    """
+    await _request("PATCH", f"/applications/{uuid}",
+                   json={"custom_network_aliases": [alias]})
+    try:
+        got = await get_app(uuid)
+    except Exception:
+        return False
+    aliases = got.get("custom_network_aliases")
+    if isinstance(aliases, str):
+        try:
+            aliases = json.loads(aliases)
+        except ValueError:
+            aliases = []
+    return alias in (aliases or [])
 
 
 async def delete_app(uuid: str) -> None:

@@ -81,6 +81,10 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS health_path text NOT NULL DE
 -- router for it and there is nothing to reach from outside. Other apps get
 -- its address injected as <ID>_URL, like DATABASE_URL.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS internal boolean NOT NULL DEFAULT false;
+-- The friendly DNS name an internal app answers to on the shared network,
+-- set only once Coolify confirms it. NULL means callers use the uuid, which
+-- is uglier but always resolves.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS internal_alias text;
 
 -- A frontend-only app has no image and no Coolify application, but the apps
 -- table predates this codebase and declared both NOT NULL, so creating one
