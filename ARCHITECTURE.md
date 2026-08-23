@@ -323,6 +323,71 @@ connector prompts.
 
 ---
 
+## 6b. Internal services (`rag`)
+
+An **internal app** is reachable from other containers on this box and from
+nowhere else. The mechanism is one field: it is created in Coolify with **no
+domain**, and Coolify derives an application's Traefik labels from its domain —
+so there is no router, no certificate and no public hostname. A database is
+unreachable from outside for exactly this reason, and `docker inspect` on the
+Postgres container shows the same thing: `coolify.managed=true` and zero
+`traefik.*` labels.
+
+Everything on the box shares one Docker network (`coolify`), and each container
+carries its uuid as a network alias, so an internal service answers at
+`http://<coolify_uuid>:80`. That address is injected into every app's
+environment on each deploy as `<ID>_URL` (so `rag` becomes `RAG_URL`), the same
+contract as `DATABASE_URL` — composed fresh each time, because the uuid changes
+if the service is rebuilt. It is injected *after* the user's own variables, so a
+variable of the same name cannot shadow it into pointing somewhere else.
+
+**Internal apps never sleep.** Scale-to-zero is driven by the Sablier middleware
+on a Traefik router; with no router there is nothing to hold the request or
+start the container, so a sleeping internal app would simply refuse the
+connection. `apply_image` therefore sets `sleep_when_idle = false` when it
+creates one, and `routing.py` excludes internal apps from both the fronted and
+defronted label passes — they have no route to write or to scope.
+
+### `rag` — document retrieval
+
+Clients POST a document and get a 16-character id; queries name the ids they
+hold. Storage is SQLite (FTS5 + int8 vectors) on a persistent volume at
+`/data/pironman/rag -> /data`; retrieval is BM25 and cosine fused by Reciprocal
+Rank Fusion. There is no ANN index and there does not need to be — measured on
+this box, brute-force cosine scores 2,000 chunks in 0.12 ms and 20,000 in
+1.76 ms, and a query only ever reads the chunks of the documents it names.
+
+Embeddings are static (Model2Vec `potion-base-8M`, baked into the image): 0.18 ms
+per chunk, 0.12 s to load, 30 MB, 256 dims, no torch. A transformer would cost
+10-30 ms per chunk and dominate both the image and every cold start.
+
+Four design points, all of them guarding the failure this repo keeps meeting —
+something that reports success while serving the wrong thing:
+
+- **The id is the whole credential**, so it never travels in a URL. This
+  platform's edge proxy logs full request lines into a log analytics ingests,
+  and an app's secret key has already been read out of it (§10). Status and
+  delete are POSTs carrying ids in the body, where REST would put them in a path.
+- **Truncation is reported by `/query`, not only at ingest.** Large documents are
+  indexed to a page/token limit; the caller querying is usually not the uploader
+  and has never seen the ingest status, so without this a question about page 150
+  of a 200-page contract gets a confident, well-ranked, wrong answer.
+- **Ingest fails loudly.** A scanned PDF with no text layer, an empty extraction,
+  or a Google sign-in page returned instead of a document all end at
+  `status: failed` with a reason, never at `ready` with nothing indexed.
+- **Ingest is asynchronous** because the edge cuts at 100 s (§9c). A caller who
+  receives a 524 for work that actually succeeded retries, and content-hash dedup
+  would then hand them a second id for the same document.
+
+Storage is content-addressed but the capability is not: identical bytes are
+stored, chunked and embedded once against a refcount, while every upload mints
+its own random id. "Same hash, same id" would hand the second uploader a live
+capability belonging to the first. Originals are dropped once extracted — only
+the compressed text and the vectors persist, so the ingress limit bounds a
+transient buffer rather than a storage commitment, and keeping the *full* text
+rather than just the indexed portion means raising a limit later re-indexes what
+the client already sent.
+
 ## 7. Environment variables
 
 Two scopes, both stored in `_paas` and injected on deploy:

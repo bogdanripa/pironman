@@ -23,6 +23,9 @@ from . import coolify, provision
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 # Managed by the platform (see provision.compose_url) — never user-settable.
+# The <ID>_URL addresses of internal services are managed too, but are not
+# listed here: they are injected AFTER the user's variables, so setting one
+# by hand is overwritten on the next deploy rather than rejected up front.
 RESERVED = {"DATABASE_URL"}
 
 
@@ -55,14 +58,39 @@ async def desired_env(conn, app_id: str) -> dict[str, str]:
     return env
 
 
+async def internal_urls(conn) -> dict[str, str]:
+    """<ID>_URL for every internal service, e.g. RAG_URL.
+
+    An internal app has no public hostname, so an app that wants to call it
+    cannot be told a URL to hardcode — and should not be, because the address is
+    the Coolify uuid, which changes if the service is ever rebuilt. Injecting it
+    on every deploy is the same contract as DATABASE_URL: read it from the
+    environment, never write it down.
+
+    The address is the container's network alias on the shared `coolify`
+    network, which is the bare uuid (the container itself is usually named
+    <uuid>-<timestamp>, so the alias is the stable half).
+    """
+    rows = await conn.fetch(
+        "SELECT id, coolify_uuid FROM apps "
+        "WHERE internal = true AND coolify_uuid IS NOT NULL")
+    return {re.sub(r"[^A-Z0-9]", "_", r["id"].upper()) + "_URL":
+            "http://%s:80" % r["coolify_uuid"] for r in rows}
+
+
 async def sync_env(conn, uuid: str, app_id: str, db_engine, db_user,
                    db_password, db_name) -> None:
     """Push an app's full desired env into Coolify: every shared/app variable,
-    plus a freshly composed DATABASE_URL when the app has a database. Idempotent
-    — it upserts, so calling it on every deploy keeps the container's env in
-    step with the registry. It does not deploy; the caller decides when to."""
+    plus a freshly composed DATABASE_URL when the app has a database, plus the
+    address of every internal service. Idempotent — it upserts, so calling it on
+    every deploy keeps the container's env in step with the registry. It does
+    not deploy; the caller decides when to."""
     for key, value in (await desired_env(conn, app_id)).items():
         await coolify.set_env(uuid, key, value)
     if db_engine:
         url = await provision.compose_url(db_engine, db_user, db_password, db_name)
         await coolify.set_env(uuid, "DATABASE_URL", url)
+    # Last, so they win. A user variable of the same name cannot shadow a
+    # platform-managed address into pointing somewhere else.
+    for key, value in (await internal_urls(conn)).items():
+        await coolify.set_env(uuid, key, value)

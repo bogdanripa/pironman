@@ -39,7 +39,8 @@ async def _request(method: str, path: str, **kw) -> dict | list | None:
 
 
 async def create_app(image: str, fqdn: str, app_id: str | None = None) -> str:
-    """VERIFIED. Returns the new application UUID.
+    """VERIFIED. Returns the new application UUID. An empty `fqdn` creates an
+    application with no domain — internal-only, like a database.
 
     `app_id` becomes the application's Coolify name. Without it Coolify names the
     app after the image, so the UI (and the labels it derives) show
@@ -54,9 +55,13 @@ async def create_app(image: str, fqdn: str, app_id: str | None = None) -> str:
         "docker_registry_image_name": name,
         "docker_registry_image_tag": tag or "latest",
         "ports_exposes": "80",
-        "domains": fqdn,
         "instant_deploy": False,
     }
+    # Omitted, not empty: an app with no domain is an internal service, and
+    # Coolify generates Traefik labels from this field. Sending "" would ask
+    # it to route a blank host.
+    if fqdn:
+        body["domains"] = fqdn
     if app_id:
         body["name"] = app_id
     data = await _request("POST", "/applications/dockerimage", json=body)

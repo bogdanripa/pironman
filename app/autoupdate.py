@@ -28,7 +28,7 @@ _ghcr_logged_in = False
 # Everything check_and_update needs to compare digests, redeploy, and enroll.
 APP_COLS = ("id, coolify_uuid, image, watch_tag, deployed_digest, "
             "db_engine, db_user, db_password, db_name, "
-            "sleep_when_idle, sablier_enrolled")
+            "sleep_when_idle, sablier_enrolled, internal")
 
 
 def repo_of(image: str) -> str:
@@ -193,7 +193,7 @@ async def apply_image(app_id: str, image: str) -> dict:
     async with pool().acquire() as c:
         row = await c.fetchrow(
             "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
-            "watch_tag, health_path FROM apps WHERE id = $1", app_id)
+            "watch_tag, health_path, internal FROM apps WHERE id = $1", app_id)
         if not row:
             raise NoSuchApp(app_id)
 
@@ -202,14 +202,25 @@ async def apply_image(app_id: str, image: str) -> dict:
         # registration — until now there was no container for it to describe.
         gained_backend = not row["coolify_uuid"]
         if gained_backend:
-            uuid = await coolify.create_app(image, app_fqdn(app_id), app_id=app_id)
+            # An internal app is created with NO domain. That single
+            # difference is what makes a database unreachable from outside:
+            # Coolify derives its Traefik labels from the domain, so without
+            # one there is no router, no certificate and no public hostname —
+            # only the container alias on the shared `coolify` network.
+            uuid = await coolify.create_app(
+                image, "" if row["internal"] else app_fqdn(app_id), app_id=app_id)
             try:
                 await coolify.set_healthcheck(uuid, row["health_path"] or "/")
             except Exception:
                 pass  # a missing healthcheck must not strand a created app
+            # Internal apps must not sleep. Scale-to-zero is driven by the
+            # Sablier middleware on a Traefik router, and an internal app has
+            # no router — so nothing would ever wake it and the first caller
+            # would simply get a refused connection. Databases stay up for
+            # exactly the same reason.
             await c.execute(
-                "UPDATE apps SET coolify_uuid = $1, sleep_when_idle = true "
-                "WHERE id = $2", uuid, app_id)
+                "UPDATE apps SET coolify_uuid = $1, sleep_when_idle = $2 "
+                "WHERE id = $3", uuid, not row["internal"], app_id)
             row = await c.fetchrow(
                 "SELECT coolify_uuid, db_engine, db_user, db_password, db_name, "
                 "watch_tag, health_path FROM apps WHERE id = $1", app_id)

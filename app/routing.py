@@ -277,7 +277,7 @@ async def fronted_ids(conn) -> set[str]:
 #     its route and start it.
 _FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle, spa "
             "FROM apps "
-            "WHERE id <> $1 AND (has_frontend = true "
+            "WHERE id <> $1 AND internal = false AND (has_frontend = true "
             "  OR jsonb_array_length(redirects) > 0 "
             "  OR (coolify_uuid IS NOT NULL AND sleep_when_idle = true)) "
             "ORDER BY id")
@@ -287,7 +287,7 @@ _FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle, spa "
 # re-deriving them so the two sets cannot disagree mid-sync.
 _DEFRONTED = ("SELECT id, coolify_uuid, sleep_when_idle "
               "FROM apps "
-              "WHERE id <> $1 AND coolify_uuid IS NOT NULL "
+              "WHERE id <> $1 AND internal = false AND coolify_uuid IS NOT NULL "
               "  AND NOT (id = ANY($2::text[])) "
               "ORDER BY id")
 

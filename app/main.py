@@ -225,6 +225,44 @@ rather than hardcoding anything. A database can be attached to an app after
 creation (apps_attach_db) or dropped from it (apps_detach_db — this destroys the
 data), not only at create time.
 
+**Internal services** are reachable from apps on this box and from nowhere else,
+the same way a database is: they are created with no domain, so Traefik generates
+no router and there is no public hostname to reach. Their address arrives in the
+environment on every deploy, exactly like DATABASE_URL — read it from there, do
+not hardcode it, because the host is a Coolify uuid that changes if the service
+is rebuilt.
+
+`RAG_URL` — document retrieval. POST a document, get a 16-character id back,
+then ask questions scoped to the ids you hold. It accepts PDF, Word, PowerPoint,
+HTML, Markdown, plain text, or a public URL to fetch. Ingest is asynchronous:
+
+    POST $RAG_URL/documents        {"text": "..."}   or {"base64": "..."}
+                                   or {"url": "https://..."}, optional "filename"
+      -> 202 {"id": "Ab3xK...", "status": "pending"}
+    POST $RAG_URL/documents/status {"ids": ["Ab3xK..."]}
+      -> status pending | ready | failed, with "error" explaining a failure and
+         "truncated" when only part of the document was indexed
+    POST $RAG_URL/query            {"ids": ["Ab3xK..."], "q": "...", "k": 8}
+      -> {"results": [{"id", "text", "page", "heading", "score"}], "truncated": [...]}
+    POST $RAG_URL/documents/delete {"ids": ["Ab3xK..."]}
+
+Four things to build around rather than discover:
+
+- **The id is the credential.** There is no API key; anyone holding an id can
+  read that document. Store ids like passwords, and never put one in a URL, a
+  log line or a redirect — which is why every endpoint above takes them in the
+  POST body and none has a path parameter.
+- **Poll for `ready` before querying.** A document that has not finished
+  indexing returns no results rather than an error, so a query fired
+  immediately after upload will look like an empty document.
+- **Honour `truncated` in the query response.** Large documents are indexed only
+  up to a page/token limit. If a result set says truncated, the answer may be
+  missing from the part that was never indexed — say so rather than answering
+  confidently from half a contract.
+- **`failed` is normal and worth surfacing.** A scanned PDF with no text layer,
+  a Google Docs link that returns a sign-in page, or a URL pointing at a private
+  address all fail ingest with a reason. Show the reason; do not retry blindly.
+
 Apps also take environment variables in two scopes. **Shared** variables are set
 once and injected into every app — the place for account-wide secrets such as an
 OpenAI API key, since this is a single owner's box. **App-specific** variables

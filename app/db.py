@@ -76,6 +76,11 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS spa boolean NOT NULL DEFAULT
 -- CI deploy rather than at creation — the platform does not know an app's image
 -- until its pipeline tells it.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS health_path text NOT NULL DEFAULT '/';
+-- An internal app is reachable only from other containers on this box, the
+-- way a database is: it gets no Coolify domain, so Traefik generates no
+-- router for it and there is nothing to reach from outside. Other apps get
+-- its address injected as <ID>_URL, like DATABASE_URL.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS internal boolean NOT NULL DEFAULT false;
 
 -- A frontend-only app has no image and no Coolify application, but the apps
 -- table predates this codebase and declared both NOT NULL, so creating one
