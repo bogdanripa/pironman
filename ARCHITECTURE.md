@@ -62,6 +62,22 @@ cd /opt/paas && git pull
 sudo cp paas-cron-dispatch paas-watchdog /usr/local/bin/
 ```
 
+The clone is owned by **`admin:admin`**, and no `safe.directory` exception is
+configured, so *every* git command there fails for root — not just `fetch` over
+its SSH remote, but a read-only `git -C /opt/paas log` too (`fatal: detected
+dubious ownership`). `host_run_script` is root, so run git there as the owner:
+`su -s /bin/sh -c 'git -C /opt/paas pull' admin`. Plain file reads (`md5sum`,
+`cat`) are unaffected.
+
+Which is why **`md5sum /usr/local/bin/paas-* ` against `/opt/paas` cannot answer
+"are the host scripts current"** on its own. It compares two things that drift
+together: the clone is itself a checkout that nobody has to update, and it is
+routinely behind `origin/main` (on 2026-08-24 it sat at `ef5c5dc` while main was
+at `3f5648a`). Equal md5s there mean only "the copy step was run since the last
+pull". Compare the installed scripts against a **fresh checkout of `main`**, or
+confirm `git log <clone-HEAD>..origin/main -- paas-cron-dispatch paas-watchdog`
+is empty, before concluding there is no drift.
+
 `paas-api` itself is the opposite: it runs from a **built image**, so the clone
 is not what serves requests and editing files there has no effect on the running
 control plane. Only CI and a redeploy change that.
@@ -265,6 +281,17 @@ host's own namespaces — the Pi's filesystem, network and process table, as roo
 The helper container carries the `nsenter` binary and contributes nothing else,
 which is why it defaults to paas-api's **own image** (already on the box, so no
 pull; `HOST_EXEC_IMAGE` overrides).
+
+**That default makes the tool visible to itself, and it looks like a fault.**
+Any `docker ps` run *through* `host_run_script` sees a second container on
+`ghcr.io/bogdanripa/paas-api:sha-<x>` — `pironman-host-<12 hex>`, always
+`Up Less than a second (health: starting)`, `--privileged --pid=host`, no
+labels, `--rm`. It is the call doing the looking. Two independent checks read it
+as a real problem: a duplicate-container check keyed on **image** counts two
+(§9's wa-gateway trap is keyed on the uuid prefix and is unaffected), and the
+random name plus the sub-second uptime make consecutive polls look like the
+control plane crash-looping. Discount any `pironman-host-*` row; the real api is
+the `<uuid>-<timestamp>` one running `uvicorn`.
 
 Three things there are easy to get wrong, and were:
 
