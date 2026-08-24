@@ -375,6 +375,22 @@ connection. `apply_image` therefore sets `sleep_when_idle = false` when it
 creates one, and `routing.py` excludes internal apps from both the fronted and
 defronted label passes — they have no route to write or to scope.
 
+**An internal app that stores anything needs a persistent volume, and Coolify's
+API is fussy about how you ask.** Without one the container writes to its own
+layer, so every redeploy silently discards the data while the service comes back
+healthy. Add it before anyone relies on it:
+
+    POST /api/v1/applications/<uuid>/storages
+         {"type": "persistent", "name": "rag-data",
+          "mount_path": "/data", "host_path": "/data/pironman/rag"}
+
+`type` is required and is `persistent` or `file` — nothing else; `bind` and
+`volume` both come back "The selected type is invalid", and omitting it comes
+back "This field is required". `name` is required for `persistent`. Create the
+host directory first, then redeploy, then check `docker inspect` for the bind
+mount: the `local_persistent_volumes` row existing is not the same as the mount
+existing. Proven by ingesting a document, redeploying, and querying it back.
+
 ### `rag` — document retrieval
 
 Clients POST a document and get a 16-character id; queries name the ids they
