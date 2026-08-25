@@ -112,6 +112,13 @@ branch for a fix or a docs update, and do not leave work parked on one waiting t
 be merged — a branch nobody merges is how a verified fact fails to reach the next
 run, which is the whole point of §"Write down what you learned".
 
+**The stop hook will call that push unpushed. It is wrong.** It compares the
+local branch against a remote of the *same name*, and `claude/<something>` has
+none, so `git push origin HEAD:main` trips it every time even though the commit
+is on `origin/main`. Confirm with `git log origin/main..HEAD` (empty) and
+`git ls-remote --heads origin <branch>` (empty), then ignore it — pushing the
+branch to silence the hook creates precisely the stray nobody merges.
+
 Unchanged by this: never force-push, never rewrite published history, and
 anything on a routine's MUST-NOT list still needs asking. Permission to choose
 the branch is not permission to skip the verification that earns the commit.
