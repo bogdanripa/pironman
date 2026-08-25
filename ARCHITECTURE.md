@@ -1112,9 +1112,26 @@ flows through: the Traefik access log** — nothing is installed per app.
     forward; `::1` is the network gateway, so **every external client** arrives
     from it (`Cf-Connecting-Ip` carries the real one); `10.0.1.1` is the host
     itself, which in practice means `paas-cron-dispatch` calling `127.0.0.1`.
-    A corroborating signature, exact across all 474 of that day's `gepetel` lines:
-    the static host's forward re-issues the path with a **trailing `?`** (261/261),
-    a client's leg never has one (0/188).
+  - **`web`'s address changes on every redeploy, so one audit window holds two
+    of them.** Resolving it once with `docker inspect` and keying the whole window
+    on that value is only right back to `web`'s last `StartedAt`; everything older
+    carries the *previous* address and falls out of the match as if it were
+    external. Measured 2026-08-25 on `gepetel`: `web` was recreated at
+    `13:24:05`, its last forward from `fddf:6e69:23a7::d` landed at `13:24:08` and
+    its first from `::f` at `13:24:15` — so of 272 static-host forwards that day,
+    215 came from the address `docker inspect` no longer reports. Keyed on `::f`
+    alone, 128 of the day's 132 `gepetel` 5xx would have read client-visible; the
+    truth is 1 (a single `fe-` `500` from the gateway). **Take `StartedAt` before
+    the address**, and if it falls inside the window, resolve the older address
+    from the log itself rather than assuming one.
+  - **The redeploy-proof discriminator is the `?`.** The static host re-issues the
+    path with a query separator appended, so a **bare trailing `?`** appears on
+    static-host forwards and nothing else — 243/243 of them on 2026-08-25, and
+    0/143 of the client (`::1`) and dispatcher (`10.0.1.1`) legs. It is
+    one-directional, which the 2026-08-23 note ("261/261") overstated: a forward
+    of a request that already carried a query string ends with that query, not a
+    bare `?` — 29 of that day's 272 forwards. So a bare `?` **proves** a
+    static-host leg; its absence proves nothing.
   - **A `502` on the `fe-<id>` router is the shape that IS client-visible** — the
     static host answering a client after its forward failed — and it is counted,
     correctly. Do not fold it in with the phantom `503`. Of `gepetel`'s 70 counted
