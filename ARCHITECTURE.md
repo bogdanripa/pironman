@@ -1124,14 +1124,29 @@ flows through: the Traefik access log** — nothing is installed per app.
     truth is 1 (a single `fe-` `500` from the gateway). **Take `StartedAt` before
     the address**, and if it falls inside the window, resolve the older address
     from the log itself rather than assuming one.
-  - **The redeploy-proof discriminator is the `?`.** The static host re-issues the
-    path with a query separator appended, so a **bare trailing `?`** appears on
-    static-host forwards and nothing else — 243/243 of them on 2026-08-25, and
-    0/143 of the client (`::1`) and dispatcher (`10.0.1.1`) legs. It is
-    one-directional, which the 2026-08-23 note ("261/261") overstated: a forward
-    of a request that already carried a query string ends with that query, not a
-    bare `?` — 29 of that day's 272 forwards. So a bare `?` **proves** a
-    static-host leg; its absence proves nothing.
+  - **Identify the client leg, not the forward leg — key on the gateway.**
+    Everything above chases a moving target: `web`'s address drifts on redeploy,
+    and the `?` below is one-directional. The client leg has neither problem.
+    `fddf:6e69:23a7::1` is a property of the `coolify` **network**, not of any
+    container (`docker network inspect coolify` → `IPAM.Config[].Gateway`), so it
+    survives every redeploy; take it from there and never from a container. So:
+    `ClientHost == ::1` **is** the client leg, and everything else on an
+    `-coolify` host is internal (`web`'s forward, or `10.0.1.1` for the
+    dispatcher). Verified 2026-08-26 over 1034 `-coolify` rows: a positive match
+    on `::1` and an exclusion of {`web`, `10.0.1.1`} selected the **same 369
+    rows**, and 0 of those 369 carried a trailing `?`.
+  - **A bare trailing `?` proves a forward; its absence proves nothing — and on
+    this box two apps trip that daily.** The static host re-issues the path with a
+    query separator appended, so a bare trailing `?` appears on static-host
+    forwards and nothing else (243/243 on 2026-08-25, 0/143 of client and
+    dispatcher legs; the 2026-08-23 note's "261/261" overstated it). But a forward
+    of a request that *already* carried a query string keeps that query instead.
+    That is not a footnote here: `bt-gateway` (`/api/v1/orders?statuses=OPEN`) and
+    `gepetel` (its `/cron/` calls) route with query strings as a matter of course,
+    so **124 forwards** — 66 and 58 — were unmarked on 2026-08-26 alone. An audit
+    keyed on `?` read 71 client-visible 5xx that day; keyed on the gateway, the
+    true figure was **5**, all `bt-gateway`. A 14× overcount, reproducible nightly.
+    Use the `?` only to confirm a leg is internal, never to conclude one is not.
   - **A `502` on the `fe-<id>` router is the shape that IS client-visible** — the
     static host answering a client after its forward failed — and it is counted,
     correctly. Do not fold it in with the phantom `503`. Of `gepetel`'s 70 counted
