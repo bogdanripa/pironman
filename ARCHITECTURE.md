@@ -1096,8 +1096,23 @@ flows through: the Traefik access log** — nothing is installed per app.
     Equal, app for app, means every recorded server error was internal. On
     2026-08-12 they matched exactly. An anatomy of one wake, for what to expect:
     client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
-    the container; five retries → `500` on the backend router (dropped); the sixth
-    → the app's own answer, which the client gets.
+    the container; N−1 retries → `500` on the backend router (dropped); the Nth
+    → the app's own answer, which the client gets. N is not fixed — it ran 5–10
+    on 2026-08-27 (207 retries over 31 wakes) — so never expect a constant
+    backend-`500`-per-wake ratio; only the `fe-` `503` is one-per-wake.
+  - **`web`'s own wake log is a third, independent route, and it closes both
+    sides arithmetically.** Each `INFO: wake <id>: served in … then N retries`
+    line in the static host's log is one wake, and every retry is one forward and
+    therefore one logged proxy response — the last of which succeeds. So for each
+    app, over any window: `fe-<id>` 5xx == wake lines == `analytics_perf.err_server`,
+    and backend-router (`http-0-<uuid>@docker`) 5xx == Σretries − wakes. This needs
+    neither `web`'s address nor the trailing `?`, so it survives a redeploy inside
+    the window and the query-string case both. Verified 2026-08-27 across the three
+    sleeping apps that woke — `smartbill-mcp` 24 wakes / 168 retries, `bt-gateway`
+    4 / 23, `revolut-mcp` 3 / 16 — giving 24·4·3 `fe-` 5xx (matching `err_server`
+    app for app) and 144·19·13 backend `500`s, every figure exact. Two independent
+    partitions of the same day already agreed there were **zero** client-visible
+    5xx; this was the third.
   - **Take that address from `GlobalIPv6Address`, not `IPAddress`.** The `coolify`
     network is dual-stack and the static host's forwards arrive over **IPv6**, so
     matching `ClientHost` against `web`'s IPv4 — which is what `docker inspect
