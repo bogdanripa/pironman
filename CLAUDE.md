@@ -50,6 +50,7 @@ was false:
 | A second container on `ghcr.io/bogdanripa/paas-api:sha-<x>`, `Up Less than a second (health: starting)` — a duplicate deploy, or the control plane crash-looping | It is **`host_run_script` itself**. The nsenter helper defaults to paas-api's own image (§5b), so every call you make appears in the `docker ps` that call is running — named `pironman-host-<12 hex>`, a fresh name each time, `--rm --privileged --pid=host`, no labels. Verified 2026-08-24 two ways: the name changed between consecutive calls, and `app/hostexec.py:64` mints it. The real api is the `<uuid>-<timestamp>` running `uvicorn`. A duplicate check keyed on **image** is fooled; one keyed on the uuid prefix is not |
 | `md5sum /usr/local/bin/paas-watchdog` equals `/opt/paas/paas-watchdog`, so the host scripts are current | It only means the copy step was run since the last `git pull` **of that clone** — and nobody has to pull it. On 2026-08-24 `/opt/paas` sat at `ef5c5dc` while `origin/main` was at `3f5648a`; equal md5s would have looked identically clean had a script changed in between. Diff the installed scripts against a fresh checkout of `main` instead. Also: root cannot run *any* git there — `admin:admin`, no `safe.directory`, so even `git -C /opt/paas log` dies on "dubious ownership"; use `su -s /bin/sh -c '…' admin` |
 | `docker inspect web` gives the static host's `ClientHost`, so the phantom-5xx reconciliation can key the whole day on it | It gives the address `web` holds **since its last redeploy**, and a redeploy inside the window leaves the older one all over the log. `web` was recreated 2026-08-25 at `13:24:05`; `fddf:6e69:23a7::d` forwards ran to `13:24:08`, `::f` began at `13:24:15`, and **215 of that day's 272** `gepetel` forwards carried the address `docker inspect` no longer reports. Keyed on `::f` alone the recipe called 128 of 132 5xx client-visible; only **1** was. Read `.State.StartedAt` first — inside the window, resolve the older address from the log. The redeploy-proof discriminator is a **bare trailing `?`** (243/243 forwards, 0/143 client and dispatcher legs), but one-directional: a forward of a request that already had a query string keeps that query, so absence of the `?` proves nothing (§11) |
+| The Pironman connector failing to connect (`502`) is a connector-side problem, so a scheduled audit simply cannot run and there is nothing to report | It can equally mean **the box is gone**, and one `curl` tells the two apart. On 2026-08-28 the connector 502'd; direct HTTPS from the session to `api-coolify`, `web-coolify`, `gepetel-coolify`, `bt-gateway-coolify` **and the bare `bogdanripa.com` apex** all returned `HTTP 530` / `error code: 1033` — Cloudflare's origin-unreachable error — while DNS still resolved to Cloudflare IPs. The apex is the discriminator: an app-level fault cannot take it down, so identical `1033` across it and the app hosts is box- or origin-link-wide, not one container. Cause was **not** established (with no connector, no HTTPS and no SSH there is no route to the Pi at all). Treating the 502 as mere tooling noise would have filed a total outage as a quiet non-run |
 
 The pattern is the same every time: the code said what *should* be true, the box
 said what *was* true, and they differed. Three of these produced confident wrong
@@ -71,6 +72,11 @@ messages that had to be rewritten.
   be working in the same repo; `origin/main` moves under you.
 - **"This code path behaves like so"** — run it. Every fix in this session that
   was tested before shipping held up; the ones reasoned about did not.
+- **"The connector is down"** — `curl` the hostnames from the session before
+  concluding anything. `502` from the connector alone is ambiguous; add the app
+  hosts *and* the bare apex. All `530`/`1033` = the origin is unreachable (a real
+  outage, report it); the apex answering while the connector 502s = the connector
+  path, not the box.
 
 ### Say what you actually verified
 
