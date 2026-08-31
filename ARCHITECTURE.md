@@ -1028,6 +1028,32 @@ flows through: the Traefik access log** — nothing is installed per app.
   counted, no error, cursor pinned, and the next pass asks for a larger window,
   which fails more easily. Every analytic on the box froze for twelve hours that
   way.
+- **A pass that reads its full `--tail` window can lose lines, and nothing
+  detects it.** `_read_since` reads `--tail MAX_LINES` (2000) every ~120s. If
+  more than 2000 lines arrive between two passes, the tail hands back only the
+  **newest** 2000; the overflow is older than those but still *newer than the
+  cursor*, is never seen, and the cursor advances past it — so those requests
+  are dropped from the rollups permanently. Every truncation diagnostic in
+  `ingest_once` lives in the `else` of `if seen:`, i.e. it runs only when a pass
+  counted **nothing**; an overrun pass counts plenty, logs `counted N lines` at
+  INFO, and looks perfectly healthy. The guard that does exist tests
+  `newest_line < cursor` — the read returning the *start* of the log — which is
+  a different fault and cannot fire here.
+  The ceiling is reachable: on **2026-08-25T02:03:24Z** a single 120s window
+  carried **3,654** lines, 1.8× `MAX_LINES`, from one scanner (3,652 requests
+  from `87.120.104.29` behind a forged Googlebot UA) against the bare IP
+  `5.12.126.43`. `_read_since`'s own docstring calls `MAX_LINES` "generous"
+  because "the whole log is currently 2333 lines" — that arithmetic is stale;
+  what matters is arrivals between passes, and it has been exceeded.
+  **Not established:** whether any hosted-app line was actually lost then. Those
+  particular lines belong to no app of ours, and an exact rollup-vs-log
+  reconciliation is not available for fronted apps while `_internal_leg` is
+  running on its partial router-name fallback (the `X-Pironman-Backend=keep`
+  proxy flag was still absent on 2026-08-31 — §9b, README one-time setup).
+  Headroom exists today: the busiest 120s window on 2026-08-31 held 1,041
+  lines. Raising
+  `MAX_LINES`, or warning when a pass reads a full window whose oldest line is
+  newer than the cursor, is an open call for a human — neither has been made.
 - **The stall test asks whether OUR lines were counted, never how old the cursor
   is.** The cursor advances to the newest line the read reached
   (`max(newest, horizon)`), and `horizon` moves on *any* stamped line — including
@@ -1423,8 +1449,31 @@ symptom and the platform's own status agreed with it.
   **Signature: the warning's own tally has `app == old`** — every app line in the
   window was already ingested, so nothing was missed. Before believing any such
   warning, diff the two sources: `analytics_perf` for today against a per-host
-  count from `docker logs coolify-proxy`. They agreeing exactly is what proved
-  this one cosmetic.
+  count from the proxy log. They agreeing exactly is what proved this one
+  cosmetic. Take that per-host count from the **log files**, not from
+  `docker logs --since` — see the next bullet.
+- **`docker logs --since` can silently return a truncated slice, and the audit
+  must not count from it.** On 2026-08-31 `docker logs --since 24h coolify-proxy`
+  returned 899 JSON lines whose earliest was exactly the current
+  `-json.log`'s first line (`2026-08-31T11:28:35.875Z`), omitting the 2,990
+  in-window lines still held in `-json.log.1`. `--since 24h`, `48h` and `72h`
+  all returned that same 899; `--since 168h` returned 14,178 and a bare
+  `docker logs` 16,216 — and a `--since` landing *before* the log's 73.4h
+  outage gap (Aug 28 07:38 → Aug 31 09:00) read `.log.1` correctly. So
+  rotation-crossing works in general and only `since` values at or after that
+  gap broke; **the mechanism is unproven**. Docker 29.6.2, driver `json-file`,
+  `max-size 10m max-file 3`. Two smaller traps in the same flag: a bare
+  timestamp is interpreted in the **host's local time** (UTC+3 here —
+  `--since 2026-08-26T00:00:00` first returned `2026-08-25T21:00:01Z`), and
+  nothing in the output says lines were dropped — a truncated log reads exactly
+  like a quiet one, which is this checklist's whole theme. Keyed on that command
+  the §11 client-leg partition reported **0** client-visible 5xx for the day
+  when the files said **41**. Read
+  `/var/lib/docker/containers/<id>/*-json.log*` directly and filter on the inner
+  `StartUTC`. Ingestion is not exposed to this one: `_read_since` deliberately
+  uses a bounded `--tail` and never `--since`, for a related Docker log-reading
+  failure measured on 2026-08-01 (its docstring has the numbers). It has the
+  *other* exposure instead — the full-window `--tail` overrun in §10.
 - **A shell "on the host" from inside a container inherits the container** —
   nsenter passes the caller's environment through and resolves `--wd` *before*
   the namespace switch, so a host shell needs `env -i` and a `cd /` run inside
