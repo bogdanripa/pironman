@@ -1354,6 +1354,33 @@ symptom and the platform's own status agreed with it.
 - **Anything Coolify generates, Coolify regenerates** — Sablier enrollment (and
   any custom route label) must live in Coolify `custom_labels`, keyed on the
   stable app id, not in a hand-edited file or a container-name reference.
+- **Traefik's own log is NOT JSON, so grepping it for `"level":"error"` finds
+  nothing on a proxy that is full of errors.** `--accesslog.format=json` sets
+  the format of the *access* log only; there is no `--log.format=json` in the
+  proxy's `Args`, so Traefik's application lines are ANSI-coloured plain text
+  (`\x1b[31mERR\x1b[0m …`). A nightly check keyed on `level=error` or
+  `"level":"error"` returned **0** against a window holding 8 real `ERR` lines
+  on 2026-08-31. Strip ANSI and match ` ERR `/` WRN `, and skip any line
+  containing `"StartUTC"` (those are the access log).
+- **If Traefik starts without a working Docker socket, every sleeping app
+  hard-503s and it is not Sablier's fault.** Signature, from the aborted first
+  boot after the 2026-08-31 power restore: `Plugins are disabled because an
+  error has occurred … unable to set up plugins` (09:04:48Z), then
+  `invalid middleware "sablier-<app>@docker" configuration` for each enrolled
+  app (09:17:14–09:17:17Z), then `Failed to list containers for docker: Get
+  http://%2Fvar%2Frun%2Fdocker.so…` (09:22:08Z). With the plugin never
+  initialised, every `sablier-<app>` middleware reference is invalid and Traefik
+  fails the route outright — so the app cannot be woken at all and the `503`s
+  are **client-visible**, not the internal-leg phantoms of §9c. That produced 40
+  of that day's 41 client-visible 5xx (503/502, ~15s each, on `bt-gateway`,
+  `revolut-mcp`, `smartbill-mcp`), and the box then rebooted at 09:22:58Z —
+  `dmesg` shows `EXT4-fs orphan cleanup`, so the first boot ended uncleanly.
+  Zero proxy `ERR` lines and normal Sablier dispatch/ready/expire cycles
+  afterwards. **Intermittent and not reproduced:** the second boot came up
+  clean, and the start ordering of Traefik against dockerd was inferred from
+  these messages, not observed. When sleeping apps 503 en masse, read the proxy's
+  own log for `Plugins are disabled` before suspecting Sablier or the apps;
+  recreating the proxy is what reloads the plugin.
 - **MCP must be stateless + SSE** for the claude.ai connector, and the key-promote
   middleware must be pure ASGI.
 - **Deploys go through CI, never hand-built images** — hand builds won't be arm64
