@@ -1285,6 +1285,19 @@ of that state now makes the distinction:
   `docker ps -a` and reports a missing container within 5 minutes. Deliberately
   **not** `restartable` — there is nothing to `docker start`, and retrying that
   every five minutes would just fail forever.
+- **The watchdog's universe is the `apps` table, so the platform's own
+  infrastructure containers are outside it.** `ALWAYS_ON` is
+  `{API_APP, STATIC_HOST_APP}` — `api` and `web`, nothing else — and the
+  `health == "unhealthy"` branch only ever runs inside the loop over `apps`
+  rows. `coolify`, `coolify-db`, `coolify-redis`, `coolify-realtime`,
+  `coolify-proxy` and the Sablier controller have no `apps` row, so **no
+  amount of them being down or unhealthy will make the watchdog say anything**.
+  On 2026-08-31 `coolify` sat `unhealthy` with a `FailingStreak` of 74 while
+  `paas-watchdog --dry-run` printed `ok — all always-on apps running, all
+  background work current`, and `platform_tasks_health` was equally clean
+  (it watches the api's own loops, not other containers). Both were telling
+  the truth about what they measure. Checking those containers is the nightly
+  audit's job (§1e of the routine) and there is no automated alarm behind it.
 - `alert_state` rows are keyed by app id and nothing deletes them when an app is
   deleted (`space-invaders` still had a row from 2026-07-31, still there on
   2026-08-21). Harmless — `alerts.py` does `SELECT * FROM alert_state` but reads
@@ -1334,8 +1347,22 @@ symptom and the platform's own status agreed with it.
   `force_docker_cleanup` false. Assume nothing about filter semantics: this one
   survived two confident wrong diagnoses and was settled only by creating a
   labelled throwaway container and running the exact command against it.
-- **Two containers for one app split its traffic across two builds, and nothing
-  says so.** Coolify writes the Traefik router *onto the container*, so a
+- **A hard power loss can leave a file present, correctly named and zero bytes,
+  and the program that reads it will not say so.** After the 2026-08-28 outage
+  `coolify` came back `running (unhealthy)`: `bootstrap/cache/config.php`,
+  `events.php` and `routes-v7.php` were all **0 bytes** (ext4 lost the data
+  blocks of a write that was never flushed — `dmesg` shows `EXT4-fs orphan
+  cleanup` on the boot). PHP's `require` on a 0-byte file returns **`int(1)`**,
+  not an array, so Laravel could not bootstrap *before it had configured its
+  logger*. Every symptom was therefore blank: `/api/health` returned **500 with
+  an empty body**, `php artisan` exited **255 printing nothing at all**, and
+  `storage/logs/laravel.log` had **no entry** — its newest line was from three
+  days earlier, which reads exactly like a container that has simply been idle.
+  **Signature: a service that 500s with no body, a CLI that exits non-zero with
+  no output, and a silent log — check `find <cache dir> -type f -size 0` before
+  anything else.** The fix is to delete the empty caches (they regenerate; the
+  app then reads config from source) — no restart needed. Do not read a stale
+  log tail as "nothing happened": here it meant the logger never came up. Coolify writes the Traefik router *onto the container*, so a
   leftover carries the same router name, the same rule and the same service as
   the current one. Traefik merges them into one service with two servers and
   round-robins: half the requests run the older image. Every other signal reports
