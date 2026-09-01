@@ -1050,10 +1050,20 @@ flows through: the Traefik access log** — nothing is installed per app.
   reconciliation is not available for fronted apps while `_internal_leg` is
   running on its partial router-name fallback (the `X-Pironman-Backend=keep`
   proxy flag was still absent on 2026-08-31 — §9b, README one-time setup).
-  Headroom exists today: the busiest 120s window on 2026-08-31 held 1,041
-  lines. Raising
-  `MAX_LINES`, or warning when a pass reads a full window whose oldest line is
-  newer than the cursor, is an open call for a human — neither has been made.
+  **Raised to 5000 on 2026-09-01**, which clears that burst with margin. It
+  cannot go much higher: `--tail` has a ceiling as well as a floor, and the two
+  faults are opposite. Re-measured the same day, `--tail` 4000/5000/6000 each
+  returned exactly what was asked with the current newest line, while
+  `--tail 7000` returned **4001** lines — fewer than 6000 did — and the newest
+  4000 of the 6000- and 8000-line reads differ by md5. 7000 is where the read
+  first reaches back past the 73.4h outage gap, so this is the same
+  gap-seeking failure that broke `docker logs --since` (§12), in the other
+  direction. The cliff is **not fixed**: it sits at "lines available since the
+  most recent gap", so after a fresh outage it starts low and climbs. Re-measure
+  that ladder before raising `MAX_LINES` again.
+  Still **not** done: nothing warns when a pass reads a full window whose oldest
+  line is newer than the cursor, so an overrun stays silent — the guard is an
+  open call.
 - **The stall test asks whether OUR lines were counted, never how old the cursor
   is.** The cursor advances to the newest line the read reached
   (`max(newest, horizon)`), and `horizon` moves on *any* stamped line — including

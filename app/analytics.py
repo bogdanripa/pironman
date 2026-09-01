@@ -47,13 +47,20 @@ _STALL_AFTER = 15 * 60
 # How far behind the cursor may be before a catch-up is worth mentioning.
 MAX_WINDOW = 60 * 60
 
-# The most log we will ask Docker for in one pass, in LINES — not a time window,
-# and deliberately MODEST. Asking for too many is not merely wasteful here: past
-# some threshold Docker stops tailing from the end and returns truncated output
-# from the START of the log instead, i.e. the oldest lines. See _read_since.
-# Measured good up to 3000 on this box; 2000 leaves margin and is still hours of
-# traffic, against a 120s pass.
-MAX_LINES = 2000
+# The most log we will ask Docker for in one pass, in LINES — not a time window.
+# Bounded from BOTH sides, and the two bounds are different faults:
+#
+#   too small — more lines arrive between two passes than we ask for, the tail
+#     hands back only the newest MAX_LINES, and the overflow is dropped even
+#     though it is newer than the cursor (the cursor then advances past it).
+#   too large — a deep tail that has to reach across a long GAP in the log stops
+#     being exact and starts silently returning a smaller, different set.
+#
+# Raised 2000 -> 5000 on 2026-09-01. 2000 was chosen against "the whole log is
+# 2333 lines", which measured the wrong thing: what matters is arrivals between
+# passes, and one 120s window on 2026-08-25T02:03:24Z carried 3,654 lines (a
+# single scanner against the bare IP). See _read_since for the upper bound.
+MAX_LINES = 5000
 
 
 _CURSOR_KEY = "accesslog_cursor"
@@ -262,11 +269,38 @@ async def _read_since(cursor: str | None) -> str:
     has always worked, against the same container through the same socket, while
     ingestion read from the start and sat frozen for a day.
 
-    Correctness does not depend on the window anyway. Every line is checked
-    against the cursor by StartUTC in ingest_once, so re-reading is free and only
-    under-reading loses data. MAX_LINES is therefore generous: it needs to exceed
-    the traffic between two passes (120s), and the whole log is currently 2333
-    lines.
+    **But `--tail` is only exact while it stays shallow, so MAX_LINES has a
+    ceiling as well as a floor.** Re-measured 2026-09-01, when the log held a
+    73.4h gap (the power outage, 08-28T07:38Z -> 08-31T09:00Z). Every N below
+    returned the current newest line, so the 2026-08-01 "returns the start of
+    the log" shape did NOT reproduce — the failure is different and quieter:
+
+        --tail 4000   -> 4000 lines, oldest 08-31T10:51Z   exact
+        --tail 5000   -> 5000 lines, oldest 08-31T09:21Z   exact
+        --tail 6000   -> 6000 lines, oldest 08-31T09:18Z   exact
+        --tail 7000   -> 4001 lines, oldest 08-28T00:41Z   <- FEWER than 6000
+        --tail 8000   -> 5001 lines, oldest 08-28T00:41Z
+
+    7000 is where the read first has to reach back PAST the gap, and there it
+    returns a smaller set than 6000 did — and a different one: the newest 4000
+    lines of the 6000 and 8000 reads do not match by md5. So a too-deep tail
+    drops recent lines without saying so. The same gap broke `docker logs
+    --since` the night before (ARCHITECTURE §12), which is two faults with one
+    shape: Docker's seeking goes wrong across a long gap, in both directions.
+
+    The cliff is not fixed — it sits at "lines available since the most recent
+    gap", so after a fresh outage it starts low and climbs. 5000 is chosen to
+    clear the worst measured burst (3,654 in 120s) with margin while staying
+    below the 7000 seen to break here; do not raise it without re-measuring this
+    ladder, and note the pass sleeps 120s BETWEEN passes, so the real window is
+    120s plus however long a pass takes.
+
+    Correctness does not depend on the window in the normal case: every line is
+    checked against the cursor by StartUTC in ingest_once, so re-reading is free
+    and only under-reading loses data. Under-reading is exactly what both bounds
+    above cause, and nothing currently detects it — every truncation diagnostic
+    in ingest_once sits in the `else` of `if seen:`, so a pass that overruns its
+    window counts plenty and looks healthy.
     """
     rc, out = await autoupdate._docker(
         "logs", "--tail", str(MAX_LINES), ANALYTICS_PROXY, timeout=120)
