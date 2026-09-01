@@ -1186,6 +1186,21 @@ flows through: the Traefik access log** — nothing is installed per app.
     dispatcher). Verified 2026-08-26 over 1034 `-coolify` rows: a positive match
     on `::1` and an exclusion of {`web`, `10.0.1.1`} selected the **same 369
     rows**, and 0 of those 369 carried a trailing `?`.
+  - **Restrict to `-coolify` hosts *before* counting anything, or the number is
+    mostly scanners.** Most 5xx the proxy logs belong to no app at all: an
+    unrouted host matches `catchall@file`, which has no `ServiceName` and answers
+    `503`. On 2026-09-01 that was **1,373 of 1,636** 5xx in 24h — 84% of the
+    day's server errors, and 43% of every access line — against the bare IP
+    `5.12.126.43` (755) and a forged `Host:` of
+    `<md5>.<md5>.traefik.default` (618), Traefik's own default-rule domain used
+    as a fingerprinting probe. One source sent 1,237 of them, rotating forged
+    bot user-agents (GrokBot, Applebot, ClaudeBot) across `/.env`,
+    `/.aws/credentials` and `169.254.169.254` SSRF paths. None of it reaches an
+    app, none of it is counted by the ingester, and none of it is a fault — but a
+    "5xx in the proxy log" count taken without the host filter reads as a
+    platform-wide catastrophe. Filter on `-coolify.bogdanripa.com` in the
+    `RequestHost`; the discriminator for what you dropped is
+    `RouterName == catchall@file` with `ServiceName` absent.
   - **A bare trailing `?` proves a forward; its absence proves nothing — and on
     this box two apps trip that daily.** The static host re-issues the path with a
     query separator appended, so a bare trailing `?` appears on static-host
@@ -1425,7 +1440,22 @@ symptom and the platform's own status agreed with it.
   no output, and a silent log — check `find <cache dir> -type f -size 0` before
   anything else.** The fix is to delete the empty caches (they regenerate; the
   app then reads config from source) — no restart needed. Do not read a stale
-  log tail as "nothing happened": here it meant the logger never came up. Coolify writes the Traefik router *onto the container*, so a
+  log tail as "nothing happened": here it meant the logger never came up.
+  **This one also self-cleared, which is worth knowing before spending a night on
+  it: `bootstrap/cache` is on no bind mount** — `docker inspect coolify` shows
+  mounts only for `storage/app/*` and `.env` — so it lives in the container's own
+  filesystem and any **recreate** regenerates it. All four `coolify-*` containers
+  were recreated at 2026-09-01T00:00:47–53 (`Created` == `StartedAt`,
+  `RestartCount` 0), and by 09-01 the cache files were non-zero and stamped
+  `00:00`, `/api/health` answered **200**, and the health check read `healthy`
+  with `FailingStreak` 0. It was **not** a version upgrade — the image was still
+  `4.3.14`, pulled 08-28 — and nothing on the host did it: the crontab holds only
+  the three `paas-*` jobs and no systemd timer touches Coolify, so it came from
+  inside Coolify's own scheduler. The trigger is unproven; what is established is
+  that the damage survived **four days** (08-28 → 09-01) and then cleared without
+  intervention. So an `unhealthy` Coolify seen by a nightly audit may be gone by
+  the next one — re-check before escalating, and delete the empty caches if it is
+  still there, rather than waiting on a recreate that may not come. Coolify writes the Traefik router *onto the container*, so a
   leftover carries the same router name, the same rule and the same service as
   the current one. Traefik merges them into one service with two servers and
   round-robins: half the requests run the older image. Every other signal reports
