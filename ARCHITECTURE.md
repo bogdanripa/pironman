@@ -1541,6 +1541,22 @@ symptom and the platform's own status agreed with it.
   uses a bounded `--tail` and never `--since`, for a related Docker log-reading
   failure measured on 2026-08-01 (its docstring has the numbers). It has the
   *other* exposure instead — the full-window `--tail` overrun in §10.
+- **`ERROR` + `Traceback` in the api's own log is usually the MCP SDK saying
+  goodbye** — `ERROR:mcp.server.streamable_http:Error in message router` ending
+  in `anyio.ClosedResourceError` (from `streamable_http.py:831`) is the
+  streamable-HTTP transport's teardown race when a client drops its session,
+  and it prints a full traceback at ERROR every time. On 2026-09-02 there were
+  **29** in 24h, and every one was immediately preceded by that client's
+  `POST /mcp … 400 Bad Request` — 29 of 29, no exceptions — with normal
+  `200`/`202` traffic resuming after. It is *not* a request that failed
+  server-side: the api served **0** 5xx that day by two independent routes,
+  its own uvicorn log (`200`×77, `202`×22, `400`×35, no 5xx) and
+  `analytics_perf` (`api` `err_server = 0`), and `api-coolify.bogdanripa.com`
+  appears nowhere in the proxy log's 5xx set. So the rate tracks how many MCP
+  clients disconnected, nothing else. Before treating a burst as a fault, check
+  the preceding line for the paired `400` and confirm the 5xx count is zero;
+  a real api fault shows up as 5xx in both of those places, not only as a
+  traceback.
 - **A shell "on the host" from inside a container inherits the container** —
   nsenter passes the caller's environment through and resolves `--wd` *before*
   the namespace switch, so a host shell needs `env -i` and a `cd /` run inside
