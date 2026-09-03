@@ -249,6 +249,32 @@ uvicorn captures, so `apps_logs api` shows it — and the healthcheck's own
 successful access-log lines are filtered out, or the 10-second cadence would push
 that traceback out of `--tail` within about two minutes.
 
+**Only WARNING and above survive — nothing configures logging.** There is no
+`basicConfig`, `dictConfig` or `setLevel` anywhere in `app/` or the Dockerfile,
+and uvicorn's default config configures only the `uvicorn*` loggers: the root
+logger keeps level WARNING with **no handlers**, and `main.py` only attaches
+filters to `uvicorn.access`. What reaches stderr does so through Python's
+`lastResort` handler, whose own level is WARNING. That is enough for the two
+rules above — `_swallow` logs at `exception` (ERROR) and the analytics stalls at
+`warning` — so both were built on the half that works. The half that does not:
+**every `_log.info(...)` in the control plane is discarded**, including the
+analytics pass's `analytics: counted %d lines, cursor now %s`. Verified
+2026-09-03 inside the running container (`app.analytics` effective level
+`WARNING`, root handlers `[]`, an INFO emitting nothing while a WARNING printed)
+and against the log itself: the ingest had completed every ~120s for two days
+with traffic to count, and that line appears **0 times** in any of the
+container's json-log files.
+
+The consequence is worth stating plainly, because it inverts how the logs read.
+The control plane logs **by exception**: silence is its healthy state *and* its
+broken state. Nothing here ever confirms that a loop achieved something — that
+belongs to `task_heartbeat` (`platform_tasks_health`) and to the rollups, which
+is where to look, and it is why "the api log is quiet" is never evidence of
+health. It also means a failure mode whose only tell is an INFO line is
+invisible: the analytics `--tail` truncation is exactly that (§10), since its
+truncation diagnostics live in the `else` of `if seen:` and an overrunning pass
+takes the `if`.
+
 **A recycle must outlive the container it recycles.** The two rules above both
 end in `apps_logs api`, and that reader has a blind spot: a Coolify deploy builds
 a **new** container, so the control plane's stdout is destroyed by precisely the
@@ -347,6 +373,18 @@ connector prompts.
 `app/db.py` holds a `_SCHEMA` of `CREATE TABLE IF NOT EXISTS` /
 `ALTER TABLE … ADD COLUMN IF NOT EXISTS` run at every startup — so a new feature
 (env vars, analytics, alerts) needs **no manual SQL on the Pi**.
+
+It does **not** cover everything in `_paas`. `apps`, `crons` and `api_keys`
+predate this codebase and were created by hand; `_SCHEMA` only bolts columns onto
+them (`api_keys.app_id`, the auto-update and Sablier columns on `apps`) and never
+creates them. So this box's `crons` carries a constraint the repo does not
+define: `crons_app_id_fkey FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE
+CASCADE` — the **only** foreign key in the whole database (`pg_constraint`,
+2026-09-03), which is why deleting an app takes its cron rows with it and why an
+orphaned cron row cannot exist here. `_SCHEMA`'s own comment declines to rely on
+FKs ("its constraints are not guaranteed here") and cleans `app_env` explicitly
+on delete instead — correct, and the reason to keep that habit: a box rebuilt
+from this repo alone would have no such cascade.
 
 ---
 
@@ -1029,14 +1067,17 @@ flows through: the Traefik access log** — nothing is installed per app.
   which fails more easily. Every analytic on the box froze for twelve hours that
   way.
 - **A pass that reads its full `--tail` window can lose lines, and nothing
-  detects it.** `_read_since` reads `--tail MAX_LINES` (2000) every ~120s. If
-  more than 2000 lines arrive between two passes, the tail hands back only the
-  **newest** 2000; the overflow is older than those but still *newer than the
-  cursor*, is never seen, and the cursor advances past it — so those requests
-  are dropped from the rollups permanently. Every truncation diagnostic in
-  `ingest_once` lives in the `else` of `if seen:`, i.e. it runs only when a pass
-  counted **nothing**; an overrun pass counts plenty, logs `counted N lines` at
-  INFO, and looks perfectly healthy. The guard that does exist tests
+  detects it.** `_read_since` reads `--tail MAX_LINES` (5000) every ~120s. If
+  more than `MAX_LINES` lines arrive between two passes, the tail hands back only
+  the **newest** `MAX_LINES`; the overflow is older than those but still *newer
+  than the cursor*, is never seen, and the cursor advances past it — so those
+  requests are dropped from the rollups permanently. Every truncation diagnostic
+  in `ingest_once` lives in the `else` of `if seen:`, i.e. it runs only when a
+  pass counted **nothing**; an overrun pass counts plenty and takes the `if`,
+  whose `counted N lines` is an INFO line that **nothing ever prints** (§5, "Two
+  rules for the control plane's own logs") — so a truncating pass and a healthy
+  one leave the same trace in `apps_logs api`: none. The guard that does exist
+  tests
   `newest_line < cursor` — the read returning the *start* of the log — which is
   a different fault and cannot fire here.
   The ceiling is reachable: on **2026-08-25T02:03:24Z** a single 120s window
@@ -1050,7 +1091,14 @@ flows through: the Traefik access log** — nothing is installed per app.
   reconciliation is not available for fronted apps while `_internal_leg` is
   running on its partial router-name fallback (the `X-Pironman-Backend=keep`
   proxy flag was still absent on 2026-08-31 — §9b, README one-time setup).
-  **Raised to 5000 on 2026-09-01**, which clears that burst with margin. It
+  **Raised to 5000 on 2026-09-01**, which clears that burst with margin — and
+  the margin is being used. On **2026-09-03** two more scanner bursts hit the
+  same bare IP, **3,401** lines in the 120s window at `18:14Z` and **3,300** at
+  `12:14Z` (from `94.154.46.250` and `94.154.46.243`), against a 24h median
+  window of well under 60. Both are ~68% of the ceiling and both would have
+  truncated at the old 2000. So this is not a one-off from August: single-source
+  scans of a few thousand requests in two minutes are a recurring load here, and
+  `MAX_LINES` is the only thing standing between them and silent data loss. It
   cannot go much higher: `--tail` has a ceiling as well as a floor, and the two
   faults are opposite. Re-measured the same day, `--tail` 4000/5000/6000 each
   returned exactly what was asked with the current newest line, while
