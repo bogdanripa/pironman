@@ -1211,6 +1211,12 @@ flows through: the Traefik access log** — nothing is installed per app.
     forward; `::1` is the network gateway, so **every external client** arrives
     from it (`Cf-Connecting-Ip` carries the real one); `10.0.1.1` is the host
     itself, which in practice means `paas-cron-dispatch` calling `127.0.0.1`.
+    A remembered address does not merely go stale, it gets **reassigned**: on
+    2026-09-04 `web` held `fddf:6e69:23a7::10` and `::d` — the address this
+    section's own 2026-08-23 measurement names — belonged to **`rag`**. Resolve
+    the whole container→address map at audit time from `docker network inspect
+    coolify` (`.Containers[].IPv6Address`), never from a literal copied out of
+    these notes.
   - **`web`'s address changes on every redeploy, so one audit window holds two
     of them.** Resolving it once with `docker inspect` and keying the whole window
     on that value is only right back to `web`'s last `StartedAt`; everything older
@@ -1433,8 +1439,25 @@ symptom and the platform's own status agreed with it.
   proxy's `Args`, so Traefik's application lines are ANSI-coloured plain text
   (`\x1b[31mERR\x1b[0m …`). A nightly check keyed on `level=error` or
   `"level":"error"` returned **0** against a window holding 8 real `ERR` lines
-  on 2026-08-31. Strip ANSI and match ` ERR `/` WRN `, and skip any line
-  containing `"StartUTC"` (those are the access log).
+  on 2026-08-31. Strip ANSI and match ` ERR `/` WRN `, and separate the access
+  lines by the *unquoted* token `StartUTC` — see the next bullet for why the
+  quoted form matches nothing.
+- **In the json-file logs on disk the inner JSON is backslash-escaped, so a
+  grep anchored on `"StartUTC"` matches zero lines** — and zero lines is
+  indistinguishable from a quiet day. The docker json-file driver wraps each
+  line as `{"log":"…","stream":…,"time":…}` and escapes every quote inside
+  `log`, so the bytes on disk read `StartUTC\":`, never `"StartUTC":`. Measured
+  2026-09-04 on `coolify-proxy`'s current file: `grep -c '"StartUTC"'` → **0**,
+  `grep -cF '\"StartUTC\"'` → **3267**, bare `grep -c StartUTC` → **3267**, with
+  `od -c` confirming the `\` before the closing quote. The §11 client-leg
+  partition keyed that way reported **0 in-window rows and 0 client-visible
+  5xx** for a day that in fact held 1,198 `-coolify` rows and 227 5xx — a clean,
+  plausible all-clear built on no data at all. The same trap bites the ERR/WRN
+  recipe above from the other side: a `grep -v '"StartUTC"'` filter excludes
+  **nothing**, so that check is only ever correct because access lines happen
+  not to contain ` ERR `. Parse the wrapper instead (read each line as JSON,
+  then `json.loads` its `log` field); if you must grep, use the bare token or
+  `grep -F` on the escaped form.
 - **If Traefik starts without a working Docker socket, every sleeping app
   hard-503s and it is not Sablier's fault.** Signature, from the aborted first
   boot after the 2026-08-31 power restore: `Plugins are disabled because an
