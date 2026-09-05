@@ -1521,12 +1521,30 @@ symptom and the platform's own status agreed with it.
   `00:00`, `/api/health` answered **200**, and the health check read `healthy`
   with `FailingStreak` 0. It was **not** a version upgrade — the image was still
   `4.3.14`, pulled 08-28 — and nothing on the host did it: the crontab holds only
-  the three `paas-*` jobs and no systemd timer touches Coolify, so it came from
-  inside Coolify's own scheduler. The trigger is unproven; what is established is
-  that the damage survived **four days** (08-28 → 09-01) and then cleared without
-  intervention. So an `unhealthy` Coolify seen by a nightly audit may be gone by
-  the next one — re-check before escalating, and delete the empty caches if it is
-  still there, rather than waiting on a recreate that may not come. Coolify writes the Traefik router *onto the container*, so a
+  the three `paas-*` jobs and no systemd timer touches Coolify.
+  **The trigger is Coolify's own auto-update, and it fires nightly** (settled
+  2026-09-05, three routes): `instance_settings` reads
+  `is_auto_update_enabled = t`, `auto_update_frequency = '0 0 * * *'`,
+  `update_check_frequency = '0 * * * *'`; the container's clock is **UTC**
+  (`date` == `date -u`, no `TZ` set) and its log shows `CheckForUpdatesJob` at
+  exactly `:00` of all 24 hours, so those crons fire on UTC; and on 2026-09-05
+  all four `coolify-*` containers were again recreated at **00:00:44–50 UTC**
+  (`Created` == `StartedAt`, `RestartCount` 0, the current log's first line at
+  `00:00:50`). It recreates the stack **whether or not the image changed** —
+  09-01 recreated on an unchanged `4.3.14`, 09-05 carried `4.3.14 → 4.3.17`.
+  Two consequences. A `coolify-*` container whose age is "since last midnight
+  UTC" is **normal**, not evidence of a crash — read the version before treating
+  it as one. And the job covers only those four: `coolify-proxy` and
+  `coolify-sentinel` are untouched by it (created 2026-07-30 and 08-31), which is
+  why waiting for a nightly recreate will never apply the missing
+  `X-Pironman-Backend=keep` proxy flag (§9b).
+  What is established about the damage itself is that it survived **four days**
+  (08-28 → 09-01) and then cleared without intervention. So an `unhealthy`
+  Coolify seen by a nightly audit may be gone by the next one — re-check before
+  escalating, and delete the empty caches if it is still there, rather than
+  waiting on a recreate that may not come.
+- **A leftover container from an earlier deploy silently splits an app's
+  traffic.** Coolify writes the Traefik router *onto the container*, so a
   leftover carries the same router name, the same rule and the same service as
   the current one. Traefik merges them into one service with two servers and
   round-robins: half the requests run the older image. Every other signal reports
