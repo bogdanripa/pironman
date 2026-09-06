@@ -1530,11 +1530,22 @@ symptom and the platform's own status agreed with it.
   exactly `:00` of all 24 hours, so those crons fire on UTC; and on 2026-09-05
   all four `coolify-*` containers were again recreated at **00:00:44–50 UTC**
   (`Created` == `StartedAt`, `RestartCount` 0, the current log's first line at
-  `00:00:50`). It recreates the stack **whether or not the image changed** —
-  09-01 recreated on an unchanged `4.3.14`, 09-05 carried `4.3.14 → 4.3.17`.
-  Two consequences. A `coolify-*` container whose age is "since last midnight
-  UTC" is **normal**, not evidence of a crash — read the version before treating
-  it as one. And the job covers only those four: `coolify-proxy` and
+  `00:00:50`), carrying `4.3.14 → 4.3.17`.
+  **But the job firing is not the same as a recreate, and only the firing is
+  nightly** (corrected 2026-09-06, two routes). At `00:00:05` that morning the
+  container's own scheduler log shows `UpdateCoolifyJob` RUNNING → DONE in
+  **376ms**, and no container was replaced: all four still read
+  `Created` == `StartedAt` == `2026-09-05T00:00:44–50`, `RestartCount` 0, when
+  checked at 23:0x. The running image was already `4.3.17`, the newest
+  `coollabsio/coolify` tag on the box (`docker images`: `4.3.17` pulled 09-04,
+  `4.3.16` 09-03), so there was nothing to move to and the job was a sub-second
+  no-op. So a recreate marks the **last version bump**, not last midnight, and a
+  `coolify-*` container several days old is normal too — read the version, and
+  do not treat "not recreated last night" as the scheduler being dead. What
+  remains unexplained is 09-01, which recreated on an unchanged `4.3.14`; one
+  no-op night does not account for it, and no mechanism for it has been
+  established.
+  The job covers only those four: `coolify-proxy` and
   `coolify-sentinel` are untouched by it (created 2026-07-30 and 08-31), which is
   why waiting for a nightly recreate will never apply the missing
   `X-Pironman-Backend=keep` proxy flag (§9b).
