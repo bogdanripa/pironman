@@ -1131,6 +1131,10 @@ flows through: the Traefik access log** — nothing is installed per app.
   without storing raw samples), `analytics_agents` (top raw user-agent strings),
   `analytics_last_seen` (each app's last request, to the second — the other
   rollups are day-keyed and cannot say how long an app has been idle).
+  The two an audit queries most do not have the column names you would guess:
+  `analytics_perf` is keyed `(app_id, day)` — a `date`, not a timestamp bucket —
+  with `requests, err_client, err_server, dur_ms_sum`, and `analytics_state` is a
+  two-column `k`/`v` text table holding the single row `accesslog_cursor`.
 - **A fronted app's request is logged twice, and only the client's leg counts.**
   The static host forwards to the backend through the proxy (§9b), so one
   exchange produces at least two access-log lines, all carrying the app's real
@@ -1255,6 +1259,17 @@ flows through: the Traefik access log** — nothing is installed per app.
     platform-wide catastrophe. Filter on `-coolify.bogdanripa.com` in the
     `RequestHost`; the discriminator for what you dropped is
     `RouterName == catchall@file` with `ServiceName` absent.
+  - **A third shape looks like an app and is not: a real hostname someone else
+    pointed at this box.** `ripa-setrarului.go.ro` resolves to `5.12.126.43` —
+    the Pi's own public IP — and drew **286** `catchall@file` `503`s on
+    2026-09-07, 20% of that day's 1,418 non-app 5xx, almost all from one scanner
+    (`/wp-login.php`, `/.git/config`, `/wp-admin/`). It is not an app whose route
+    broke, confirmed two ways: no `applications` or `service_applications` row in
+    coolify-db carries that fqdn, and no container label mentions it. Unlike the
+    bare IP and the md5 `traefik.default` host, a plausible hostname invites
+    exactly the wrong reading, so settle it on the registry rather than on how
+    the name looks. The `-coolify` host filter already excludes it; this is why
+    the filter is a positive match on the suffix and not a blocklist of junk.
   - **A bare trailing `?` proves a forward; its absence proves nothing — and on
     this box two apps trip that daily.** The static host re-issues the path with a
     query separator appended, so a bare trailing `?` appears on static-host
