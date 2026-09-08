@@ -1484,8 +1484,11 @@ symptom and the platform's own status agreed with it.
   fails the route outright — so the app cannot be woken at all and the `503`s
   are **client-visible**, not the internal-leg phantoms of §9c. That produced 40
   of that day's 41 client-visible 5xx (503/502, ~15s each, on `bt-gateway`,
-  `revolut-mcp`, `smartbill-mcp`), and the box then rebooted at 09:22:58Z —
-  `dmesg` shows `EXT4-fs orphan cleanup`, so the first boot ended uncleanly.
+  `revolut-mcp`, `smartbill-mcp`), and the box then rebooted at 09:22:58Z.
+  (That reboot was originally called unclean because `dmesg` showed `EXT4-fs
+  orphan cleanup`; that line appears on clean boots too — see the reboot-forensics
+  entry below — so how the first boot ended is **unestablished**, and nothing
+  here depends on it.)
   Zero proxy `ERR` lines and normal Sablier dispatch/ready/expire cycles
   afterwards. **Intermittent and not reproduced:** the second boot came up
   clean, and the start ordering of Traefik against dockerd was inferred from
@@ -1511,12 +1514,39 @@ symptom and the platform's own status agreed with it.
   `force_docker_cleanup` false. Assume nothing about filter semantics: this one
   survived two confident wrong diagnoses and was settled only by creating a
   labelled throwaway container and running the exact command against it.
+- **The host keeps no record of why it rebooted, and `EXT4-fs orphan cleanup` is
+  not the discriminator.** Nothing on this box survives a reboot to say what
+  caused it: `last` is **not installed** (`/var/log/wtmp` exists but there is no
+  tool to read it), `rsyslog` is `inactive` and there is no `/var/log/syslog`,
+  and although `/var/log/journal` exists it is **empty** — the journal actually
+  lives in `/run/log/journal/<machine-id>` on tmpfs, so `journalctl --list-boots`
+  only ever lists boot 0 and the previous boot's shutdown is gone. (`Storage` is
+  unset in `journald.conf`, i.e. `auto`, and there are no drop-ins, so why the
+  flush to `/var` never happens is **unproven**.) `dmesg` is no help either:
+  `EXT4-fs (nvme0n1p2): orphan cleanup on readonly fs` appears on **clean** boots
+  too — it was present on the 2026-09-08T07:53:22Z boot, which followed a
+  demonstrably orderly stop — so it does not corroborate a power loss.
+  **What does survive is the containers' own json-file logs**, which are on disk
+  and predate the reboot; read the last minutes before boot there:
+  - *Clean stop* — the `_paas` postgres logs `received fast shutdown request` …
+    `database system is shut down`, and on the way back
+    `database system was shut down at <that timestamp>`; the api's uvicorn logs
+    the full `Shutting down` / `Application shutdown complete` /
+    `Finished server process` sequence. Both were present at 07:50:50Z on
+    2026-09-08, 2m32s before the boot — dockerd was stopped in an orderly way,
+    i.e. a deliberate reboot.
+  - *Power loss* — the logs simply stop mid-stream with no shutdown sequence,
+    postgres comes back with `database system was not properly shut down;
+    automatic recovery in progress`, and the damage of the next entry shows up.
+  Corroborate with `vcgencmd get_throttled` (`0x0` = no undervoltage **this
+  boot**, so it cannot speak to a pre-reboot brownout), `systemctl --failed`, and
+  `find /var/log -size 0`.
 - **A hard power loss can leave a file present, correctly named and zero bytes,
   and the program that reads it will not say so.** After the 2026-08-28 outage
   `coolify` came back `running (unhealthy)`: `bootstrap/cache/config.php`,
   `events.php` and `routes-v7.php` were all **0 bytes** (ext4 lost the data
-  blocks of a write that was never flushed — `dmesg` shows `EXT4-fs orphan
-  cleanup` on the boot). PHP's `require` on a 0-byte file returns **`int(1)`**,
+  blocks of a write that was never flushed). PHP's `require` on a 0-byte file
+  returns **`int(1)`**,
   not an array, so Laravel could not bootstrap *before it had configured its
   logger*. Every symptom was therefore blank: `/api/health` returned **500 with
   an empty body**, `php artisan` exited **255 printing nothing at all**, and
