@@ -1181,7 +1181,9 @@ flows through: the Traefik access log** — nothing is installed per app.
     lines in the proxy log whose `ClientHost` is the static host's own address
     (`docker inspect` `web` for it *now* — it drifts, which is why the ingester
     cannot key on it, but a one-off audit resolves it first and then it is exact).
-    Equal, app for app, means every recorded server error was internal. On
+    Equal, app for app, means every recorded server error was internal — but only
+    when the day held no real client-visible 5xx; the general form is
+    `err_server == wakes + client-visible 5xx` (see the wake-log bullet). On
     2026-08-12 they matched exactly. An anatomy of one wake, for what to expect:
     client → `fe-` router; the forward → `503` (counted, phantom); Sablier starts
     the container; N−1 retries → `500` on the backend router (dropped); the Nth
@@ -1201,6 +1203,28 @@ flows through: the Traefik access log** — nothing is installed per app.
     app for app) and 144·19·13 backend `500`s, every figure exact. Two independent
     partitions of the same day already agreed there were **zero** client-visible
     5xx; this was the third.
+    - **A wake that fails is still a wake, and it logs a different sentence.**
+      `served in` is only the success shape; a wake the retry budget runs out on
+      logs `WARNING: wake <id>: still failing after Xs — probe …, sablier …, N
+      retries; passing the backend's <code> through`, and it emits its `fe-<id>`
+      `503` like any other. So count **both** shapes, or the identity above breaks
+      by exactly the number of failed wakes. Verified 2026-09-09 on `bt-gateway`:
+      25 `served in` + 4 `still failing` = **29**, matching 29 `fe-` 5xx exactly,
+      while counting only `served in` gives 25 and leaves four phantom 5xx looking
+      unexplained. That same day showed the `err_server` term the two earlier
+      verifications could not: `bt-gateway` `err_server` **33** = 29 wakes + **4**
+      client-visible `502`s (the four failed wakes, `sablier 0.01–0.04s` — the
+      backend was already up and answering `502` on its own account, §9c).
+      `revolut-mcp` closed exactly too (5 = 5 = 5, 0 client-visible).
+      `smartbill-mcp` was **off by one** over 00:00–23:00Z — 45 `fe-` 5xx against
+      44 wake lines — cause not established; treat a residual of one as noise, not
+      as a reconciled figure.
+    - **Partitioning on `RouterName` needs no address at all**, and agreed with the
+      `ClientHost` partition app-for-app on 2026-09-09. Take the client legs off
+      first (`ClientHost` == the `coolify` network's gateway, §11), *then* split
+      what is left: `RouterName` starting `fe-` is the phantom, `http-0-<uuid>@docker`
+      is a retry. The order matters — a client leg carries the `fe-` router too, so
+      testing `fe-` first counts real client-visible 5xx as phantom.
   - **Take that address from `GlobalIPv6Address`, not `IPAddress`.** The `coolify`
     network is dual-stack and the static host's forwards arrive over **IPv6**, so
     matching `ClientHost` against `web`'s IPv4 — which is what `docker inspect
