@@ -92,27 +92,31 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
 
         # Every run pushes the same :latest tag and the box deploys whatever that
         # points at, so two overlapping runs race and the one that FINISHES last
-        # wins regardless of which commit is newer. Build times vary by an order
-        # of magnitude — a small node/alpine image is a minute or two, while a
-        # large image or one that compiles native dependencies can take 15+
-        # minutes under QEMU emulation — so a quick follow-up commit can easily
-        # land first and then be undone by its predecessor. Don't build a polling
-        # timeout around either figure; time your own first run and use that.
-        # One run at a time, newest wins.
+        # wins regardless of which commit is newer — a quick follow-up commit can
+        # land first and then be undone by its predecessor. Build times still vary
+        # with image size, so don't build a polling timeout around a guess; time
+        # your own first run and use that. One run at a time, newest wins.
         concurrency:
           group: deploy-${{{{ github.ref }}}}
           cancel-in-progress: true
 
         jobs:
           deploy:
-            runs-on: ubuntu-latest
+            # NATIVE arm64, matching the Pi, rather than an x86 runner emulating
+            # it. Cross-building under QEMU runs every dependency install and
+            # compile step emulated, which is the difference between a couple of
+            # minutes and half an hour. GitHub's arm64 runners are free for PUBLIC
+            # repositories; on a private repo they need a paid plan, and the job
+            # will sit waiting for a runner that never comes. If that happens, put
+            # `ubuntu-latest` back and re-add `- uses: docker/setup-qemu-action@v3`
+            # above setup-buildx.
+            runs-on: ubuntu-24.04-arm
             permissions:
               contents: read
               packages: write
             steps:
               - uses: actions/checkout@v4
 
-              - uses: docker/setup-qemu-action@v3
               - uses: docker/setup-buildx-action@v3
 
               - uses: docker/login-action@v3
@@ -128,6 +132,12 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                 with:
                   platforms: linux/arm64
                   push: true
+                  # Without this every build is cold: nothing carries between
+                  # runs, so a dependency install repeats in full even when its
+                  # lockfile has not moved. Keyed on the layer inputs, so a real
+                  # change still rebuilds.
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
                   # So the image can report which commit it is running. A health
                   # endpoint that answers "unknown" cannot tell you whether a
                   # deploy actually landed, which is exactly when you want to
@@ -406,11 +416,13 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
         "the new image right away. A push to any other branch does nothing — "
         "re-run apps_deploy_workflow with `branches` to change that rather than "
         "editing the file.",
-        f"Build time is dominated by the arm64 image build under QEMU emulation, "
-        "and it varies enormously: a small node/alpine image finishes in a minute "
-        "or two, an image with native dependencies to compile can take 15+ "
-        "minutes. Do not size a polling loop off either number — watch the run, "
-        "or time the first one and use that.",
+        "The image is built natively on an arm64 runner rather than cross-built "
+        "under QEMU, so build time is dominated by the image itself and not by "
+        "emulation. It still varies with size and with what has to compile. Do "
+        "not size a polling loop off a number quoted here — watch the run, or "
+        "time the first one and use that. Note the arm64 runners are free only "
+        "on public repositories; on a private repo the job waits for a runner "
+        "that never comes, and the workflow comment names the fallback.",
         "The deploy is checked twice, and the two catch different things. "
         "'Wait for the deploy to be verified' polls the box's own verdict "
         "(GET /apps/<id>/refresh): the /refresh POST answers 202 the moment the "

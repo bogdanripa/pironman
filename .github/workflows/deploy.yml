@@ -38,14 +38,17 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # NATIVE arm64, not x86 emulating it. The Pi is arm64, so cross-building
+    # under QEMU made every dependency install and compile run emulated —
+    # minutes to tens of minutes, varying with the runner rather than with
+    # the change. GitHub's arm64 runners are free on public repositories.
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -65,6 +68,11 @@ jobs:
         with:
           platforms: linux/arm64
           push: true
+          # Without this every build is cold: nothing carries between runs, so a
+          # dependency install repeats in full even when its lockfile has not
+          # moved. Keyed on the layer inputs, so a real change still rebuilds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/bogdanripa/paas-api:latest
             ghcr.io/bogdanripa/paas-api:${{ steps.tag.outputs.value }}

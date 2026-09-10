@@ -604,18 +604,33 @@ is worse than one that races.
 
 **CI needs the same guarantee one level up.** Every run pushes the same `:latest`
 tag, so two overlapping runs race and the one that *finishes* last wins,
-regardless of which commit is newer — and an arm64 build under QEMU emulation can
-take anywhere from a minute or two for a small `node:*-slim`-style image to 15+
-minutes for a large one or one that compiles native dependencies, so a quick
-follow-up commit can easily land first and then be undone by its predecessor.
-Every workflow this repo ships or scaffolds carries a `concurrency` group with
-`cancel-in-progress`.
+regardless of which commit is newer, and a quick follow-up commit can land first
+and then be undone by its predecessor. Every workflow this repo ships or
+scaffolds carries a `concurrency` group with `cancel-in-progress`.
 
-That spread is worth stating both ways round, because the old flat "~15 minutes"
-figure was also quoted in `apps_deploy_workflow`'s output, and a caller who
-believes it builds a twenty-minute polling loop around a run that finishes in
-under two. Neither number is a default to plan against: watch the run, or time
-the app's first build and use that.
+### Build natively on arm64 — never emulate it
+
+The box is arm64, and these workflows used to build `linux/arm64` on an x86
+runner via `docker/setup-qemu-action`. That runs **every** dependency install and
+compile step under emulation, which is what turned a ~90-second image build into
+15-30 minutes, with the spread coming from the runner rather than from anything
+in the change being built. It was quoted as normal in three places — this file,
+the scaffolded workflow and `apps_deploy_workflow`'s output — which is how a
+fixable config problem became an accepted fact that nobody re-examined.
+
+`runs-on: ubuntu-24.04-arm` builds natively and QEMU comes out entirely. GitHub's
+arm64 hosted runners are **free for public repositories**; a private repo needs a
+paid plan, and without one the job waits for a runner that never arrives. That
+failure looks like a hang rather than an error, so the scaffolded workflow says
+so in a comment and names the fallback (`ubuntu-latest` plus re-adding
+`setup-qemu-action`).
+
+Layer caching (`cache-from`/`cache-to: type=gha`) went in at the same time: there
+was none, so nothing carried between runs and dependency installs repeated in
+full on every push even when the lockfile had not moved.
+
+Build time still varies with image size, so do not size a polling loop off a
+figure quoted here — watch the run, or time the app's first build and use that.
 
 ---
 

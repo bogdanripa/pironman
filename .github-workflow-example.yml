@@ -10,13 +10,18 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # NATIVE arm64, matching the Pi, rather than an x86 runner emulating it.
+    # Cross-building under QEMU runs every dependency install and compile step
+    # emulated — the difference between a couple of minutes and half an hour.
+    # Free for PUBLIC repositories; on a private repo these runners need a paid
+    # plan and the job waits for one that never arrives, so put `ubuntu-latest`
+    # back and re-add `- uses: docker/setup-qemu-action@v3` if that happens.
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -27,6 +32,10 @@ jobs:
         with:
           platforms: linux/arm64        # the Pi is aarch64 — without this the
           push: true                    # image builds amd64 and will not start
+          # Nothing carries between runs without this, so a dependency install
+          # repeats in full even when its lockfile has not moved.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: ghcr.io/bogdanripa/${{ github.event.repository.name }}:latest
       # The box watches :latest and redeploys when the digest moves; this triggers
       # the check now instead of waiting for the hourly sweep. PAAS_KEY is the
