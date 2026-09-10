@@ -1211,8 +1211,9 @@ flows through: the Traefik access log** — nothing is installed per app.
     therefore one logged proxy response — the last of which succeeds. So for each
     app, over any window: `fe-<id>` 5xx == wake lines == `analytics_perf.err_server`,
     and backend-router (`http-0-<uuid>@docker`) 5xx == Σretries − wakes. This needs
-    neither `web`'s address nor the trailing `?`, so it survives a redeploy inside
-    the window and the query-string case both. Verified 2026-08-27 across the three
+    neither `web`'s address nor the trailing `?`, so the *arithmetic* survives a
+    redeploy inside the window and the query-string case both — but the *evidence*
+    does not, see the truncation bullet below. Verified 2026-08-27 across the three
     sleeping apps that woke — `smartbill-mcp` 24 wakes / 168 retries, `bt-gateway`
     4 / 23, `revolut-mcp` 3 / 16 — giving 24·4·3 `fe-` 5xx (matching `err_server`
     app for app) and 144·19·13 backend `500`s, every figure exact. Two independent
@@ -1234,6 +1235,31 @@ flows through: the Traefik access log** — nothing is installed per app.
       `smartbill-mcp` was **off by one** over 00:00–23:00Z — 45 `fe-` 5xx against
       44 wake lines — cause not established; treat a residual of one as noise, not
       as a reconciled figure.
+    - **The wake log reaches back only to `web`'s last `StartedAt`, so a redeploy
+      inside the window silently truncates one whole side of the identity.** Wake
+      lines exist *only* in the static host's container log, and Coolify
+      **recreates** that container on deploy rather than restarting it — the
+      previous container is removed and Docker deletes its json-file log with it,
+      so the older wake lines are not merely out of reach, they are gone. Verified
+      2026-09-10: `web` was recreated at `11:31:03Z` (`Created` == `StartedAt`,
+      `RestartCount` 0, corroborated by the `web` / `finished` row at `11:30:48`
+      in coolify-db `application_deployment_queues`); `docker logs --since 24h`
+      returned **39** wake lines and the log's first line was uvicorn's own
+      `Started server process [1]`, with nothing before it; and
+      `/var/lib/docker/containers` held **23** log dirs against **23** containers,
+      exactly one of them `web`'s current one — no orphan survives a removal.
+      Reconciled over the nominal 24h the identity therefore reads as a **4×
+      deficit** — 153 internal-leg `503`s (`smartbill-mcp` 70, `revolut-mcp` 46,
+      `bt-gateway` 37) against 39 available wake lines — and every one of those
+      114 "unexplained" phantom 5xx is an artefact of the log window. Matched to
+      `11:31:03Z`–`23:03Z` instead it closes: `revolut-mcp` 9/9 and `bt-gateway`
+      10/10 exact, `smartbill-mcp` 23 `fe-` against 20 wake lines (residual 3,
+      cause not established — the same kind of small residual as the 2026-09-09
+      off-by-one). **Read `web`'s `StartedAt` first and clamp the reconciliation
+      window to it**, exactly as for its address; a deficit that scales with how
+      far the window predates the redeploy is this, not a fault. The `ClientHost`
+      gateway partition is unaffected — it reads the proxy's log, which rotates
+      but is not destroyed.
     - **Partitioning on `RouterName` needs no address at all**, and agreed with the
       `ClientHost` partition app-for-app on 2026-09-09. Take the client legs off
       first (`ClientHost` == the `coolify` network's gateway, §11), *then* split
