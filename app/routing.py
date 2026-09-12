@@ -44,7 +44,7 @@ static host, which is the only way absolute URLs can be right.
 import logging
 
 from . import coolify, frontends, sablier
-from .config import DOMAIN_SUFFIX, STATIC_HOST_APP
+from .config import DOMAIN_SUFFIX, STATIC_HOST_APP, app_hosts
 from .db import pool
 from .locks import ROUTING_LOCK, app_lock
 
@@ -80,17 +80,28 @@ def _without_generated(labels: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in labels.items() if not k.startswith(_PREFIX)}
 
 
-def build_labels(current: dict[str, str], app_ids: list[str]) -> dict[str, str]:
+def build_labels(current: dict[str, str],
+                 hosts_by_app: dict[str, list[str]]) -> dict[str, str]:
     """`current` labels plus one router per frontend app. Returns them unchanged
     if the static host's service name can't be determined (better to leave
-    routing alone than to write a broken router set)."""
+    routing alone than to write a broken router set).
+
+    One router per app, listing every hostname it answers on -- Traefik's
+    Host() matcher takes several values, so a custom domain does not need a
+    router of its own here. It has to be on THIS router, not only on the app's:
+    the static host is what holds the route while a sleeping app is stopped, so
+    a custom domain missing from it reaches the catchall and 503s exactly when
+    the app is asleep, while working perfectly whenever the app happens to be
+    awake.
+    """
     service = _service_of(current)
     base = _without_generated(current)
     if not service:
         return base
-    for app_id in sorted(app_ids):
+    for app_id in sorted(hosts_by_app):
         r = f"{_PREFIX}{app_id}"
-        base[f"{r}.rule"] = f"Host(`{app_id}{DOMAIN_SUFFIX}`)"
+        hosts = ", ".join(f"`{h}`" for h in hosts_by_app[app_id])
+        base[f"{r}.rule"] = f"Host({hosts})"
         base[f"{r}.entryPoints"] = "http"
         base[f"{r}.service"] = service
         base[f"{r}.middlewares"] = "gzip"
@@ -109,6 +120,17 @@ def scoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
     Only the Host(...) term is touched — any other condition Coolify put in the
     rule (PathPrefix, etc.) is preserved. Idempotent, and it also migrates a rule
     left on `<app-id>.internal` by the earlier scheme back onto the public host.
+
+    The marker goes on EVERY router rule on this container, not only the one
+    naming the generated host. Coolify emits one router per domain, indexed —
+    `$http_label = "http-{$loop}-{$uuid}"` in its docker.php — so an app with a
+    custom domain has `http-0-<uuid>` and `http-1-<uuid>`, and a rewrite keyed on
+    the generated hostname would silently leave the second one unmarked. That
+    router would then answer the custom domain directly, bypassing the static
+    host: the fronted split breaks, and a sleeping app is simply unreachable on
+    its custom domain instead of being woken. Every router on this container
+    belongs to this app, so marking all of them is both correct and narrower to
+    reason about than enumerating hostnames.
     """
     public = f"Host(`{app_id}{DOMAIN_SUFFIX}`)"
     legacy = f"Host(`{app_id}.internal`)"
@@ -117,10 +139,9 @@ def scoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
     for k, v in labels.items():
         if k.startswith("traefik.http.routers.") and k.endswith(".rule"):
             v = v.replace(legacy, public)
-            if marker not in v and public in v:
-                v = v.replace(public, f"{public} && {marker}", 1)
-            if marker in v:
-                out[k[: -len(".rule")] + ".priority"] = BACKEND_PRIORITY
+            if marker not in v:
+                v = f"{v} && {marker}"
+            out[k[: -len(".rule")] + ".priority"] = BACKEND_PRIORITY
         out[k] = v
     return out
 
@@ -275,7 +296,8 @@ async def fronted_ids(conn) -> set[str]:
 #   - it has redirect rules, which the static host applies even with no bundle;
 #   - it has a backend that sleeps, and so needs something that is awake to hold
 #     its route and start it.
-_FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle, spa "
+_FRONTED = ("SELECT id, coolify_uuid, image, redirects, sleep_when_idle, spa, "
+            "custom_domains "
             "FROM apps "
             "WHERE id <> $1 AND internal = false AND (has_frontend = true "
             "  OR jsonb_array_length(redirects) > 0 "
@@ -328,6 +350,8 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
     rows = [r for r in await conn.fetch(_FRONTED, WEB_APP_ID)
             if not sablier.excluded(r["id"])]
     app_ids = [r["id"] for r in rows]
+    hosts_by_app = {r["id"]: app_hosts(r["id"], list(r["custom_domains"] or []))
+                    for r in rows}
 
     # The manifest is how the static host knows an app has a backend at all. An
     # app fronted only because it sleeps has no bundle and so no directory, and
@@ -344,7 +368,7 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
     if not current:
         return {"routed": [], "reason": "static host has no running container yet"}
 
-    desired = build_labels(current, app_ids)
+    desired = build_labels(current, hosts_by_app)
     changed = desired != current
     readonly = None
     if changed:

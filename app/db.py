@@ -81,6 +81,11 @@ ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS health_path text NOT NULL DE
 -- router for it and there is nothing to reach from outside. Other apps get
 -- its address injected as <ID>_URL, like DATABASE_URL.
 ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS internal boolean NOT NULL DEFAULT false;
+-- Extra hostnames this app answers on, alongside the generated one. Additive:
+-- <id>-coolify.bogdanripa.com always works and is never replaced. Cloudflare
+-- must terminate TLS for these (SSL mode Flexible) because the origin has no
+-- certificate for them -- see ARCHITECTURE 4b.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS custom_domains text[] NOT NULL DEFAULT '{}';
 -- The friendly DNS name an internal app answers to on the shared network,
 -- set only once Coolify confirms it. NULL means callers use the uuid, which
 -- is uglier but always resolves.

@@ -143,6 +143,15 @@ def sablier_session_seconds(value: str | None = None) -> int:
 def app_url(app_id: str) -> str:
     return f"https://{app_id}{DOMAIN_SUFFIX}"
 
+def app_hosts(app_id: str, custom_domains=None) -> list[str]:
+    """Every hostname this app answers on: the generated one first, then any
+    custom domains. The generated host is never dropped -- a custom domain is
+    added alongside it, so an app stays reachable at a name the platform
+    controls even if its DNS is repointed elsewhere.
+    """
+    return [f"{app_id}{DOMAIN_SUFFIX}", *(custom_domains or [])]
+
+
 def app_fqdn(app_id: str) -> str:
     # Coolify stores the ORIGIN scheme. http:// — Cloudflare terminates TLS at
     # the edge; https:// here would make Traefik redirect and loop.
