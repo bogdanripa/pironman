@@ -137,12 +137,47 @@ def _visitor(ip: str, ua: str) -> str:
     return h[:32]
 
 
-def _parse_line(line: str) -> dict | None:
+def resolve_app(host: str, hosts: dict[str, str] | None = None) -> str | None:
+    """RequestHost -> app id, or None if it belongs to no hosted app.
+
+    `hosts` is a custom-domain lookup (custom hostname -> app id). It is checked
+    first, because a custom domain is an arbitrary name with no suffix to strip:
+    without it, every request to one is silently discarded here and the app looks
+    untrafficked. That is not a cosmetic loss — `analytics_last_seen` feeds both
+    `apps_stats` and the stuck-awake alert, so an app served only on its custom
+    domain would read as idle forever and page every night while working fine.
+
+    The suffix rule stays as the fallback so a generated host still resolves with
+    no lookup at all, and ingest keeps working if the map cannot be built.
+    """
+    host = (host or "").strip().lower()
+    if hosts:
+        app_id = hosts.get(host)
+        if app_id:
+            return app_id
+    if host.endswith(DOMAIN_SUFFIX):
+        app_id = host[: -len(DOMAIN_SUFFIX)]
+        if app_id and "." not in app_id:  # only flat <app> labels are real apps
+            return app_id
+    return None
+
+
+async def custom_domain_map(conn) -> dict[str, str]:
+    """custom hostname -> app id, for every app that has one. Rebuilt per pass
+    rather than cached: a domain added between passes must start counting, and
+    one removed must stop, without waiting for a redeploy."""
+    rows = await conn.fetch(
+        "SELECT id, custom_domains FROM apps WHERE cardinality(custom_domains) > 0")
+    return {d.strip().lower(): r["id"]
+            for r in rows for d in (r["custom_domains"] or []) if d and d.strip()}
+
+
+def _parse_line(line: str, hosts: dict[str, str] | None = None) -> dict | None:
     """One JSON access-log line -> {app_id, visitor, day, start} or None.
 
     Returns None for anything that is not a request to a hosted app: non-JSON
-    lines (Traefik startup/error logs are plain text), hosts that are not
-    <app>-coolify.bogdanripa.com, and requests with no usable client identity.
+    lines (Traefik startup/error logs are plain text), hosts belonging to no app,
+    and requests with no usable client identity.
     """
     line = line.strip()
     if not line or not line.startswith("{"):
@@ -152,11 +187,8 @@ def _parse_line(line: str) -> dict | None:
     except ValueError:
         return None
 
-    host = (e.get("RequestHost") or "").strip().lower()
-    if not host.endswith(DOMAIN_SUFFIX):
-        return None
-    app_id = host[: -len(DOMAIN_SUFFIX)]
-    if not app_id or "." in app_id:  # only flat <app> labels are real apps
+    app_id = resolve_app(e.get("RequestHost") or "", hosts)
+    if not app_id:
         return None
 
     ip = _client_ip(e)
@@ -373,6 +405,7 @@ async def ingest_once() -> dict:
         # _internal_leg. Read once per pass: it changes only when an app is
         # created, deleted or (un)fronted.
         fronted = await routing.fronted_ids(conn)
+        hosts = await custom_domain_map(conn)
 
         raw = await _read_since(cursor)
 
@@ -420,7 +453,7 @@ async def ingest_once() -> dict:
             tally["lines"] += 1
             if line.strip().startswith("{"):
                 tally["json"] += 1
-            rec = _parse_line(line)
+            rec = _parse_line(line, hosts)
             if rec is None:
                 continue
             tally["app"] += 1
@@ -717,6 +750,7 @@ async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
     limit = max(1, min(limit, 200))
     async with pool().acquire() as conn:
         fronted = await routing.fronted_ids(conn)
+        hosts = await custom_domain_map(conn)
     _, out = await autoupdate._docker(
         "logs", "--tail", str(limit * 8 + 200), ANALYTICS_PROXY, timeout=60)
     items = []
@@ -728,11 +762,8 @@ async def recent_requests(app_id: str | None = None, limit: int = 50) -> dict:
             e = json.loads(line)
         except ValueError:
             continue
-        host = (e.get("RequestHost") or "").strip().lower()
-        if not host.endswith(DOMAIN_SUFFIX):
-            continue
-        aid = host[: -len(DOMAIN_SUFFIX)]
-        if not aid or "." in aid or (app_id and aid != app_id):
+        aid = resolve_app(e.get("RequestHost") or "", hosts)
+        if not aid or (app_id and aid != app_id):
             continue
         # Traefik reports request time in NANOseconds, as _parse_line also has
         # to remember. Rounded to 0.1ms: the raw value carries nanosecond digits
