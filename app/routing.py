@@ -113,12 +113,36 @@ def _marker_term() -> str:
 
 
 def _host_term(hosts: list[str]) -> str:
-    return "Host(" + ", ".join(f"`{h}`" for h in hosts) + ")"
+    """The rule fragment matching any of `hosts`.
+
+    **One host per `Host()`, joined with `||`.** Traefik v3 takes exactly one
+    parameter — `Host(`a`, `b`)` is a v2 form and v3.6.24 rejects it with
+    "unexpected number of parameters; got 2, expected one of [1]". A rejected
+    rule is not a degraded rule: Traefik drops that router entirely, so the app
+    answers nobody while every other router keeps working, which is the shape of
+    fault that gets blamed on DNS. Measured here on 2026-09-12 — see §4b.
+
+    Parenthesised when there is more than one, because `&&` binds tighter than
+    `||`: without the group, `Host(a) || Host(b) && Header(m)` parses happily and
+    means `Host(a) || (Host(b) && Header(m))`, so the generated host would answer
+    the static host's forwards *and* direct traffic, un-scoped. It parses, so
+    nothing reports it.
+
+    A single host keeps the bare `Host(`a`)` spelling it has always had. That is
+    not cosmetic: every label write compares `desired == base` to decide whether
+    to redeploy, so a changed spelling would redeploy every app on the box once.
+    """
+    terms = " || ".join(f"Host(`{h}`)" for h in hosts)
+    return terms if len(hosts) == 1 else f"({terms})"
 
 
-# The Host(...) term of a Traefik rule, however many hostnames it lists. A
-# hostname cannot contain ')', so stopping at the first one is exact.
-_HOST_RE = re.compile(r"Host\([^)]*\)")
+# The Host term of a Traefik rule in either shape this file writes: a
+# parenthesised `||` group, or a single bare `Host(...)`. The group alternative
+# comes first so it wins where both could match. Hostnames cannot contain a
+# backtick, so the inner match is exact.
+_HOST_RE = re.compile(
+    r"\(\s*Host\(`[^`]*`\)(?:\s*\|\|\s*Host\(`[^`]*`\))*\s*\)"
+    r"|Host\([^)]*\)")
 
 
 def _rewrite_hosts(rule: str, hosts: list[str]) -> str:

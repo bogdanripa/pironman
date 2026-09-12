@@ -204,6 +204,21 @@ Four things have to agree, and all four are written by
 | `web`'s app-id resolution | `/srv/frontends/.pironman-domains.json` | a 404 from the right machine with the route, DNS and container all healthy |
 | analytics | `apps.custom_domains`, read per pass into a host→app map | the traffic is dropped entirely: `resolve_app` strips `DOMAIN_SUFFIX` and a custom host has none |
 
+**One host per `Host()`, joined with `||`, and parenthesised.** Traefik v3 takes
+exactly one parameter per matcher; `Host(`a`, `b`)` is the v2 spelling and
+v3.6.24 answers `unexpected number of parameters; got 2, expected one of [1]`.
+A rejected rule is not a degraded rule — Traefik drops that router and keeps
+every other one, so the app answers nobody while the box looks healthy. Measured
+2026-09-12: the first custom domain took `gepetel` off the air for 110s
+(09:40:41–09:42:30) while `api-coolify` served 200 and `wa-gateway` kept being
+fronted normally, both confirmed in the same access-log window. The parentheses
+matter separately, because `&&` binds tighter than `||`: unparenthesised,
+`Host(gen) || Host(custom) && Header(marker)` is *valid* and means
+`Host(gen) || (Host(custom) && Header(marker))`, which un-scopes the generated
+host — a failure that parses. `tests/test_traefik_rules.py` runs the generated
+rules through a throwaway `traefik:v3.6` and asserts which router answers, which
+is the only oracle that catches either.
+
 **The host list is ours, not Coolify's.** Coolify emits one router per domain
 (`http-{loop}-{uuid}`), so it *looks* as though setting `domains` there would do
 the job. It would not: this Coolify version has no
