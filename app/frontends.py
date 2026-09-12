@@ -11,11 +11,24 @@ Keeping it in the volume means the static host needs no database credentials and
 no call back into paas-api.
 """
 import json
+import os
 import shutil
 import zipfile
 from pathlib import Path
 
 FRONTEND_ROOT = Path("/srv/frontends")
+
+# Custom hostname -> app id, for the static host. It resolves an app from the
+# Host header, and for a generated hostname it can do that by arithmetic
+# (strip DOMAIN_SUFFIX); a custom domain is arbitrary, so the mapping has to be
+# handed to it. Written next to the bundles rather than fetched over HTTP for
+# the same reason the manifests are: the static host holds no credentials and
+# never calls back into paas-api.
+#
+# The leading dot keeps it out of every app's directory, which is what makes it
+# unservable: `_safe_file` resolves only under <root>/<app-id>, and no app id can
+# begin with one (SLUG_RE).
+DOMAIN_MAP = FRONTEND_ROOT / ".pironman-domains.json"
 
 # Refuse absurd bundles rather than filling the Pi's disk.
 MAX_FILES = 5000
@@ -181,6 +194,25 @@ def write_manifest(app_id: str, has_backend: bool,
         "redirects": redirects or [],
         "spa": spa,
     }))
+
+
+def write_domain_map(custom_by_app: dict[str, list[str]]) -> None:
+    """Publish the custom hostname -> app id map the static host reads.
+
+    Written whole and swapped into place, never edited: the static host reads
+    this file on any request whose Host it has not seen, and a half-written file
+    would resolve to no app at all — a 404 on every custom domain at once, for
+    however long the write took.
+
+    Takes ONLY each app's custom domains. Generated hostnames are left out on
+    purpose: the static host derives those itself, so including them would put a
+    second source of truth under the answer it already knows.
+    """
+    mapping = {h: app_id for app_id, hosts in custom_by_app.items() for h in hosts}
+    FRONTEND_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = DOMAIN_MAP.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(mapping))
+    os.replace(tmp, DOMAIN_MAP)
 
 
 def info(app_id: str) -> dict | None:

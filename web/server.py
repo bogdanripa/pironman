@@ -134,8 +134,48 @@ NO_STORE = "no-store, private"
 app = FastAPI(title="pironman-web", docs_url=None, redoc_url=None)
 
 
+# Custom hostname -> app id, written by paas-api (app/frontends.write_domain_map)
+# whenever the routing set changes. Cached on the file's mtime rather than
+# re-read per request, and re-read the moment it moves: a domain added to an app
+# takes effect here without restarting the static host, which is the whole point
+# of the file existing instead of an environment variable.
+DOMAIN_MAP = ROOT / ".pironman-domains.json"
+_domain_cache: tuple[float, dict] = (-1.0, {})
+
+
+def _custom_domains() -> dict:
+    global _domain_cache
+    try:
+        mtime = DOMAIN_MAP.stat().st_mtime
+    except OSError:
+        return {}  # no app has a custom domain yet
+    if mtime != _domain_cache[0]:
+        try:
+            loaded = json.loads(DOMAIN_MAP.read_text())
+        except (OSError, ValueError):
+            # Mid-write or corrupt. Keep serving the last good map rather than
+            # dropping every custom domain to 404 for as long as it takes to be
+            # rewritten, and do not cache the bad mtime, so the next request
+            # retries.
+            return _domain_cache[1]
+        _domain_cache = (mtime, loaded if isinstance(loaded, dict) else {})
+    return _domain_cache[1]
+
+
 def _app_id(host: str) -> str | None:
+    """Which app owns this Host header, or None.
+
+    Custom domains are consulted FIRST, then the generated hostname is derived by
+    stripping DOMAIN_SUFFIX. The order does not actually matter — paas-api
+    refuses to register a custom domain ending in DOMAIN_SUFFIX precisely so the
+    two sets cannot overlap — but it matches app/analytics.resolve_app, and two
+    resolvers that disagree about which app served a request would make the
+    traffic figures wrong in a way nothing would flag.
+    """
     host = (host or "").split(":")[0].strip().lower()
+    aid = _custom_domains().get(host)
+    if aid:
+        return aid
     if not host.endswith(DOMAIN_SUFFIX):
         return None
     aid = host[: -len(DOMAIN_SUFFIX)]

@@ -310,6 +310,40 @@ async def main():
               r.status_code == 404 and "MARKETING" not in r.text,
               f"{r.status_code} {r.text[:40]}")
 
+        print("\n[a custom domain]")
+        # Exactly what paas-api writes (app/frontends.write_domain_map). The
+        # static host derives an app id from a generated hostname by arithmetic
+        # and cannot do that for a custom one, so without this file every custom
+        # domain 404s from the right machine with the route, DNS and container
+        # all healthy — the hardest kind of failure to read.
+        (ROOT / ".pironman-domains.json").write_text(
+            json.dumps({"shop.example.com": "demo"}))
+        STATE["up"] = True
+        C = {"Host": "shop.example.com"}
+        r = await c.get(base + "/", headers=C)
+        check("a custom domain serves the app's bundle",
+              "MARKETING PAGE" in r.text, r.status_code)
+        r = await c.get(base + "/api/thing", headers=C)
+        check("a custom domain reaches the backend",
+              r.status_code == 200 and r.json().get("backend"), r.text[:60])
+        check("the backend sees the CUSTOM host, not the generated one",
+              STATE["seen_host"] == "shop.example.com", STATE["seen_host"])
+        STATE["up"] = False; STATE["wakes"] = 0
+        r = await c.get(base + "/api/thing", headers=C)
+        check("a custom domain wakes a sleeping backend",
+              r.status_code == 200 and STATE["wakes"] == 1,
+              f"{r.status_code} wakes={STATE['wakes']}")
+        r = await c.get(base + "/", headers={"Host": "notmine.example.com"})
+        check("a host in nobody's map is a 404, not somebody else's site",
+              r.status_code == 404 and "MARKETING" not in r.text,
+              f"{r.status_code} {r.text[:40]}")
+        # Removing it must take effect without restarting the static host.
+        (ROOT / ".pironman-domains.json").write_text("{}")
+        os.utime(ROOT / ".pironman-domains.json", (1, 1))
+        r = await c.get(base + "/", headers=C)
+        check("removing the domain stops it resolving, with no restart",
+              r.status_code == 404, r.status_code)
+
     print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
     return 1 if fails else 0
 

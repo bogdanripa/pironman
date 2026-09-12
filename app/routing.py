@@ -42,6 +42,7 @@ Keeping the real hostname end-to-end means an app cannot tell it is behind the
 static host, which is the only way absolute URLs can be right.
 """
 import logging
+import re
 
 from . import coolify, frontends, sablier
 from .config import DOMAIN_SUFFIX, STATIC_HOST_APP, app_hosts
@@ -100,8 +101,7 @@ def build_labels(current: dict[str, str],
         return base
     for app_id in sorted(hosts_by_app):
         r = f"{_PREFIX}{app_id}"
-        hosts = ", ".join(f"`{h}`" for h in hosts_by_app[app_id])
-        base[f"{r}.rule"] = f"Host({hosts})"
+        base[f"{r}.rule"] = _host_term(hosts_by_app[app_id])
         base[f"{r}.entryPoints"] = "http"
         base[f"{r}.service"] = service
         base[f"{r}.middlewares"] = "gzip"
@@ -112,33 +112,93 @@ def _marker_term() -> str:
     return f"Header(`{BACKEND_HEADER}`, `{BACKEND_TOKEN}`)"
 
 
-def scoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
-    """The backend's labels with the marker-header condition added to every router
-    rule, so the public hostname is shared with the static host's router rather
-    than surrendered.
+def _host_term(hosts: list[str]) -> str:
+    return "Host(" + ", ".join(f"`{h}`" for h in hosts) + ")"
+
+
+# The Host(...) term of a Traefik rule, however many hostnames it lists. A
+# hostname cannot contain ')', so stopping at the first one is exact.
+_HOST_RE = re.compile(r"Host\([^)]*\)")
+
+
+def _rewrite_hosts(rule: str, hosts: list[str]) -> str:
+    """`rule` with its Host(...) term replaced by exactly `hosts`, everything else
+    (PathPrefix, the marker, anything Coolify added) left alone.
+
+    Wholesale replacement rather than appending the missing ones, so that
+    REMOVING a custom domain is the same operation as adding one and neither
+    needs its own path. The caller must therefore pass the app's complete host
+    list — see `_hosts_of`, which is why no caller is trusted to assemble it.
+
+    Also migrates a rule left on `<app-id>.internal` by the earlier scheme, since
+    that is just another Host term to overwrite.
+    """
+    want = _host_term(hosts)
+    if _HOST_RE.search(rule):
+        return _HOST_RE.sub(lambda _: want, rule, count=1)
+    return f"{want} && {rule}" if rule else want
+
+
+async def _hosts_of(app_id: str) -> list[str]:
+    """Every hostname this app answers on: the generated one plus its custom
+    domains, read from the registry at the moment the labels are written.
+
+    Read here rather than passed in by the caller, deliberately. The Host term is
+    rewritten wholesale, so a caller that omitted the argument would not get a
+    harmless default — it would silently delete the app's custom domains from its
+    own router and leave them 503ing at the catchall. There are five call sites
+    (routing's two passes, apps_sablier, the Sablier reconciler, the auto-enroll
+    sweep) and only one of them is about domains at all, so "remember to pass the
+    hosts" is a rule that would be forgotten exactly once. One extra read costs
+    less than that.
+
+    Falls back to the generated host alone if the row cannot be read: that is the
+    pre-custom-domain behaviour, which is wrong only for an app that has one, and
+    the next write repairs it.
+    """
+    try:
+        async with pool().acquire() as c:
+            row = await c.fetchrow(
+                "SELECT custom_domains FROM apps WHERE id = $1", app_id)
+    except Exception:
+        _log.warning("could not read custom domains for %s; writing labels with "
+                     "the generated host only", app_id, exc_info=True)
+        row = None
+    return app_hosts(app_id, list(row["custom_domains"] or []) if row else None)
+
+
+def scoped(labels: dict[str, str], app_id: str,
+           hosts: list[str] | None = None) -> dict[str, str]:
+    """The backend's labels with its router rules set to this app's full host list
+    and the marker-header condition added, so each public hostname is SHARED with
+    the static host's router rather than surrendered.
 
     Only the Host(...) term is touched — any other condition Coolify put in the
     rule (PathPrefix, etc.) is preserved. Idempotent, and it also migrates a rule
     left on `<app-id>.internal` by the earlier scheme back onto the public host.
 
-    The marker goes on EVERY router rule on this container, not only the one
-    naming the generated host. Coolify emits one router per domain, indexed —
-    `$http_label = "http-{$loop}-{$uuid}"` in its docker.php — so an app with a
-    custom domain has `http-0-<uuid>` and `http-1-<uuid>`, and a rewrite keyed on
-    the generated hostname would silently leave the second one unmarked. That
-    router would then answer the custom domain directly, bypassing the static
-    host: the fronted split breaks, and a sleeping app is simply unreachable on
-    its custom domain instead of being woken. Every router on this container
-    belongs to this app, so marking all of them is both correct and narrower to
-    reason about than enumerating hostnames.
+    Both halves apply to EVERY router rule on this container, not only the one
+    naming the generated host. Every router here belongs to this app, so marking
+    all of them is both correct and narrower to reason about than enumerating
+    hostnames.
+
+    The host list is written into the rule rather than left to Coolify because on
+    this box Coolify does not get a say. `set_custom_labels` finds no
+    readonly flag to set — the `applications` table on this version has no such
+    column, only `custom_labels` — and Coolify nonetheless treats the stored block
+    as final: gepetel's container, recreated by an ordinary CI deploy, still
+    carried the marker and had lost the `PathPrefix(`/`)` that Coolify generates
+    for every unscoped app. So adding a domain in Coolify would produce no second
+    router for an app we have ever scoped, and the custom hostname would reach the
+    static host, be forwarded with the marker, match nothing, and come back as the
+    static host's own "backend has no route" 503.
     """
-    public = f"Host(`{app_id}{DOMAIN_SUFFIX}`)"
-    legacy = f"Host(`{app_id}.internal`)"
+    hosts = hosts or app_hosts(app_id)
     marker = _marker_term()
     out: dict[str, str] = {}
     for k, v in labels.items():
         if k.startswith("traefik.http.routers.") and k.endswith(".rule"):
-            v = v.replace(legacy, public)
+            v = _rewrite_hosts(v, hosts)
             if marker not in v:
                 v = f"{v} && {marker}"
             out[k[: -len(".rule")] + ".priority"] = BACKEND_PRIORITY
@@ -146,9 +206,12 @@ def scoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
     return out
 
 
-def unscoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
+def unscoped(labels: dict[str, str], app_id: str,
+             hosts: list[str] | None = None) -> dict[str, str]:
     """The inverse of `scoped()`: the marker condition removed from every router
-    rule, and the priority `scoped()` added dropped along with it.
+    rule, and the priority `scoped()` added dropped along with it. The host list
+    is still written, because an app that nothing fronts answers its custom
+    domains on its OWN router and needs them there.
 
     This is not symmetry for its own sake. `scoped()` writes the marker into the
     container's **live** labels, and every later write is a read-modify-write of
@@ -158,8 +221,9 @@ def unscoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
     demanding a header that the static host no longer sends, and the app answers
     nobody on its own hostname.
 
-    Idempotent: a rule with no marker comes back unchanged.
+    Idempotent: a rule already in this shape comes back unchanged.
     """
+    hosts = hosts or app_hosts(app_id)
     marker = _marker_term()
     out: dict[str, str] = {}
     for k, v in labels.items():
@@ -170,6 +234,7 @@ def unscoped(labels: dict[str, str], app_id: str) -> dict[str, str]:
                 continue  # this priority exists only because of the marker
         if k.startswith("traefik.http.routers.") and k.endswith(".rule"):
             v = v.replace(f" && {marker}", "").replace(f"{marker} && ", "")
+            v = _rewrite_hosts(v, hosts)
         out[k] = v
     return out
 
@@ -195,6 +260,7 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
     base = await sablier._current_labels(uuid)
     if not base:
         raise sablier.NoContainer(app_id)
+    hosts = await _hosts_of(app_id)
     # Whether an app MAY sleep is not the caller's to decide. Every other path
     # asks sablier.excluded() — is_fronted(), the _FRONTED filter, reconcile() —
     # and this one took `sleeps` on trust, which is how the control plane came to
@@ -218,8 +284,8 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
     sleeps = sleeps and not sablier.excluded(app_id)
     desired = (sablier.enrolled_labels(base, app_id) if sleeps
                else sablier.stripped(base, app_id))
-    desired = (scoped(desired, app_id) if fronted
-               else unscoped(desired, app_id))
+    desired = (scoped(desired, app_id, hosts) if fronted
+               else unscoped(desired, app_id, hosts))
     if desired == base:
         return False
     await coolify.set_custom_labels(uuid, [f"{k}={v}" for k, v in desired.items()],
@@ -258,6 +324,9 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
     if scoped_before != scoped_after:
         changes.append("scoped behind the static host" if scoped_after
                        else "un-scoped — it answers its own hostname again")
+    if _host_term(hosts) not in " ".join(
+            v for k, v in base.items() if k.endswith(".rule")):
+        changes.append("now answers " + ", ".join(hosts))
     await coolify.deploy(
         uuid, app_id=app_id,
         reason="; ".join(changes) or "container labels rewritten")
@@ -363,6 +432,17 @@ async def _sync(conn, scope_backends: bool = True) -> dict:
                                      spa=bool(r["spa"]))
         except OSError:
             pass  # the volume will be there on the next sync; routing is unharmed
+
+    # And the one file that is not per-app: the static host resolves a generated
+    # hostname by stripping DOMAIN_SUFFIX, which tells it nothing about a custom
+    # one. Without this it would answer every custom domain with "no frontend for
+    # this host" — a 404 from the right machine, which is the hardest kind to
+    # read, because the route, the DNS and the container are all fine.
+    try:
+        frontends.write_domain_map(
+            {r["id"]: list(r["custom_domains"] or []) for r in rows})
+    except OSError:
+        pass
 
     current = await sablier._current_labels(web["coolify_uuid"])
     if not current:

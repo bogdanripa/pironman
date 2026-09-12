@@ -12,6 +12,7 @@ from .cors import CorsMiddleware
 from .config import DASHBOARD_ORIGIN, app_url
 from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
                       redirects as redirects_router,
+                      domains as domains_router,
                       analytics as analytics_router, stats,
                       alerts as alerts_router, frontend, host)
 
@@ -195,6 +196,19 @@ Any app can also carry **redirect rules** (apps_redirects_list / apps_redirects_
 301/302/307/308, preserve the query string, and can point at another path or an
 absolute URL. Setting them needs no redeploy, and works for a backend-only app
 too. Reach for these when paths move, rather than adding redirect code to an app.
+
+An app can also answer on a **custom domain** of its own (apps_domains_list /
+apps_domain_add / apps_domain_remove) — 'shop.example.com' alongside
+https://shop-coolify.bogdanripa.com, which it keeps. Everything follows the
+hostname: the bundle, the backend, the wake-on-request for a sleeping app and
+the analytics attribution all work on it exactly as on the generated one. Two
+things are NOT done for you, and both fail in ways that look like a platform
+fault. Create the DNS record first — a CNAME to web-coolify.bogdanripa.com for a
+subdomain, an A record to the box's IP for an apex — and if the domain is proxied
+through Cloudflare, set its SSL mode to 'Flexible': this origin serves plain HTTP
+and has no certificate, so a 'Full' mode domain fails on https:// while http://
+works. Keep using the generated hostname for anything internal (CI, crons, one
+app calling another): it cannot be removed, and a custom domain can.
 
 Frontends deploy by upload, not by image: apps_frontend_write publishes a small
 site from inline files (no build, no repo — good for a landing page), while a
@@ -485,6 +499,7 @@ app.include_router(stats.router)       # apps_stats — live CPU/RAM/DB/health s
 app.include_router(alerts_router.router)  # alerts_test — Telegram alert wiring check
 app.include_router(frontend.router)    # apps_frontend_deploy / apps_frontend_write
 app.include_router(redirects_router.router)  # apps_redirects_list / _set
+app.include_router(domains_router.router)    # apps_domains_list / apps_domain_add / _remove
 
 
 @app.get("/analytics/dashboard", include_in_schema=False)
@@ -589,8 +604,8 @@ try:
                  "apps_env_list", "crons_list", "env_list", "github_secrets_list",
                  "analytics_overview", "analytics_timeseries", "analytics_cohorts",
                  "analytics_agents", "analytics_recent", "apps_stats",
-                 "apps_redirects_list", "platform_tasks_health",
-                 "platform_events"}
+                 "apps_redirects_list", "apps_domains_list",
+                 "platform_tasks_health", "platform_events"}
     # The test for this set is whether the tool's PURPOSE is removal: every call
     # destroys something, so a prompt every time carries real information. That
     # is what the two script tools fail — the annotation is static per tool, so
@@ -601,7 +616,8 @@ try:
     # call that matters. Their guard is the tool description and CLAUDE.md,
     # which can tell a SELECT from a DROP; this flag cannot.
     _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
-                    "crons_delete", "env_delete", "github_secret_delete"}
+                    "crons_delete", "env_delete", "github_secret_delete",
+                    "apps_domain_remove"}
     for _tool in getattr(_mcp, "tools", None) or []:
         if _tool.name in _READONLY:
             _tool.annotations = ToolAnnotations(readOnlyHint=True)

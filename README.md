@@ -768,6 +768,38 @@ this works for backend-only apps. Validation rejects the mistakes that would
 otherwise fail silently: a target placeholder the pattern never captures, a
 duplicate source, or a rule pointing at itself.
 
+## Custom domains
+
+An app can answer on hostnames of its own **in addition to** the generated
+`<id>-coolify.bogdanripa.com` (`apps_domains_list` / `apps_domain_add` /
+`apps_domain_remove`, stored in `apps.custom_domains`). The generated host is
+never replaced — CI's `/refresh` hook, the cron dispatcher and the wake handshake
+all use it, so a rename would break them at once and silently. Use it for
+anything internal; use the custom domain for the public-facing URL.
+
+Everything follows the hostname: the bundle, the backend, wake-on-request for a
+sleeping app, redirects, and the analytics attribution. Adding one rewrites the
+static host's router, the app's own router and the host→app map the static host
+reads, and may redeploy both containers.
+
+Two steps are **not** done for you, and both fail in ways that look like a
+platform fault rather than a missing step:
+
+- **DNS.** The wildcard covers only `*.bogdanripa.com`. Point the name at this
+  box first: a CNAME to `web-coolify.bogdanripa.com` for a subdomain, an A record
+  to the box's public IP for an apex (which cannot be a CNAME).
+- **TLS mode.** Cloudflare terminates TLS; this origin serves plain HTTP on :80
+  and has no certificate of its own (:443 answers with Traefik's default
+  self-signed one). A domain proxied through Cloudflare therefore needs SSL mode
+  **Flexible** — on `Full` it fails on `https://` while `http://` works. A domain
+  pointed straight at the box, unproxied, is `http://`-only.
+
+Validation refuses a scheme, path, port or wildcard, a bare label, an IP, a
+domain another app already claims, and — the one that matters — anything ending
+in `-coolify.bogdanripa.com`. Every resolver here checks the custom map *before*
+stripping the suffix, so registering another app's generated hostname would
+capture both its routing and its traffic figures.
+
 ## Known-unverified
 
 `create_app`, `delete_app`, `set_image`, `deploy` and `get_app` in `coolify.py`

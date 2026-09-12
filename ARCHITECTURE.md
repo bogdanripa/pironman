@@ -186,6 +186,51 @@ to list containers by app name, state and restart policy.
   pass the fd to uvicorn (see `web/run.py`). Port 80 is privileged → run as root.
   Verify from *outside* the container; `localhost` will lie to you.
 
+### 4b. Custom domains
+
+An app can answer on hostnames of its own **in addition to** the generated one
+(`apps_domain_add` / `apps_domain_remove` / `apps_domains_list`, stored in
+`apps.custom_domains text[]`). The generated host is never replaced: CI's
+`/refresh` hook, the cron dispatcher, the wake handshake and every internal
+caller use it, and a rename would break all of them at once and silently.
+
+Four things have to agree, and all four are written by
+`routing.sync_frontend_routes`:
+
+| | what carries the hostname | what happens without it |
+|---|---|---|
+| static host | `fe-<id>` router rule, `Host(gen, custom…)` | the catchall 503s it — and that is also what a *sleeping* app looks like, since `web` is what holds its route while the container is stopped |
+| the app's own container | its router rule, same host list, plus the marker header (§9b) | `web` forwards it with the marker, nothing matches, and it comes back as `web`'s own "backend has no route" 503 |
+| `web`'s app-id resolution | `/srv/frontends/.pironman-domains.json` | a 404 from the right machine with the route, DNS and container all healthy |
+| analytics | `apps.custom_domains`, read per pass into a host→app map | the traffic is dropped entirely: `resolve_app` strips `DOMAIN_SUFFIX` and a custom host has none |
+
+**The host list is ours, not Coolify's.** Coolify emits one router per domain
+(`http-{loop}-{uuid}`), so it *looks* as though setting `domains` there would do
+the job. It would not: this Coolify version has no
+`is_container_label_readonly_enabled` column at all — only `custom_labels` — and
+it nonetheless treats a stored `custom_labels` block as final. Measured
+2026-09-12: `gepetel`'s container, recreated that morning by an ordinary CI
+deploy, still carried the marker and had *lost* the `PathPrefix(`/`)` Coolify
+generates for every unscoped app. So for any app the platform has ever scoped,
+adding a domain in Coolify produces no router at all. `routing.scoped()` /
+`unscoped()` rewrite the rule's `Host(...)` term wholesale instead — which is
+also why adding and removing a domain are the same code path, and why
+`_hosts_of()` reads the list from the registry rather than trusting a caller to
+pass it.
+
+**Validation refuses anything ending in `DOMAIN_SUFFIX`**, and that is a
+security rule, not tidiness. Every resolver here checks the custom map *before*
+stripping the suffix, so a custom domain of `<other-app>-coolify.bogdanripa.com`
+would capture that app's routing and its traffic figures at once.
+
+**DNS and TLS are the caller's.** The wildcard covers only `*.bogdanripa.com`, so
+a custom domain needs a record: CNAME to `web-coolify.bogdanripa.com` for a
+subdomain, an A record to the box's public IP for an apex. TLS is terminated by
+Cloudflare — the origin serves plain HTTP on :80 and has no certificate (:443
+answers with Traefik's default self-signed one), so a proxied domain needs SSL
+mode **Flexible**. Pointed straight at the box with nothing in front, it works on
+`http://` and not on `https://`.
+
 ---
 
 ## 5. The control plane (`paas-api` / pironman)

@@ -250,8 +250,13 @@ async def get_app(app_id: str):
 
     fe = frontends.info(app_id)
     has_backend = bool(row["image"])
+    custom = list(row["custom_domains"] or [])
     out = {
         "id": row["id"], "url": app_url(row["id"]),
+        # Extra hostnames this app answers on, added with apps_domain_add. The
+        # generated `url` above is never one of them and is never replaced — it
+        # is what CI, the crons and the wake handshake use.
+        "custom_domains": custom,
         "kind": ("both" if has_backend and fe else
                  "frontend" if fe else "backend"),
         "image": row["image"],
