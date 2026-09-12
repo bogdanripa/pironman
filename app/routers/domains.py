@@ -151,13 +151,20 @@ async def _apply(c, row, domains: list[str]) -> dict:
 
 DNS_NOTE = (
     "DNS is yours to create and is the only step this platform cannot do for "
-    "you. Point the name at this box — a CNAME to web{suffix} for a subdomain, "
-    "or an A record to the box's public IP for an apex, which cannot be a CNAME. "
+    "you. Point the name at this box with an **A record to its public IP**, "
+    "proxied — for a subdomain as much as for an apex. "
+    "Do NOT CNAME it to <something>{suffix}: those hostnames are themselves "
+    "proxied by Cloudflare, so a proxied CNAME to one never reaches an origin at "
+    "all. The request is handed to the bogdanripa.com edge still carrying your "
+    "hostname, that zone does not serve it, and Cloudflare answers 404 from "
+    "inside — with nothing in this box's access log to show for it. Measured "
+    "2026-09-12 on gepetel.com. "
     "TLS is terminated by Cloudflare, not here: the origin serves plain HTTP on "
     "port 80 and has no certificate (port 443 answers with Traefik's default "
-    "self-signed one), so a domain proxied through Cloudflare must have SSL mode "
-    "'Flexible'. A domain pointed straight at the box with no proxy in front "
-    "will work on http:// and NOT on https://.").format(suffix=DOMAIN_SUFFIX)
+    "self-signed one), so a proxied domain must have SSL mode 'Flexible' — "
+    "'Full' fails on https:// while http:// works. A domain pointed straight at "
+    "the box with no proxy in front is http://-only."
+).format(suffix=DOMAIN_SUFFIX)
 
 
 @router.get("/{app_id}/domains", operation_id="apps_domains_list",

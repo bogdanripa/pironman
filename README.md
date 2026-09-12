@@ -786,8 +786,16 @@ Two steps are **not** done for you, and both fail in ways that look like a
 platform fault rather than a missing step:
 
 - **DNS.** The wildcard covers only `*.bogdanripa.com`. Point the name at this
-  box first: a CNAME to `web-coolify.bogdanripa.com` for a subdomain, an A record
-  to the box's public IP for an apex (which cannot be a CNAME).
+  box first with an **A record to its public IP, proxied** — for a subdomain as
+  much as for an apex. A CNAME to `web-coolify.bogdanripa.com` reads like the
+  tidier answer and does not work: that target is itself a proxied Cloudflare
+  record, so a proxied CNAME to it never reaches an origin. The request is handed
+  to the `bogdanripa.com` edge still carrying your hostname, that zone does not
+  serve it, and Cloudflare answers 404 from inside — with nothing in this box's
+  access log to show for it, which is what makes it read as a platform fault.
+  (Measured 2026-09-12 on `gepetel.com`. If you want a name to CNAME to so the
+  record survives an IP change, it has to be a **DNS-only** record — grey cloud —
+  since the whole failure is the second proxy hop. Untested here.)
 - **TLS mode.** Cloudflare terminates TLS; this origin serves plain HTTP on :80
   and has no certificate of its own (:443 answers with Traefik's default
   self-signed one). A domain proxied through Cloudflare therefore needs SSL mode

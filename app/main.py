@@ -203,11 +203,13 @@ https://shop-coolify.bogdanripa.com, which it keeps. Everything follows the
 hostname: the bundle, the backend, the wake-on-request for a sleeping app and
 the analytics attribution all work on it exactly as on the generated one. Two
 things are NOT done for you, and both fail in ways that look like a platform
-fault. Create the DNS record first — a CNAME to web-coolify.bogdanripa.com for a
-subdomain, an A record to the box's IP for an apex — and if the domain is proxied
-through Cloudflare, set its SSL mode to 'Flexible': this origin serves plain HTTP
-and has no certificate, so a 'Full' mode domain fails on https:// while http://
-works. Keep using the generated hostname for anything internal (CI, crons, one
+fault. Create the DNS record first: an **A record to the box's public IP**,
+proxied — for a subdomain as much as for an apex. A CNAME to
+<something>-coolify.bogdanripa.com looks right and is not: those names are
+themselves proxied by Cloudflare, so the request never leaves Cloudflare and is
+answered there with a 404 that leaves no trace on the box. And if the domain is
+proxied, set its SSL mode to 'Flexible': this origin serves plain HTTP and has no
+certificate, so a 'Full' domain fails on https:// while http:// works. Keep using the generated hostname for anything internal (CI, crons, one
 app calling another): it cannot be removed, and a custom domain can.
 
 Frontends deploy by upload, not by image: apps_frontend_write publishes a small

@@ -239,8 +239,17 @@ stripping the suffix, so a custom domain of `<other-app>-coolify.bogdanripa.com`
 would capture that app's routing and its traffic figures at once.
 
 **DNS and TLS are the caller's.** The wildcard covers only `*.bogdanripa.com`, so
-a custom domain needs a record: CNAME to `web-coolify.bogdanripa.com` for a
-subdomain, an A record to the box's public IP for an apex. TLS is terminated by
+a custom domain needs a record, and it has to be an **A record to the box's
+public IP**, proxied — for a subdomain as much as for an apex. A proxied CNAME to
+`<something>-coolify.bogdanripa.com` does not work, and fails in the way that is
+hardest to attribute: that target is itself a proxied Cloudflare record, so the
+request is handed to the `bogdanripa.com` edge still carrying the custom
+hostname, that zone does not serve it, and Cloudflare answers 404 from inside.
+Nothing reaches the origin, so the box's access log holds no row for it at all —
+which is the check that tells this apart from a routing fault here (a request
+Cloudflare forwarded carries `Cf-Connecting-Ip`; one it answered itself never
+appears). Measured 2026-09-12 on `gepetel.com`, whose zone carried exactly that
+CNAME. TLS is terminated by
 Cloudflare — the origin serves plain HTTP on :80 and has no certificate (:443
 answers with Traefik's default self-signed one), so a proxied domain needs SSL
 mode **Flexible**. Pointed straight at the box with nothing in front, it works on
