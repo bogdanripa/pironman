@@ -1304,6 +1304,23 @@ flows through: the Traefik access log** — nothing is installed per app.
       `smartbill-mcp` was **off by one** over 00:00–23:00Z — 45 `fe-` 5xx against
       44 wake lines — cause not established; treat a residual of one as noise, not
       as a reconciled figure.
+      - **The residual is confined to `smartbill-mcp` and it recurs**, so do not
+        spend a run re-deriving it. Third occurrence 2026-09-13, and the shape
+        narrows it: over a rolling 24h the *other* three sleeping apps that woke
+        closed **exactly on both halves** — `bt-gateway` 6 wakes / 36 retries
+        (6 `fe-` 503s, 30 backend `500`s), `revolut-mcp` 7 / 41 (7, 34),
+        `snake` 9 / 61 (9, 52) — while `smartbill-mcp` (32 wakes / 219 retries)
+        read **33** `fe-` 503s against 32 wake lines *and* **186** backend `500`s
+        against a predicted 187. One extra frontend 503 and one missing backend
+        500, in the same window, in opposite directions. That rules out the two
+        explanations the earlier entries reached for: there were **zero**
+        `still failing` lines, so it is not a failed-wake undercount, and `web`
+        had been up 37h with `RestartCount` 0 and its log's first line well before
+        the cut, so it is not the truncation artefact below. What remains is one
+        wake's worth of frontend 503 with no wake line — mechanism still not
+        established. It shows up on `smartbill-mcp` because it is by far the
+        most-woken app here (32 wakes against 6–9), which is what a race firing
+        once per ~30 wakes would look like; that reading is **unproven**.
     - **The wake log reaches back only to `web`'s last `StartedAt`, so a redeploy
       inside the window silently truncates one whole side of the identity.** Wake
       lines exist *only* in the static host's container log, and Coolify
