@@ -1321,6 +1321,21 @@ flows through: the Traefik access log** — nothing is installed per app.
         established. It shows up on `smartbill-mcp` because it is by far the
         most-woken app here (32 wakes against 6–9), which is what a race firing
         once per ~30 wakes would look like; that reading is **unproven**.
+        **"Recurs" is not "always", and the first low-wake night measured says
+        so.** On 2026-09-14, over a rolling 24h, `smartbill-mcp` woke **19**
+        times and closed **exactly on all four arms** — 19 wake lines, 19 `fe-`
+        `503`s, `analytics_perf.err_server` 19, and 133 retries against 114
+        backend `500`s (predicted 133 − 19 = 114) — with `bt-gateway` 9/53/44
+        and `revolut-mcp` 8/47/39 equally exact and **zero** client-visible 5xx
+        across 1,186 app rows. That is the first night the residual could have
+        appeared and did not, and it arrived immediately after the 09-13
+        occurrence above. It does not settle the mechanism, but it is consistent
+        with the rate reading rather than against it: 19 wakes is below the
+        ~30 the hypothesis needs, so a clean night at this volume is what that
+        hypothesis predicts. Practically: a `smartbill-mcp` reconciliation that
+        closes exactly is **not** evidence that something changed, and one that
+        is off by one is still not a fault — only a residual that scales with
+        wakes, or appears on another app, is new information.
     - **The wake log reaches back only to `web`'s last `StartedAt`, so a redeploy
       inside the window silently truncates one whole side of the identity.** Wake
       lines exist *only* in the static host's container log, and Coolify
