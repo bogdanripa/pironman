@@ -1302,8 +1302,8 @@ flows through: the Traefik access log** — nothing is installed per app.
       backend was already up and answering `502` on its own account, §9c).
       `revolut-mcp` closed exactly too (5 = 5 = 5, 0 client-visible).
       `smartbill-mcp` was **off by one** over 00:00–23:00Z — 45 `fe-` 5xx against
-      44 wake lines — cause not established; treat a residual of one as noise, not
-      as a reconciled figure.
+      44 wake lines — cause not established; treat a small residual as noise, not
+      as a reconciled figure (it has since been 0, 1 and 2 — see below).
       - **The residual is confined to `smartbill-mcp` and it recurs**, so do not
         spend a run re-deriving it. Third occurrence 2026-09-13, and the shape
         narrows it: over a rolling 24h the *other* three sleeping apps that woke
@@ -1318,24 +1318,36 @@ flows through: the Traefik access log** — nothing is installed per app.
         had been up 37h with `RestartCount` 0 and its log's first line well before
         the cut, so it is not the truncation artefact below. What remains is one
         wake's worth of frontend 503 with no wake line — mechanism still not
-        established. It shows up on `smartbill-mcp` because it is by far the
-        most-woken app here (32 wakes against 6–9), which is what a race firing
-        once per ~30 wakes would look like; that reading is **unproven**.
-        **"Recurs" is not "always", and the first low-wake night measured says
-        so.** On 2026-09-14, over a rolling 24h, `smartbill-mcp` woke **19**
-        times and closed **exactly on all four arms** — 19 wake lines, 19 `fe-`
-        `503`s, `analytics_perf.err_server` 19, and 133 retries against 114
-        backend `500`s (predicted 133 − 19 = 114) — with `bt-gateway` 9/53/44
-        and `revolut-mcp` 8/47/39 equally exact and **zero** client-visible 5xx
-        across 1,186 app rows. That is the first night the residual could have
-        appeared and did not, and it arrived immediately after the 09-13
-        occurrence above. It does not settle the mechanism, but it is consistent
-        with the rate reading rather than against it: 19 wakes is below the
-        ~30 the hypothesis needs, so a clean night at this volume is what that
-        hypothesis predicts. Practically: a `smartbill-mcp` reconciliation that
-        closes exactly is **not** evidence that something changed, and one that
-        is off by one is still not a fault — only a residual that scales with
-        wakes, or appears on another app, is new information.
+        established. **The `+1 fe` / `−1 be` pairing is the unit**, and it is
+        what recurs; it was tempting to read it as a race firing about once per
+        ~30 wakes, since `smartbill-mcp` is by far the most-woken app here, but
+        **the measured series now contradicts that** and the rate reading should
+        not be reached for again. Four nights, each a rolling 24h reconciled on
+        all four arms:
+
+        | night | `smartbill-mcp` wakes | residual (`fe` / `be`) |
+        |---|---|---|
+        | 2026-09-09 | 44 | +1 / −1 |
+        | 2026-09-13 | 32 | +1 / −1 |
+        | 2026-09-14 | 19 | 0 |
+        | 2026-09-15 | 16 | **+2 / −2** |
+
+        The largest residual yet fell on the **fewest** wakes, so it does not
+        scale with wake count and 09-14's clean night is not "below the
+        threshold" — it is just a night it did not happen. What survives is
+        narrower and firmer: the anomaly comes in whole `+1 fe` / `−1 be` units
+        (09-15 was that unit twice over, exactly), it is `smartbill-mcp`-only
+        across all four nights, and its mechanism is **unestablished**. On
+        09-15 the other three closed exactly — `bt-gateway` 5 wakes / 22 retries
+        (5, 17), `revolut-mcp` 4 / 19 (4, 15), `snake` 6 / 46 (6, 40) — with
+        `analytics_perf.err_server` matching the `fe-` column app for app
+        (5 / 4 / 18 / 6, `smartbill-mcp` included, so `err_server` tracks the
+        frontend leg and inherits the same +2) and **zero** client-visible 5xx
+        across 1,174 app rows; 09-14 was `bt-gateway` 9/53/44 and `revolut-mcp`
+        8/47/39, equally exact. Practically: a `smartbill-mcp` reconciliation
+        that closes exactly is **not** evidence that something changed, and a
+        small residual is still not a fault — only one that appears on another
+        app, or that grows beyond a couple of units, is new information.
     - **The wake log reaches back only to `web`'s last `StartedAt`, so a redeploy
       inside the window silently truncates one whole side of the identity.** Wake
       lines exist *only* in the static host's container log, and Coolify
