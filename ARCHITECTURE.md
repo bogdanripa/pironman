@@ -1196,6 +1196,48 @@ flows through: the Traefik access log** — nothing is installed per app.
   Still **not** done: nothing warns when a pass reads a full window whose oldest
   line is newer than the cursor, so an overrun stays silent — the guard is an
   open call.
+- **A request still in flight when a pass runs is dropped for good, and the
+  cursor is why.** Traefik stamps `StartUTC` at the request's **start** but
+  writes the line at its **completion**, so the access log is not ordered by the
+  field the cursor keys on — 4,623 of the 22,989 rows on disk on 2026-09-16 were
+  out of `StartUTC` order. The cursor advances to `max(newest, horizon)`, the
+  newest `StartUTC` in the read, and the next pass then skips every
+  `rec["start"] <= cursor` as "already counted in an earlier pass". A line
+  written *after* the cursor has passed its start time therefore lands below the
+  cursor and is never counted. The comment on that advance states the premise
+  outright — "everything up to here has been examined, so re-reading it can only
+  find what was already counted" — and it is false for exactly as long as the
+  longest request in flight.
+  **The loss tracks request duration and nothing else**, which is why it hid for
+  so long: almost every app here answers in under a second and reconciles
+  request-for-request. Measured 2026-09-16 against the proxy log, for the two
+  apps where an exact reconciliation is possible at all (single-leg, no custom
+  domain — `gepetel` serves `gepetel.com` too, and `wa-gateway` is fronted, so
+  its rollup is legitimately ~half its log rows):
+
+  | app-day | log rows | `analytics_perf` | lost | dur p90 |
+  |---|---|---|---|---|
+  | `auditzel` 09-15 | 28 / 8 / 0 | 28 / 8 / 0 | 0 | 0.00s |
+  | `api` 09-15 | 45 / 6 / 0 | 45 / 6 / 0 | 0 | 1.24s |
+  | `api` 09-16 | **107 / 11 / 1** | **83 / 6 / 0** | **24** | **24.01s** |
+
+  All 107 of that day's rows were already at or below the cursor, so the ingest
+  had passed over every one. The victim is **the control plane itself**: MCP is
+  a streaming transport, so `api` is the one app whose requests routinely run
+  tens of seconds (p90 24.0s, 15 requests over 10s, max 63.8s that day). The
+  cost is not the request count — it is that `analytics_perf.err_server` read
+  **0** while the proxy log held a real `500`, and `err_server` is the
+  independent route §11 and §12 lean on for "did the api serve a 5xx". A failure
+  answered with something that looks like success.
+  **Not fixed**, deliberately: `analytics_perf` accumulates with `+ EXCLUDED`,
+  so a de-dup that is even slightly wrong inflates the rollups permanently and
+  cannot be cleanly undone. A fix needs either a re-read overlap window plus a
+  per-line dedupe key, or a ledger of counted lines — a design call, not a
+  nightly repair. Until then, **do not read `err_server` as authoritative for
+  `api`**; count from the proxy log.
+  One trap when reconciling: `sorted(glob(...json.log*))` puts the **current**
+  file before `.log.1`, so rows read that way are not in chronological order and
+  any running-max computed over them is meaningless. Sort by `StartUTC`.
 - **The stall test asks whether OUR lines were counted, never how old the cursor
   is.** The cursor advances to the newest line the read reached
   (`max(newest, horizon)`), and `horizon` moves on *any* stamped line — including
@@ -1651,6 +1693,19 @@ symptom and the platform's own status agreed with it.
   not to contain ` ERR `. Parse the wrapper instead (read each line as JSON,
   then `json.loads` its `log` field); if you must grep, use the bare token or
   `grep -F` on the escaped form.
+- **The access log is not sorted by `StartUTC`, so the ingest cursor silently
+  drops every request that was still in flight when the previous pass ran.**
+  Traefik stamps `StartUTC` at a request's start and writes the line at its
+  completion; the cursor advances to the newest `StartUTC` seen and the next
+  pass skips anything at or below it as already counted. Signature: an app whose
+  requests are slow loses rows while every fast app reconciles exactly — on
+  2026-09-16 `api` (MCP streaming, dur p90 **24.01s**) logged 107 rows against
+  `analytics_perf`'s 83, losing 5 of 11 `4xx` **and the only `5xx`**, while
+  `api` the day before (p90 1.24s) and `auditzel` (p90 0.00s) matched
+  request-for-request. The control plane is the worst-affected app on the box,
+  so `err_server` is least trustworthy exactly where §11 leans on it hardest.
+  Count `api` errors from the proxy log. Full measurement and why it is not yet
+  fixed: §10.
 - **If Traefik starts without a working Docker socket, every sleeping app
   hard-503s and it is not Sablier's fault.** Signature, from the aborted first
   boot after the 2026-08-31 power restore: `Plugins are disabled because an
