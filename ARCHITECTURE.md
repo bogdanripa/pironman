@@ -1196,45 +1196,65 @@ flows through: the Traefik access log** — nothing is installed per app.
   Still **not** done: nothing warns when a pass reads a full window whose oldest
   line is newer than the cursor, so an overrun stays silent — the guard is an
   open call.
-- **A request still in flight when a pass runs is dropped for good, and the
-  cursor is why.** Traefik stamps `StartUTC` at the request's **start** but
-  writes the line at its **completion**, so the access log is not ordered by the
-  field the cursor keys on — 4,623 of the 22,989 rows on disk on 2026-09-16 were
-  out of `StartUTC` order. The cursor advances to `max(newest, horizon)`, the
-  newest `StartUTC` in the read, and the next pass then skips every
-  `rec["start"] <= cursor` as "already counted in an earlier pass". A line
-  written *after* the cursor has passed its start time therefore lands below the
-  cursor and is never counted. The comment on that advance states the premise
-  outright — "everything up to here has been examined, so re-reading it can only
-  find what was already counted" — and it is false for exactly as long as the
-  longest request in flight.
-  **The loss tracks request duration and nothing else**, which is why it hid for
-  so long: almost every app here answers in under a second and reconciles
-  request-for-request. Measured 2026-09-16 against the proxy log, for the two
-  apps where an exact reconciliation is possible at all (single-leg, no custom
-  domain — `gepetel` serves `gepetel.com` too, and `wa-gateway` is fronted, so
-  its rollup is legitimately ~half its log rows):
-
-  | app-day | log rows | `analytics_perf` | lost | dur p90 |
-  |---|---|---|---|---|
-  | `auditzel` 09-15 | 28 / 8 / 0 | 28 / 8 / 0 | 0 | 0.00s |
-  | `api` 09-15 | 45 / 6 / 0 | 45 / 6 / 0 | 0 | 1.24s |
-  | `api` 09-16 | **107 / 11 / 1** | **83 / 6 / 0** | **24** | **24.01s** |
-
-  All 107 of that day's rows were already at or below the cursor, so the ingest
-  had passed over every one. The victim is **the control plane itself**: MCP is
-  a streaming transport, so `api` is the one app whose requests routinely run
-  tens of seconds (p90 24.0s, 15 requests over 10s, max 63.8s that day). The
-  cost is not the request count — it is that `analytics_perf.err_server` read
-  **0** while the proxy log held a real `500`, and `err_server` is the
-  independent route §11 and §12 lean on for "did the api serve a 5xx". A failure
-  answered with something that looks like success.
-  **Not fixed**, deliberately: `analytics_perf` accumulates with `+ EXCLUDED`,
-  so a de-dup that is even slightly wrong inflates the rollups permanently and
-  cannot be cleanly undone. A fix needs either a re-read overlap window plus a
-  per-line dedupe key, or a ledger of counted lines — a design call, not a
-  nightly repair. Until then, **do not read `err_server` as authoritative for
-  `api`**; count from the proxy log.
+- **A reboot freezes the cursor completely, for hours, and the traffic in that
+  window is then skipped forever.** This is the `--tail` gap cliff above, but
+  arriving from the other side and with far worse consequences, and it is not
+  theoretical: it happened on **2026-09-16**.
+  The mechanism is the cliff plus the cursor. A reboot puts a fresh gap in the
+  proxy's log stream, and `_read_since` asks for `--tail MAX_LINES`
+  unconditionally. Immediately after the gap there are only a few hundred lines
+  newer than it, so a 5000-line request reaches straight past it and comes back
+  with a window that ends *before* the gap — every line in it older than the
+  cursor. `horizon` starts at the cursor and can only rise, `newest` never
+  moves, so `mark == cursor` and **the cursor is not written at all**. The next
+  pass does the same thing. It repeats until roughly `MAX_LINES` lines have
+  accumulated since the gap, at which point `--tail` stops over-reaching, the
+  read finally returns the recent window, and the cursor jumps from where it
+  froze to the newest line in that window — **skipping everything in between
+  that the read never covered**.
+  On 2026-09-16 the box lost power at 07:01:03Z and the cursor froze at
+  `06:59:45` for **7h41m**, until `14:40:52`. The whole time the ingest logged
+  `analytics: cursor was N minutes behind; catching up from the last 5000 log
+  lines` every pass — **200 of them**, with N climbing 62 → 461 in steps of
+  exactly 2, the pass interval, which is the tell that the cursor is pinned
+  rather than merely lagging. That warning is **informational only**: it does
+  not change the read, and `_read_since` has no catch-up path to take.
+  **`platform_tasks_health` said `analytics_ingest` was healthy throughout**,
+  because the loop kept completing on time — a pass that counts nothing still
+  completes.
+  The loss is real and was confirmed three ways. `auditzel` is the clean case:
+  single-leg, no custom domain, 72 rows that day, of which **70 fall before the
+  freeze (04:43–05:00) and exactly 2 inside it (14:01:47Z)**. `analytics_perf`
+  holds **70**, and `analytics_last_seen` is frozen at **05:00:05** while the
+  cursor sits at 23:19 — so those two requests were stepped over, not delayed.
+  `dashboard`'s single request that day was also inside the window and is absent
+  from both tables entirely. In total **484 `-coolify` rows, 184 of them client
+  legs**, plus the `gepetel.com` custom-domain rows, are permanently missing.
+  For `api` the day reconciles exactly once the window is excluded: 116 rows =
+  19 inside the freeze (**5 of its 11 `4xx` and its only `5xx`**) + 96 countable
+  + 1 pending, against `analytics_perf`'s 93 / 6 / 0 where 96 / 6 / 0 was due —
+  the `4xx` and `5xx` columns match to the row. That missing `5xx` is why
+  `err_server` read **0** for a day the proxy log holds a real `500`: §11 and
+  §12 lean on `err_server` as the independent route for "did the api serve a
+  5xx", and after any reboot it is not one.
+  **Not fixed.** The narrow repair is to stop asking `--tail` for more lines
+  than exist since the last gap; the honest one is for the cursor to refuse to
+  advance across a window it could not read contiguously. Either needs care,
+  because `analytics_perf` accumulates with `+ EXCLUDED`, so a re-read that
+  double-counts inflates the rollups permanently and cannot be cleanly undone.
+  Until then: **after a reboot, treat every rollup as incomplete until the
+  warnings stop**, and count from the proxy log instead.
+  Do **not** reach for the tempting alternative explanation. Traefik does stamp
+  `StartUTC` at a request's start and write the line at its completion, so the
+  log genuinely is not sorted by the field the cursor keys on (4,623 of 22,989
+  rows out of order on 2026-09-16), and `rec["start"] <= cursor` genuinely would
+  drop a line written late. That story was built first here, on the correlation
+  that `api` — the one app with long requests, MCP being a streaming transport,
+  dur p90 24.0s that day — was also the app visibly losing rows. The correlation
+  was **confounded**: 09-16 was the reboot day too, and once the freeze window
+  is excluded the residual is ~2 requests and **zero** error rows. The
+  in-flight path remains reachable in code and unquantified; it was not what
+  happened.
   One trap when reconciling: `sorted(glob(...json.log*))` puts the **current**
   file before `.log.1`, so rows read that way are not in chronological order and
   any running-max computed over them is meaningless. Sort by `StartUTC`.
@@ -1693,19 +1713,22 @@ symptom and the platform's own status agreed with it.
   not to contain ` ERR `. Parse the wrapper instead (read each line as JSON,
   then `json.loads` its `log` field); if you must grep, use the bare token or
   `grep -F` on the escaped form.
-- **The access log is not sorted by `StartUTC`, so the ingest cursor silently
-  drops every request that was still in flight when the previous pass ran.**
-  Traefik stamps `StartUTC` at a request's start and writes the line at its
-  completion; the cursor advances to the newest `StartUTC` seen and the next
-  pass skips anything at or below it as already counted. Signature: an app whose
-  requests are slow loses rows while every fast app reconciles exactly — on
-  2026-09-16 `api` (MCP streaming, dur p90 **24.01s**) logged 107 rows against
-  `analytics_perf`'s 83, losing 5 of 11 `4xx` **and the only `5xx`**, while
-  `api` the day before (p90 1.24s) and `auditzel` (p90 0.00s) matched
-  request-for-request. The control plane is the worst-affected app on the box,
-  so `err_server` is least trustworthy exactly where §11 leans on it hardest.
-  Count `api` errors from the proxy log. Full measurement and why it is not yet
-  fixed: §10.
+- **A reboot freezes the analytics cursor for hours and the traffic in that
+  window is lost, while every health check reports fine.** `--tail MAX_LINES`
+  over-reaches the fresh gap and returns a window older than the cursor, so the
+  cursor is never written; it stays pinned until ~`MAX_LINES` lines accumulate
+  after the gap, then jumps past everything the reads never covered. Signature:
+  `analytics: cursor was N minutes behind; catching up from the last 5000 log
+  lines` repeating with N rising by exactly the pass interval — pinned, not
+  lagging — while `platform_tasks_health` shows `analytics_ingest` healthy,
+  because a pass that counts nothing still completes on time. On 2026-09-16 the
+  07:01:03Z power loss pinned it at `06:59:45` for **7h41m** and 200 such
+  warnings; **484 `-coolify` rows (184 client legs) are permanently missing**,
+  including `api`'s only `5xx` that day — which is why `err_server` read `0`
+  against a proxy log holding a real `500`. After any reboot, treat the rollups
+  as incomplete until the warnings stop and count from the proxy log. Full
+  measurement, the three-way confirmation, and the plausible-but-wrong
+  explanation to avoid: §10.
 - **If Traefik starts without a working Docker socket, every sleeping app
   hard-503s and it is not Sablier's fault.** Signature, from the aborted first
   boot after the 2026-08-31 power restore: `Plugins are disabled because an
