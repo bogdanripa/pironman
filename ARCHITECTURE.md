@@ -1353,8 +1353,8 @@ flows through: the Traefik access log** — nothing is installed per app.
     - **A wake that fails is still a wake, and it logs a different sentence.**
       `served in` is only the success shape; a wake the retry budget runs out on
       logs `WARNING: wake <id>: still failing after Xs — probe …, sablier …, N
-      retries; passing the backend's <code> through`, and it emits its `fe-<id>`
-      `503` like any other. So count **both** shapes, or the identity above breaks
+      retries; passing the backend's <code> through`, and it emits a `fe-<id>` 5xx
+      like any other. So count **both** shapes, or the identity above breaks
       by exactly the number of failed wakes. Verified 2026-09-09 on `bt-gateway`:
       25 `served in` + 4 `still failing` = **29**, matching 29 `fe-` 5xx exactly,
       while counting only `served in` gives 25 and leaves four phantom 5xx looking
@@ -1363,6 +1363,33 @@ flows through: the Traefik access log** — nothing is installed per app.
       client-visible `502`s (the four failed wakes, `sablier 0.01–0.04s` — the
       backend was already up and answering `502` on its own account, §9c).
       `revolut-mcp` closed exactly too (5 = 5 = 5, 0 client-visible).
+      - **But a failed wake's `fe-` row is not a `503`, and it is not on the
+        internal leg** — so the §11 client-vs-internal partition splits the two
+        wake shapes into *different buckets*, and `fe-<id>` 5xx must be counted
+        across **both** legs or the identity breaks again, by the same number of
+        failed wakes it was just fixed for. A **served** wake's `fe-` 5xx is
+        Sablier's own blocking `503`, emitted while `web` holds the request, so it
+        carries `ClientHost ==` `web`'s address (internal leg). A **failed** wake's
+        `fe-` row is the backend's code handed back to the caller, so it carries
+        the passed-through status (`502`, not `503`) *and* `ClientHost ==` the
+        gateway — it **is** the client-visible 5xx, not a second event beside one.
+        Measured 2026-09-17: `bt-gateway` 1 `served in` + 3 `still failing` = 4
+        wake lines, and its 4 `fe-` 5xx were 1 internal `503` + 3 client `502` on
+        `/api/v1/orders?statuses=OPEN` (same app serving `200` 16s later, §9c).
+        Bucketing only the internal leg gives **1** against 4 wake lines and reads
+        exactly like a 3-row phantom deficit. Whole-night tally, both legs:
+        `fe-` 5xx **21** == 18 `served in` + 3 `still failing`, and per-app
+        `analytics_perf.err_server` matched app for app (`bt-gateway` 4,
+        `smartbill-mcp` 13, `snake` 3, `revolut-mcp` 1) — `smartbill-mcp` exact,
+        no residual that night.
+        **Caveat, unresolved:** on that reading `err_server == fe-` 5xx `==` wake
+        lines, and adding a separate `+ client-visible 5xx` term double-counts the
+        failed wakes (it would predict `bt-gateway` 7, the box said 4). The
+        2026-09-09 figure above (33 = 29 + 4) is therefore not reproduced, and
+        that day's log is long rotated away, so which of the two forms is general
+        is **not established**. Count `fe-` 5xx over both legs — that is the term
+        measured directly both times — and treat the `+ client-visible` form as
+        applying only when the client-visible 5xx are *not* themselves `fe-` rows.
       `smartbill-mcp` was **off by one** over 00:00–23:00Z — 45 `fe-` 5xx against
       44 wake lines — cause not established; treat a small residual as noise, not
       as a reconciled figure (it has since been 0, 1 and 2 — see below).
