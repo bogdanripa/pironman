@@ -186,6 +186,35 @@ to list containers by app name, state and restart policy.
   pass the fd to uvicorn (see `web/run.py`). Port 80 is privileged → run as root.
   Verify from *outside* the container; `localhost` will lie to you.
 
+### 4a. How traffic reaches the box — two paths, not one
+
+**The box has no public address.** `wlan0` is `192.168.86.250/24` behind a home
+router and its only global IPv6 is a ULA (`fdf1:…`); the public `5.12.126.43` is
+the router's, and is what the box reports as its own egress IP. So nothing
+reaches Traefik directly, and there are exactly two ways in — which matters
+because **they present different source addresses to the access log**:
+
+| | path | `ClientHost` at Traefik |
+|---|---|---|
+| `*-coolify.bogdanripa.com` | **Cloudflare Tunnel**: `cloudflared.service` on the host (`tunnel run --token-file /etc/cloudflared/token`) dials `[::1]:80`, which the ip6tables `DOCKER` chain skips (`-A OUTPUT ! -d ::1/128`), so `docker-proxy` relays it in userland and rewrites the source | the bridge **gateway**, `fddf:6e69:23a7::1` |
+| a **custom domain** | Cloudflare edge → the public IPv4 → the router → the box's `:80` → ip4tables `DNAT`, which preserves the source | the real **Cloudflare edge IP** (`104.23.…`, `141.101.…`) |
+
+Observed 2026-09-19 as a live socket chain — `cloudflared` pid 929
+`[::1]:57082 → [::1]:80`, then `docker-proxy` pid 2749
+`[fddf:6e69:23a7::1]:42542 → [fddf:6e69:23a7::b]:80` — and corroborated over 24h
+of access log: **no** `-coolify` row carried a Cloudflare address (464 `web`, 252
+gateway, 48 `10.0.1.1`) and **none** of `gepetel.com`'s 1,094 client legs carried
+the gateway. A clean split, so the two paths do not mix. The custom-domain hop
+through the router is inferred from the DNAT rule and the absence of any other
+route in; it was not observed at the router itself.
+
+Three consequences. A custom domain's availability rests on a **port-forward the
+tunnel does not use**, so the two can fail independently and a tunnel outage
+would leave custom domains up (and the reverse). `Cf-Connecting-Ip` does **not**
+tell the paths apart — it was present on 255/255 gateway-sourced `-coolify` rows
+as well as on all 2,300 `gepetel.com` rows. And the §10 client-leg discriminator
+is scoped to the tunnel path only; see there.
+
 ### 4b. Custom domains
 
 An app can answer on hostnames of its own **in addition to** the generated one
@@ -249,7 +278,12 @@ Nothing reaches the origin, so the box's access log holds no row for it at all �
 which is the check that tells this apart from a routing fault here (a request
 Cloudflare forwarded carries `Cf-Connecting-Ip`; one it answered itself never
 appears). Measured 2026-09-12 on `gepetel.com`, whose zone carried exactly that
-CNAME. TLS is terminated by
+CNAME. **The A-record fix has since landed and is confirmed working**: on
+2026-09-19 `gepetel.com` served 2,300 access-log rows, every one carrying
+`Cf-Connecting-Ip` — so the requests now arrive — and 112 of them `200` on
+`fe-gepetel`. The rest were `404`s the app itself returned to WordPress scanners
+(`/wp-admin/install.php`, `/wp-json/batch/v1`), not a routing fault. Note this
+path bypasses the tunnel entirely (§4a). TLS is terminated by
 Cloudflare — the origin serves plain HTTP on :80 and has no certificate (:443
 answers with Traefik's default self-signed one), so a proxied domain needs SSL
 mode **Flexible**. Pointed straight at the box with nothing in front, it works on
@@ -1411,7 +1445,7 @@ flows through: the Traefik access log** — nothing is installed per app.
         what recurs; it was tempting to read it as a race firing about once per
         ~30 wakes, since `smartbill-mcp` is by far the most-woken app here, but
         **the measured series now contradicts that** and the rate reading should
-        not be reached for again. Four nights, each a rolling 24h reconciled on
+        not be reached for again. Five nights, each a rolling 24h reconciled on
         all four arms:
 
         | night | `smartbill-mcp` wakes | residual (`fe` / `be`) |
@@ -1420,6 +1454,7 @@ flows through: the Traefik access log** — nothing is installed per app.
         | 2026-09-13 | 32 | +1 / −1 |
         | 2026-09-14 | 19 | 0 |
         | 2026-09-15 | 16 | **+2 / −2** |
+        | 2026-09-19 | 23 | **+2 / −2** |
 
         The largest residual yet fell on the **fewest** wakes, so it does not
         scale with wake count and 09-14's clean night is not "below the
@@ -1433,7 +1468,11 @@ flows through: the Traefik access log** — nothing is installed per app.
         (5 / 4 / 18 / 6, `smartbill-mcp` included, so `err_server` tracks the
         frontend leg and inherits the same +2) and **zero** client-visible 5xx
         across 1,174 app rows; 09-14 was `bt-gateway` 9/53/44 and `revolut-mcp`
-        8/47/39, equally exact. Practically: a `smartbill-mcp` reconciliation
+        8/47/39, equally exact; 09-19 was `snake` 2 wakes / 18 retries (2, 16),
+        `revolut-mcp` 2 / 13 (2, 11) and `bt-gateway` 2 / 12 (2, 10) — all three
+        exact on both arms — against `smartbill-mcp` 23 / 158 reading 25 `fe-`
+        and 133 backend `500`s for a predicted 23 and 135. Practically: a
+        `smartbill-mcp` reconciliation
         that closes exactly is **not** evidence that something changed, and a
         small residual is still not a fault — only one that appears on another
         app, or that grows beyond a couple of units, is new information.
@@ -1511,6 +1550,22 @@ flows through: the Traefik access log** — nothing is installed per app.
     dispatcher). Verified 2026-08-26 over 1034 `-coolify` rows: a positive match
     on `::1` and an exclusion of {`web`, `10.0.1.1`} selected the **same 369
     rows**, and 0 of those 369 carried a trailing `?`.
+    - **But that key is scoped to the `-coolify` hosts, because it is really the
+      *tunnel's* address (§4a) — on a custom domain it inverts.** A custom
+      domain does not come through `cloudflared`; it arrives by IPv4 DNAT, which
+      preserves the source, so its client legs carry the **Cloudflare edge IP**
+      and never the gateway. Keyed on `== ::1` a custom domain therefore reads as
+      **100% internal traffic and zero client-visible 5xx**, which is the failure
+      shape this whole section exists to avoid. Measured 2026-09-19: all 1,094
+      `fe-gepetel` client legs on `gepetel.com` carried `104.23.…`/`141.101.…`
+      and 0 carried the gateway, while the same day's `-coolify` rows carried no
+      Cloudflare address at all. **The general key is the complement, and it
+      covers both paths**: build the container→address map from `docker network
+      inspect coolify` and call a row a client leg when its `ClientHost` is *not*
+      in that map and is not `10.0.1.1`. On `-coolify` hosts that selects exactly
+      what `== ::1` does; on a custom domain it is the only one of the two that
+      works. This only became reachable once a custom domain started arriving at
+      all — before the 2026-09-12 A-record fix (§4b) none did.
   - **Restrict to `-coolify` hosts *before* counting anything, or the number is
     mostly scanners.** Most 5xx the proxy logs belong to no app at all: an
     unrouted host matches `catchall@file`, which has no `ServiceName` and answers
