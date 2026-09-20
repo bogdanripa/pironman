@@ -42,6 +42,10 @@ def free_port():
 
 
 WEB_PORT, PROXY_PORT, SABLIER_PORT = free_port(), free_port(), free_port()
+# Stands in for anything the static host can reach but must never be asked to:
+# the Sablier controller's admin API, coolify, another app's container. A forward
+# that lands here means the caller chose the upstream, not us.
+ROGUE_PORT = free_port()
 
 os.environ["FRONTEND_ROOT"] = str(ROOT)
 os.environ["DOMAIN_SUFFIX"] = "-test.local"
@@ -66,7 +70,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
 
 STATE = {"up": False, "wakes": 0, "sablier_ok": True, "seen_host": None,
          "seen_xfh": None, "asked_by": None, "gateway": 0,
-         "transient500": 0}
+         "transient500": 0, "rogue": 0, "seen_raw": None, "seen_query": None}
 
 proxy = FastAPI()
 
@@ -96,6 +100,10 @@ async def route(request: Request, p: str = ""):
         # backend router matched -> the app itself
         STATE["seen_host"] = request.headers.get("host")
         STATE["seen_xfh"] = request.headers.get("x-forwarded-host")
+        # The bytes as the caller sent them, not the decoded path: the whole
+        # point of _upstream_url is that %2F and %3F survive the hop.
+        STATE["seen_raw"] = request.scope.get("raw_path")
+        STATE["seen_query"] = (request.scope.get("query_string") or b"").decode()
         if request.url.path == "/sse":
             from fastapi.responses import StreamingResponse
             async def gen():
@@ -113,10 +121,19 @@ async def route(request: Request, p: str = ""):
         if request.url.path.startswith("/api/"):
             return JSONResponse({"backend": True, "path": request.url.path})
         return JSONResponse({"error": "not_found"}, status_code=404)
-    # frontend router matched -> back to the static host
+    # frontend router matched -> back to the static host.
+    #
+    # Forwarded from the RAW target, query included. Real Traefik relays the
+    # request line it received; re-composing it from the decoded path made this
+    # hop lossy in exactly the place the static host's own URL handling is
+    # delicate — `%2F` and `%3F` arrived already flattened, and the query was
+    # dropped — so a test could not see either bug through it.
+    raw = (request.scope.get("raw_path") or b"").decode() or request.url.path
+    q = (request.scope.get("query_string") or b"").decode()
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.request(
-            request.method, f"http://127.0.0.1:{WEB_PORT}{request.url.path}",
+            request.method,
+            f"http://127.0.0.1:{WEB_PORT}{raw}" + (f"?{q}" if q else ""),
             headers={k: v for k, v in request.headers.items()},
             content=await request.body())
     return PlainTextResponse(r.text, status_code=r.status_code,
@@ -153,6 +170,17 @@ serve(server.app, WEB_PORT)
 serve(proxy, PROXY_PORT)
 serve(sablier, SABLIER_PORT)
 
+rogue = FastAPI()
+
+
+@rogue.api_route("/{p:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
+async def rogue_route(p: str = ""):
+    STATE["rogue"] += 1
+    return PlainTextResponse("PWNED")
+
+
+serve(rogue, ROGUE_PORT)
+
 
 async def main():
     await asyncio.sleep(1.2)
@@ -175,6 +203,24 @@ async def main():
               r.status_code == 200 and r.json().get("backend"), r.text[:60])
         check("backend sees the REAL public host",
               STATE["seen_host"] == "demo-test.local", STATE["seen_host"])
+
+        # An encoded slash used to move the upstream authority: the decoded path
+        # started `//`, which is an RFC 3986 network-path reference, so the URL
+        # join replaced the proxy with a host of the caller's choosing.
+        STATE["rogue"] = 0
+        r = await c.get(base + f"/%2F127.0.0.1:{ROGUE_PORT}%2Fpwn", headers=H)
+        check("an encoded slash cannot redirect the forward off-platform",
+              STATE["rogue"] == 0 and "PWNED" not in r.text,
+              f"{r.status_code} rogue={STATE['rogue']} {r.text[:40]}")
+        # Same shape, unresolvable: this is what the box logged — the whole retry
+        # budget spent on a name the caller invented, then our own 502.
+        r = await c.get(base + "/%2Fnot-a-host.invalid%2Fx", headers=H)
+        check("an encoded slash is a path, not a 502 from a failed lookup",
+              r.status_code != 502, r.status_code)
+        r = await c.get(base + "/api/a%2Fb%3Fc?q=1", headers=H)
+        check("the backend sees the path encoded as the caller sent it",
+              STATE["seen_raw"] == b"/api/a%2Fb%3Fc" and STATE["seen_query"] == "q=1",
+              f"{STATE['seen_raw']!r} query={STATE['seen_query']!r}")
         r = await c.get(base + "/deep/link", headers={**H, "Accept": "text/html"})
         check("a browser deep link is a 404, not the homepage",
               r.status_code == 404 and "MARKETING PAGE" not in r.text,

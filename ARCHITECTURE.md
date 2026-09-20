@@ -1384,12 +1384,26 @@ flows through: the Traefik access log** — nothing is installed per app.
     app for app) and 144·19·13 backend `500`s, every figure exact. Two independent
     partitions of the same day already agreed there were **zero** client-visible
     5xx; this was the third.
-    - **A wake that fails is still a wake, and it logs a different sentence.**
-      `served in` is only the success shape; a wake the retry budget runs out on
+    - **A wake that fails is still a wake, and it logs a different sentence —
+      there are three shapes, not two.** `served in` is only the success shape; a
+      wake the retry budget runs out on
       logs `WARNING: wake <id>: still failing after Xs — probe …, sablier …, N
       retries; passing the backend's <code> through`, and it emits a `fe-<id>` 5xx
-      like any other. So count **both** shapes, or the identity above breaks
-      by exactly the number of failed wakes. Verified 2026-09-09 on `bt-gateway`:
+      like any other. So count **all** shapes, or the identity above breaks
+      by exactly the number of failed wakes.
+      The third is `WARNING: wake <id>: UNREACHABLE after Xs — probe …, sablier
+      …, N retries`, logged when *every* hop failed at the connection level so
+      `_send` never got a response at all. It is the odd one out twice over:
+      `sablier` reads `0.00s` because the Sablier call is inside `if sent:` and so
+      never ran, and it is the only shape that leaves **no internal-leg row** —
+      the forward never reached Traefik, so the proxy log holds the client's
+      `fe-<id>` `502` and nothing else. A reconciliation that expects an internal
+      row per wake will read it as a phantom deficit. Observed 3× on 2026-09-20,
+      all `gepetel`, all the `%2F` URL-composition bug in §12; measured then at
+      `5.17–5.30s` with 15–19 retries, which is `GATEWAY_RETRY_BUDGET` (5s) at
+      `WAKE_RETRY_DELAY` (0.25s), not the 15s sleeping-app budget — `_send`
+      returning `None` fails the `sent and _is_down(...)` test, so the short
+      budget applies. Verified 2026-09-09 on `bt-gateway`:
       25 `served in` + 4 `still failing` = **29**, matching 29 `fe-` 5xx exactly,
       while counting only `served in` gives 25 and leaves four phantom 5xx looking
       unexplained. That same day showed the `err_server` term the two earlier
@@ -2040,6 +2054,36 @@ symptom and the platform's own status agreed with it.
   the preceding line for the paired `400` and confirm the 5xx count is zero;
   a real api fault shows up as 5xx in both of those places, not only as a
   traceback.
+- **A percent-decoded path is not a URL component — re-composing one moved the
+  static host's upstream to whatever the caller named.** ASGI hands `scope["path"]`
+  over already decoded, and `_send` built the forward with
+  `httpx.URL(PROXY).join(request.url.path)`. So `/%2Fsablier:10000%2Fhealth`
+  decoded to `//sablier:10000/health`, which RFC 3986 reads as a **network-path
+  reference** — `join` keeps the scheme and *replaces the authority*, dropping
+  `coolify-proxy` entirely. Every fronted app's public hostname was therefore an
+  open SSRF onto anything the static host can reach (the Sablier controller's
+  admin API, `coolify`, `coolify-db`, any app's container), with our own
+  `X-Pironman-Backend` marker attached and the reply streamed back to the caller.
+  Proven four ways on 2026-09-20: `httpx.URL("http://coolify-proxy").join("//sablier:10000/x")`
+  → `host='sablier' port=10000` inside the *running* web container; a live
+  `curl -H 'Host: gepetel.com' --path-as-is http://127.0.0.1/%2Fsablier:10000%2Fhealth`
+  → `200 OK`, byte-identical to a direct `GET http://10.0.1.6:10000/health`, while
+  gepetel's own `/health` returns an Express 404 page; and `web/tests/test_server.py`
+  reaching a deliberately planted rogue server. The **signature in the wild is the
+  failure case, not the success**: a host that does not resolve makes every hop
+  raise, so the whole `GATEWAY_RETRY_BUDGET` is spent on a name the caller invented
+  and the client gets `502 {"error":"backend unreachable"}` — three of those on
+  2026-09-20 at `05:13:12Z`, a scanner probing `/%2F.env`,
+  `/%2Fbackend%2F.env`, `/%2F.aws%2Fcredentials` on `gepetel.com` (§11's third
+  wake shape). Two smaller bugs came from the same root: `%3F` in the path decoded
+  to `?`, so `join` read the rest of the path as a query and the following
+  `copy_with(query=…)` dropped it; and `request.url.query` is itself polluted,
+  because Starlette composes `request.url` by concatenating the **decoded** path
+  with the query string, so `urlsplit` hands back everything after that injected
+  `?` as the query — `/a%3Fb?real=1` read as `b?real=1`, compounding once per hop
+  (`c?c?c?q=1` after three). Forward from `scope["raw_path"]` and
+  `scope["query_string"]` via `copy_with(raw_path=…)`, which never re-parses the
+  authority; `join` on anything client-supplied is the bug.
 - **A shell "on the host" from inside a container inherits the container** —
   nsenter passes the caller's environment through and resolves `--wd` *before*
   the namespace switch, so a host shell needs `env -i` and a `cd /` run inside
@@ -2062,7 +2106,14 @@ symptom and the platform's own status agreed with it.
 host up against a fake Traefik and a fake Sablier and drives the paths that have
 actually broken: a woken backend, a dead one (which must 502, not quietly serve
 the homepage), the 404 / `404.html` / `spa` fork, compressed passthrough and SSE
-streaming. `deploy-web.yml` runs it before building the image.
+streaming. `deploy-web.yml` runs it before building the image. It also stands up a
+**rogue server on its own port that no forward may ever reach**, which is how the
+`%2F` SSRF above is held closed — asserting the status code alone would not have
+caught it, because the hijacked forward returned a perfectly ordinary `200`. Note
+the fake Traefik has to relay the **raw** request target and the query string: it
+used to re-compose them from the decoded path, which flattened `%2F`/`%3F` and
+dropped the query one hop before the code under test, and no test could see either
+bug through it.
 
 **Checking it from outside.** `.github/workflows/verify.yml` (workflow_dispatch)
 asserts these against the live box as a real client sees them: the static host

@@ -55,6 +55,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Request
@@ -209,6 +210,48 @@ def _safe_file(aid: str, path: str) -> Path | None:
     return target if target.is_file() else None
 
 
+def _upstream_url(request: Request) -> httpx.URL:
+    """Where this forward goes: always the proxy's authority, with the caller's
+    path byte-for-byte as they sent it.
+
+    **Built from `raw_path`, never from `request.url.path`**, because ASGI hands
+    the path over percent-DECODED and a decoded path cannot be safely
+    re-composed. It used to be `httpx.URL(PROXY).join(request.url.path)`, and two
+    encodings escaped the path that way:
+
+    - `%2F` at the start decoded to `//`, which RFC 3986 reads as a network-path
+      reference — so `join` replaced `coolify-proxy` with whatever the caller put
+      there. `/%2Fsablier:10000%2Fhealth` on any fronted app's public hostname
+      reached the Sablier controller's admin API on the `coolify` network and
+      streamed its answer back, carrying our own marker header (ARCHITECTURE
+      §12). An unresolvable one instead burned the full retry budget and
+      answered 502 `backend unreachable`, which is how it surfaced.
+    - `%3F` decoded to `?`, so `join` read the rest of the path as a query and
+      the `copy_with(query=...)` below then dropped it — the backend saw a
+      truncated path and never knew.
+
+    Neither is reachable from a raw path: `copy_with(raw_path=...)` never
+    re-parses the authority, so the worst a caller can ask for is a path of their
+    choosing on *our* backend — which is what reaching the app directly would
+    have given them anyway.
+    """
+    raw = request.scope.get("raw_path") or b""
+    # Absent (raw_path is optional in ASGI) or an absolute-form request target,
+    # which httpx rejects outright. Re-encoding the decoded path is lossy for a
+    # literal `%`, and still cannot move the authority.
+    if not raw.startswith(b"/"):
+        raw = quote(request.url.path).encode()
+    raw = raw.split(b"?", 1)[0]     # uvicorn excludes the query; don't rely on it
+    # scope, not `request.url.query`: Starlette composes `request.url` by
+    # concatenating the DECODED path with the query string, so a `%3F` in the
+    # path lands in the middle of that string and urlsplit hands back everything
+    # after it as the query. `/a%3Fb?real=1` read as query `b?real=1`, and since
+    # each hop re-read it the junk compounded on every retry.
+    query = request.scope.get("query_string") or b""
+    return httpx.URL(PROXY).copy_with(
+        raw_path=raw + (b"?" + query if query else b""))
+
+
 async def _send(request: Request, aid: str):
     """One hop to the backend through Traefik. Returns (client, response) with the
     response still streaming, or None if the connection itself failed.
@@ -217,8 +260,7 @@ async def _send(request: Request, aid: str):
     the caller used. `content-length` is dropped because httpx recomputes it, and
     a stale one would contradict the body we send.
     """
-    url = httpx.URL(PROXY).join(request.url.path).copy_with(
-        query=request.url.query.encode())
+    url = _upstream_url(request)
     headers = {k: v for k, v in request.headers.items()
                if k.lower() != "content-length"}
     headers[BACKEND_HEADER] = BACKEND_TOKEN
@@ -543,8 +585,9 @@ async def resolve(request: Request, _path: str = ""):
     # 0. Redirects come first, so a rule for a path still present in the bundle
     #    (or still served by the backend) actually takes effect — a redirect that
     #    silently loses to an existing file is the confusing case.
-    hit = redirect_rules.match(mf.get("redirects") or [], path,
-                               request.url.query or "")
+    hit = redirect_rules.match(
+        mf.get("redirects") or [], path,
+        (request.scope.get("query_string") or b"").decode("latin-1"))
     if hit:
         location, status = hit
         return RedirectResponse(location, status_code=status,
