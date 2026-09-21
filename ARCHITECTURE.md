@@ -215,6 +215,30 @@ tell the paths apart — it was present on 255/255 gateway-sourced `-coolify` ro
 as well as on all 2,300 `gepetel.com` rows. And the §10 client-leg discriminator
 is scoped to the tunnel path only; see there.
 
+**Which makes the pair the two-route test for "is the origin gone", and the two
+routes do not answer in the same words.** From outside, a dead tunnel and a dead
+box look identical on `*-coolify` alone; the custom domain is the independent
+second look, because it shares no mechanism with the tunnel past the Cloudflare
+edge. Measured 2026-09-21T23:02Z, when both were down at once:
+
+| route | what Cloudflare answers | what it means |
+|---|---|---|
+| tunnel (`*-coolify`, `www`) | `530`, body `error code: 1033` | no tunnel is registered for the zone |
+| port-forward (custom domain) | `522`, body `error code: 522` | the edge could not TCP-connect to the public IP |
+
+Both carry `server: cloudflare` and a `cf-ray`, so the edge is answering rather
+than something synthesising the error, and both reproduce on plain `:80`, so
+neither is TLS. **Do not key an outage check on the string `1033` or `530`** —
+that is the tunnel path's dialect only, and the second route reporting `522`
+will read as "does not match" rather than as the confirmation it is. Key on
+"this host did not reach the origin" and read `%{http_code}` per host.
+
+What the pair still cannot tell you is *where*: `1033` + `522` together is
+box-down, router-down and home-link-down alike, since all three sever both paths
+at once. Narrowing it needs something on the box's side of the router, and this
+session has nothing there — 2026-09-21 ended at "the origin is unreachable by
+both routes", and the cause was not established from outside.
+
 ### 4b. Custom domains
 
 An app can answer on hostnames of its own **in addition to** the generated one
