@@ -759,6 +759,38 @@ full on every push even when the lockfile had not moved.
 Build time still varies with image size, so do not size a polling loop off a
 figure quoted here — watch the run, or time the app's first build and use that.
 
+### The deploy trigger is always `main`, never the branch being worked on
+
+`apps_deploy_workflow` used to take a `branches` parameter, with advice to pass
+"the branch actually being worked on" so a feature-branch push wouldn't look
+like a silently-missing CI run. That advice is what put two apps into
+production running whatever a stale feature branch happened to build:
+`ping-pong`'s workflow ended up wired to `[main, 'claude/**']` and `snake`'s to
+one specific named branch left over from a finished PR — both from a session
+scaffolding CI mid-feature and never widening the trigger back. Neither needed
+a PR or a merge to main after that: any future push to that branch redeployed
+the live app straight from the branch tip. Found 2026-09-23 by cross-checking
+every deployed app's live `.github/workflows/deploy.yml` against `main`-only —
+12 of 14 were already `[main]`; `pacman` and `revolut-mcp` were unverified
+(a GitHub code-search indexing gap, not evidence either way).
+
+Coolify's own `applications.git_branch` column is not the lever here and reads
+`main` for every app regardless — these apps deploy from a prebuilt GHCR image
+via `/refresh`, not from Coolify building a git branch, so that column is a
+Coolify placeholder with no effect. The only thing on this whole platform that
+decides which branch deploys is the `on: push: branches:` trigger baked into
+the app repo's own workflow file by `apps_deploy_workflow`.
+
+Fixed 2026-09-23: `apps_deploy_workflow` no longer takes a `branches`
+parameter — the generated workflow always triggers on `main` only, with no way
+to widen it short of hand-editing the file (which the tool's own docs already
+warn against for other reasons). A workflow that looks "missing" on a feature
+branch is doing its job; merge to main to ship instead of repointing the
+trigger. This closes the class of bug for every *newly scaffolded* workflow;
+`ping-pong` and `snake` still need their existing repo workflow files fixed by
+hand (out of this session's GitHub access, scoped to this repo only), and
+`pacman`/`revolut-mcp` still need checking directly.
+
 ---
 
 ## 9. Scale-to-zero (Sablier)

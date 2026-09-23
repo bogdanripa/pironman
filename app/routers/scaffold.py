@@ -355,8 +355,7 @@ def _dockerfile_rules(health_path: str) -> str:
 
 @router.get("/{app_id}/deploy-workflow", operation_id="apps_deploy_workflow",
             summary="Get the GitHub Actions workflow that redeploys this app on every push")
-async def deploy_workflow(app_id: str, repo_name: str | None = None,
-                          branches: str | None = None):
+async def deploy_workflow(app_id: str, repo_name: str | None = None):
     """Return everything needed to wire an app up to automatic deployment from
     GitHub: the complete workflow file, where to save it, which repository
     secret to create, and the constraints its Dockerfile must satisfy.
@@ -373,16 +372,23 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
     this platform expects.
 
     **Verbatim means verbatim — so pass what you need as parameters instead of
-    editing the result.** Everything that legitimately varies per repository is a
-    parameter here: `branches` for the branch to deploy from, `repo_name` for a
-    repository named differently from the app. Hand-editing the generated file is
-    how the parts that must not change get changed by accident.
+    editing the result.** The only thing that legitimately varies per repository
+    is `repo_name`, for a repository named differently from the app. Hand-editing
+    the generated file is how the parts that must not change get changed by
+    accident.
 
-    `branches` — comma-separated branch names whose pushes deploy, e.g.
-    'develop' or 'main,staging'. Defaults to 'main'. **Pass the branch actually
-    being worked on**: on a feature branch, a workflow wired to main builds
-    nothing, and the run that looks missing is simply a workflow that never
-    triggered.
+    **The workflow always deploys from `main` and only `main` — this is not
+    configurable.** There used to be a `branches` parameter here, with advice to
+    "pass the branch actually being worked on" so a feature-branch push wouldn't
+    look like a silently-missing run. That advice is exactly what put two apps
+    into production serving whatever a stale feature branch built:
+    `ping-pong`'s workflow ended up wired to `[main, 'claude/**']` and `snake`'s
+    to a single named branch from a finished PR — both left over from a session
+    scaffolding CI mid-feature, and both meant a push to that branch redeployed
+    the live app with no PR and no merge to main. A workflow that only ever
+    triggers on `main` is the safe default: on a feature branch it looks
+    "missing" because it correctly did not run, and that is the point, not a
+    bug to work around by widening the trigger.
 
     Secrets: one, PAAS_KEY — the app's scoped deploy key, which authenticates
     both halves of a deploy (the backend's /refresh call and the frontend
@@ -404,18 +410,19 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
         raise HTTPException(404, "no such app — create it first with apps_create")
 
     repo = repo_name or app_id
-    branch_list = [b.strip() for b in (branches or "main").split(",") if b.strip()]
-    if not branch_list:
-        raise HTTPException(422, "branches must name at least one branch")
+    branch_list = ["main"]
     health_path = row["health_path"] or "/"
 
     notes = [
-        f"Each push to {' or '.join(branch_list)} builds an arm64 image and pushes "
-        "it to ghcr.io tagged ':latest' (and with the commit sha for "
-        "traceability), then calls this app's /refresh hook so the box redeploys "
-        "the new image right away. A push to any other branch does nothing — "
-        "re-run apps_deploy_workflow with `branches` to change that rather than "
-        "editing the file.",
+        "Each push to main builds an arm64 image and pushes it to ghcr.io "
+        "tagged ':latest' (and with the commit sha for traceability), then "
+        "calls this app's /refresh hook so the box redeploys the new image "
+        "right away. A push to any other branch does nothing, deliberately — "
+        "this is not a parameter to widen. Work on a feature branch and merge "
+        "it to main to ship; do not repoint the trigger at the branch you are "
+        "on, which is how a feature branch ends up deploying to production "
+        "indefinitely after the feature is done (ARCHITECTURE.md has the "
+        "ping-pong/snake incident).",
         "The image is built natively on an arm64 runner rather than cross-built "
         "under QEMU, so build time is dominated by the image itself and not by "
         "emulation. It still varies with size and with what has to compile. Do "
@@ -485,19 +492,19 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
             "now too (apps_env_set) — they are staged until the first container "
             "exists, and an app that needs one at import cannot boot without it.",
             "1. Write `workflow` verbatim to `workflow_path` in the app's repo "
-            "and commit it. If something about it does not fit — the branch, the "
-            "repository name — call this tool again with that parameter rather "
-            "than editing the file by hand.",
+            "and commit it. If the repository name does not match the app id, "
+            "call this tool again with `repo_name` rather than editing the file "
+            "by hand — never repoint the branch trigger.",
             "2. Make sure the app's Dockerfile satisfies "
             "`dockerfile_requirements`.",
-            f"3. Push to {' or '.join(branch_list)}. CI builds and pushes the "
-            "arm64 image and calls the app's /refresh hook; the box redeploys the "
-            "new image. Deploying is CI's job — there is no tool to deploy an app "
-            "by hand.",
+            "3. Merge to main. CI builds and pushes the arm64 image and calls "
+            "the app's /refresh hook; the box redeploys the new image. "
+            "Deploying is CI's job — there is no tool to deploy an app by hand, "
+            "and pushing straight to a feature branch will not trigger it.",
         ],
         "workflow_path": ".github/workflows/deploy.yml",
         "workflow": _workflow(app_id, repo, branch_list, health_path),
-        "deploys_from_branches": branch_list,
+        "deploys_from_branch": "main",
         "health_path": health_path,
         # One secret, and the platform installs it itself (see the notes).
         "required_secrets": [

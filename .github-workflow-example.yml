@@ -1,11 +1,14 @@
 # Reference only — a minimal illustration of the shape. Get the real thing from
-# apps_deploy_workflow, which fills in the app id, the branch to deploy from, the
-# app's health path and the verified-deploy retry logic that this file omits.
+# apps_deploy_workflow, which fills in the app id, the app's health path and the
+# verified-deploy retry logic that this file omits.
 name: deploy
 on:
   push:
-    # The branch that deploys. Not always main: a feature branch wired to main
-    # builds nothing, and the run that looks missing is one that never triggered.
+    # Always main, and only main — never repoint this at a feature branch. A
+    # workflow wired to a feature branch builds nothing until you push there,
+    # which looks like a missing run, but that is correct: merge to main to
+    # ship. Two apps here (ping-pong, snake) ended up deploying to production
+    # off a leftover feature-branch trigger from exactly that workaround.
     branches: [main]
 
 jobs:
