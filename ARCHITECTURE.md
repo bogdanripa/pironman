@@ -1636,6 +1636,36 @@ flows through: the Traefik access log** — nothing is installed per app.
       what `== ::1` does; on a custom domain it is the only one of the two that
       works. This only became reachable once a custom domain started arriving at
       all — before the 2026-09-12 A-record fix (§4b) none did.
+    - **The complement inherits the redeploy problem two bullets up, and it fails
+      in the dangerous direction — it *invents* client-visible 5xx.** The map is
+      read *now*; `web`'s forwards in the window carry whatever address it held
+      *then*. An address `web` has since released that no container has since
+      taken is in neither the map nor `{10.0.1.1}`, so the complement scores every
+      one of its forwards as a client leg. Measured 2026-09-23, when `web` was
+      redeployed three times inside one 24h window (`application_deployment_queues`
+      512/514/516 at `14:32:35`, `14:33:25`, `14:37:31`): it held `::9` until
+      `14:32:30`, `::16` from `14:33:31` to `14:33:40`, `::18` at `14:33:42`, and
+      `::a` from `14:43:02` on. `::16`/`::18` belong to nothing today, so the
+      complement moved their **31** forwards into the client bucket and reported
+      **45** client-visible 5xx against a true **14**. The same window shows the
+      other half of it: `::9` is now held by **`wa-gateway`** (started `15:39:11`),
+      so those rows bin as internal — correct verdict, wrong container — and any
+      per-app attribution taken from the map's *name* is silently wrong.
+    - **Resolve `web`'s addresses from the log instead, by router name.** A
+      forward's defining property is in the row itself: the backend routers
+      `http-0-<uuid>@docker` match on
+      ``Host(`…`) && Header(`X-Pironman-Backend`, `1`)``, and only `_send` stamps
+      that header (`app/routing.py:62`, asserted in `tests/test_traefik_rules.py`).
+      So **any `ClientHost` seen on an `http-0-*` router is the static host**, for
+      as long as it appears — no `docker inspect`, no `StartedAt`, no address map,
+      and it enumerates *every* address `web` held in the window rather than the
+      one it holds now. Build that set in a first pass, treat it as internal in a
+      second, and the complement is exact again. Verified 2026-09-23 two ways:
+      `::16` and `::18` each drew a `200` on `http-0-ugfngj1r9vsz3uvxc8yzhiym`
+      while `::9` forwarded to nine different apps' backend routers, and each
+      address's first and last row falls inside the bracketing Coolify deployment
+      row. Note this rescues attribution as well as the partition — the set is
+      "was `web` at the time", which is the question being asked.
   - **Restrict to `-coolify` hosts *before* counting anything, or the number is
     mostly scanners.** Most 5xx the proxy logs belong to no app at all: an
     unrouted host matches `catchall@file`, which has no `ServiceName` and answers
