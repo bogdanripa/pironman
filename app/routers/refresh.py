@@ -129,12 +129,19 @@ async def _run(deploy_id: str, app_id: str, image: str | None) -> None:
         _log.exception("deploy %s of %s failed", deploy_id, app_id)
         result = {"error": repr(exc)}
 
-    # Three distinct outcomes collapse to one boolean here, so be explicit about
-    # which is which. `verified is False` is a rollback — the deploy ran and the
-    # code is not live. `error` is a failure to deploy at all. Everything else is
-    # a pass, INCLUDING `updated: False`, which means the digest had not moved
-    # and there was correctly nothing to do.
-    failed = result.get("verified") is False or bool(result.get("error"))
+    # A pass now requires an AFFIRMATIVE `verified: True`, not merely the absence
+    # of a complaint. The old rule — fail only on `verified is False` or `error` —
+    # scored any result that mentioned neither as a success, and the one result
+    # that mentions neither is `updated: False`. That branch is reached when the
+    # recorded digest equals the tag's, which a rolled-back deploy used to make
+    # true while the old container kept serving. So the single most important
+    # failure on this platform arrived here wearing the shape of a no-op, and was
+    # reported to CI as a green deploy every time it was retried.
+    #
+    # `updated: False` is still a legitimate pass — it now carries
+    # `verified: True` because check_and_update confirms it against the running
+    # container before claiming there is nothing to do.
+    failed = bool(result.get("error")) or result.get("verified") is not True
     await deploys.finish(deploy_id, not failed, result=result)
 
     if failed:

@@ -130,7 +130,38 @@ async def _container_started_at(uuid: str) -> str | None:
     return out.strip() if rc == 0 else None
 
 
-async def verify_deploy(uuid: str, before: str | None, timeout: int = 150) -> dict:
+async def _image_id(ref: str) -> str | None:
+    """The local image id Docker resolves `ref` to, or None.
+
+    Deliberately NOT `remote_digest`'s value. That returns the RepoDigest — a
+    registry manifest digest — while a container carries `.Image`, a local id.
+    The two happen to coincide on this box (Docker 29.6 with the containerd
+    image store) and do not in general: with a multi-arch tag the registry's
+    `:latest` names a manifest LIST while the box holds one platform's manifest,
+    so the values differ by design. Comparing a registry digest against a
+    container's image id would then be permanently unequal and redeploy on every
+    pass. Both sides of the verification therefore come from the local daemon.
+    """
+    rc, out = await _docker("inspect", "--format", "{{.Id}}", ref, timeout=30)
+    out = out.strip()
+    return out if rc == 0 and out.startswith("sha256:") else None
+
+
+async def _running_image_id(uuid: str) -> str | None:
+    """The image id the app's current container is ACTUALLY running, or None if
+    it has no container. Reads a stopped container too — a sleeping app is
+    stopped, and a rolled-back deploy leaves the old one — so this answers "what
+    would serve the next request", which is the only thing worth verifying."""
+    name = await _container_name(uuid)
+    if not name:
+        return None
+    rc, out = await _docker("inspect", "--format", "{{.Image}}", name, timeout=30)
+    out = out.strip()
+    return out if rc == 0 and out.startswith("sha256:") else None
+
+
+async def verify_deploy(uuid: str, before: str | None, timeout: int = 150,
+                        target: str | None = None) -> dict:
     """Wait for a deploy to actually take, and say so honestly if it did not.
 
     Coolify's deploy call is asynchronous and its rollback is silent: if the new
@@ -140,12 +171,21 @@ async def verify_deploy(uuid: str, before: str | None, timeout: int = 150) -> di
     that was deployed is nowhere. That failure cost a long debugging session, so
     it is worth the wait to catch it.
 
-    A deploy is verified when the app's container has a start time later than the
-    one observed before the deploy (i.e. it was genuinely replaced) and is running
-    without an unhealthy healthcheck.
+    A deploy is verified when the app's container was genuinely replaced (its
+    start time is later than the one observed before), is **running the image
+    that was deployed**, and is running without an unhealthy healthcheck.
+
+    `target` is the local image id the deploy was supposed to land on. It is the
+    criterion that actually matters and the one this function used to lack: start
+    time plus health passes for ANY replacement, including one that came back up
+    on the previous image. Everything else — the deploy call's 2xx, a running
+    container, a passing health endpoint — is equally true of a rollback, which
+    is precisely how a stale build serves traffic for five weeks with CI green
+    the whole time (bt-gateway, 2026-08-11 to 2026-09-23). Passing None keeps the
+    old, weaker check for callers that have no target to compare against.
     """
     deadline = timeout
-    last = {"replaced": False, "status": None}
+    last = {"replaced": False, "status": None, "image": None}
     while deadline > 0:
         name = await _container_name(uuid)
         if name:
@@ -155,25 +195,32 @@ async def verify_deploy(uuid: str, before: str | None, timeout: int = 150) -> di
                 "inspect", "--format",
                 "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}"
                 "{{else}}none{{end}}", name, timeout=30)
-            started, status = started.strip(), status.strip()
+            _, image = await _docker(
+                "inspect", "--format", "{{.Image}}", name, timeout=30)
+            started, status, image = started.strip(), status.strip(), image.strip()
             state, health = (status.split("|", 1) + ["none"])[:2]
             replaced = bool(started) and (before is None or started > before)
-            last = {"replaced": replaced, "status": status, "container": name}
-            if replaced and state == "running" and health in ("healthy", "none"):
-                return {"verified": True, "container": name}
+            on_target = target is None or image == target
+            last = {"replaced": replaced, "status": status, "container": name,
+                    "image": image, "on_target": on_target}
+            if replaced and on_target and state == "running" \
+                    and health in ("healthy", "none"):
+                return {"verified": True, "container": name, "image": image}
         await asyncio.sleep(5)
         deadline -= 5
 
-    return {
-        "verified": False,
-        **last,
-        "reason": ("the new container never became healthy, so Coolify rolled the "
-                   "deploy back and the previous container is still serving — the "
-                   "code you deployed is not running. apps_logs shows why it "
-                   "failed to start."
-                   if not last["replaced"] else
-                   "the container was replaced but did not become healthy in time"),
-    }
+    if not last["replaced"]:
+        reason = ("the new container never became healthy, so Coolify rolled the "
+                  "deploy back and the previous container is still serving — the "
+                  "code you deployed is not running. apps_logs shows why it "
+                  "failed to start.")
+    elif not last.get("on_target", True):
+        reason = (f"the container was replaced but is running {last['image']}, "
+                  f"not the {target} that was deployed — the deploy was reverted "
+                  f"onto the previous image.")
+    else:
+        reason = "the container was replaced but did not become healthy in time"
+    return {"verified": False, **last, "reason": reason}
 
 
 class NoSuchApp(LookupError):
@@ -274,7 +321,10 @@ async def settle(app_id: str, uuid: str, before: str | None) -> dict:
     Enrolment has to come after the container exists — its labels are read off the
     running container — which is why this is a step of its own rather than part of
     apply_image."""
-    result = await verify_deploy(uuid, before)
+    async with pool().acquire() as c:
+        row = await c.fetchrow("SELECT image FROM apps WHERE id = $1", app_id)
+    target = await _image_id(row["image"]) if row and row["image"] else None
+    result = await verify_deploy(uuid, before, target=target)
     if not result.get("verified"):
         return result
     async with pool().acquire() as c:
@@ -293,18 +343,50 @@ async def settle(app_id: str, uuid: str, before: str | None) -> dict:
     return result
 
 
-async def check_and_update(conn, app, verify: bool = False) -> dict:
-    """Pull the app's watched tag; if its digest differs from what is running,
-    redeploy (re-injecting env like a normal deploy) and record the new digest.
-    A no-op when nothing changed. `app` is a row selected with APP_COLS."""
+async def check_and_update(conn, app, verify: bool = True) -> dict:
+    """Pull the app's watched tag; if what is RUNNING is not that image, redeploy
+    (re-injecting env like a normal deploy) and record the digest — but only once
+    the running container has been confirmed to carry it. `app` is a row selected
+    with APP_COLS.
+
+    Two rules here exist because breaking either produced a deploy that reported
+    success while the previous build kept serving:
+
+    **`deployed_digest` records fact, not intent.** It used to be written
+    immediately after asking Coolify to deploy, before verification. Coolify's
+    rollback is silent, so a failed deploy still stamped the new digest — and from
+    then on every call took the `nothing to do` branch below and answered success,
+    for ever. One flaky deploy converted itself into permanent, invisible
+    staleness that the app could not recover from, because the platform had
+    written down that it was already there. Measured on bt-gateway: five weeks on
+    a stale image with every CI run green.
+
+    **`nothing to do` must be confirmed against the container**, not just the
+    database. The digest column is a belief; the running container is the fact,
+    and when they disagree it is the belief that is wrong. Costs one extra
+    `docker inspect` per no-op pass, which is the price of the difference between
+    verified-current and believed-current.
+    """
     watch = app["watch_tag"] or "latest"
     ref = f'{repo_of(app["image"])}:{watch}'
 
     digest = await remote_digest(ref)
     if digest is None:
         return {"id": app["id"], "updated": False, "error": f"could not pull {ref}"}
-    if digest == app["deployed_digest"]:
-        return {"id": app["id"], "updated": False, "image": ref}
+
+    # Both sides local, so they are the same kind of identifier — see _image_id.
+    target = await _image_id(ref)
+    running = await _running_image_id(app["coolify_uuid"])
+
+    if digest == app["deployed_digest"] and target is not None and running == target:
+        return {"id": app["id"], "updated": False, "image": ref,
+                "verified": True, "image_id": running}
+    # Falling through with a matching digest is the self-heal: the row claims
+    # this image is deployed and the container says otherwise, so deploy it.
+    # `target is None` lands here too — if the image cannot be inspected we
+    # cannot claim it is current, and a redundant deploy is recoverable where
+    # silent staleness is not. It cannot loop unnoticed: verify_deploy would be
+    # equally unable to confirm, and reports a failure rather than a success.
 
     before = await _container_started_at(app["coolify_uuid"])
     await coolify.set_image(app["coolify_uuid"], ref)
@@ -314,18 +396,26 @@ async def check_and_update(conn, app, verify: bool = False) -> dict:
         app["coolify_uuid"], app_id=app["id"],
         reason=f"auto-update: the digest behind {ref} moved",
         )
+
+    result = {"id": app["id"], "updated": True, "image": ref, "digest": digest,
+              "target_image_id": target, "was_running": running}
+    result.update(await verify_deploy(app["coolify_uuid"], before, target=target))
+
+    if not result.get("verified"):
+        # Deliberately NO write. `deployed_digest` keeps its last verified value,
+        # so the next CI run and the next sweep both see work still to do and
+        # retry. Recording the new digest here is the entire bug this function
+        # was rewritten to remove.
+        return result
+
     await conn.execute(
         "UPDATE apps SET image = $1, deployed_digest = $2 WHERE id = $3",
         ref, digest, app["id"])
     enrolled = await _maybe_enroll_sablier(conn, app)
-    result = {"id": app["id"], "updated": True, "image": ref, "digest": digest}
-    if verify:
-        result.update(await verify_deploy(app["coolify_uuid"], before))
-        # Only once the deploy is confirmed good, and not when enrollment just
-        # queued a redeploy of its own. Without verify there is nothing to
-        # confirm against, so the app is left running rather than slept blind.
-        if result.get("verified") and not enrolled:
-            result["sleep"] = await sleep_after_deploy(app)
+    # Only once the deploy is confirmed good, and not when enrollment just
+    # queued a redeploy of its own.
+    if not enrolled:
+        result["sleep"] = await sleep_after_deploy(app)
     return result
 
 
