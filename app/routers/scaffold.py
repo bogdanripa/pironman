@@ -9,7 +9,7 @@ router = APIRouter(prefix="/apps", tags=["apps"],
                    dependencies=[Depends(require_key)])
 
 
-def _upload_step(app_id: str) -> str:
+def _upload_step(app_ref: str, key_ref: str) -> str:
     """The last step of either frontend job. Authenticated with PAAS_KEY, which
     this platform installs itself — unlike the backend's /refresh hook this
     uploads real content, so it cannot be an unauthenticated call."""
@@ -20,13 +20,13 @@ def _upload_step(app_id: str) -> str:
         - name: Upload the frontend
           run: |
             curl -fsS -X PUT \\
-              -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
+              -H "Authorization: Bearer {key_ref}" \\
               --data-binary @site.zip \\
-              "https://api-coolify.bogdanripa.com/apps/{app_id}/frontend"
+              "https://api-coolify.bogdanripa.com/apps/{app_ref}/frontend"
         """)
 
 
-def _frontend_job(app_id: str) -> str:
+def _frontend_job(app_ref: str, key_ref: str) -> str:
     """The optional frontend half of the workflow, for a site with a build step:
     build static assets, zip them, upload. Separate job so an app can have a
     frontend, a backend, or both — and so a frontend deploy doesn't wait on an
@@ -54,10 +54,10 @@ def _frontend_job(app_id: str) -> str:
             - name: Package the bundle
               run: cd dist && zip -qr "$GITHUB_WORKSPACE/site.zip" .
 
-        """) + indent(_upload_step(app_id), "    "), "  ")
+        """) + indent(_upload_step(app_ref, key_ref), "    "), "  ")
 
 
-def _frontend_job_no_build(app_id: str) -> str:
+def _frontend_job_no_build(app_ref: str, key_ref: str) -> str:
     """The same job for a site that has no build step — the files in the repo are
     the site. A game, a landing page, a status page: plain HTML/CSS/JS, which is
     also what apps_frontend_write publishes. Running `npm ci && npm run build`
@@ -78,11 +78,130 @@ def _frontend_job_no_build(app_id: str) -> str:
                 zip -qr "$GITHUB_WORKSPACE/site.zip" . \\
                   -x '.git/*' '.github/*' '.gitignore' 'README.md'
 
-        """) + indent(_upload_step(app_id), "    "), "  ")
+        """) + indent(_upload_step(app_ref, key_ref), "    "), "  ")
+
+
+def _fe_refs(app_id: str, dev_app: str | None) -> tuple[str, str]:
+    """(app_ref, key_ref) for the frontend job — the same branch-keyed pair the
+    backend job uses, so a paired repo uploads its bundle to the app the push is
+    actually for. The frontend job runs in the same workflow and therefore sees
+    the same `steps.target` output."""
+    if not dev_app:
+        return app_id, "${{ secrets.PAAS_KEY }}"
+    return ("${{ steps.target.outputs.app }}",
+            "${{ github.ref_name == 'dev' "
+            "&& secrets.PAAS_KEY_DEV || secrets.PAAS_KEY }}")
+
+
+def _sha_tag_step() -> str:
+    """Single-app mode: one moving tag (:latest) plus the commit sha."""
+    return dedent("""\
+        - id: tag
+          run: echo "value=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+        """)
+
+
+def _target_step(app_id: str, dev_app: str) -> str:
+    """Paired mode: resolve which app, and which tags, this push is for.
+
+    Emitted as step outputs rather than baked into the file so one workflow
+    serves both branches. The app id is safe to put in an output; the deploy key
+    is not, which is why that is selected inline at each use instead.
+    """
+    return dedent(f"""\
+        # main -> {app_id} (:latest), dev -> {dev_app} (:dev). The two share a
+        # repository and a Dockerfile and nothing else: separate hostname,
+        # database, environment, schedule and release cadence.
+        #
+        # The tags MUST differ. Both apps auto-update from their moving tag, so a
+        # dev build pushed to :latest would be deployed to production by the
+        # box's hourly sweep — with nothing to notice, because a deploy that
+        # succeeds looks the same whichever commit it carries.
+        - name: Pick the target app
+          id: target
+          run: |
+            if [ "${{{{ github.ref_name }}}}" = "dev" ]; then
+              app={dev_app}; moving=dev;    commit=dev-${{GITHUB_SHA::7}}
+            else
+              app={app_id}; moving=latest; commit=sha-${{GITHUB_SHA::7}}
+            fi
+            echo "app=$app"       >> $GITHUB_OUTPUT
+            echo "moving=$moving" >> $GITHUB_OUTPUT
+            echo "commit=$commit" >> $GITHUB_OUTPUT
+            echo "branch ${{{{ github.ref_name }}}} -> app $app, tags :$moving and :$commit"
+        """)
 
 
 def _workflow(app_id: str, repo_name: str, branches: list[str],
-              health_path: str) -> str:
+              health_path: str, dev_app: str | None = None) -> str:
+    """The deploy workflow. With `dev_app` it serves TWO apps from one repository
+    — `main` deploys the production app, `dev` deploys its sister — and the file
+    stays single, because everything that differs is resolved at run time from
+    `github.ref_name`.
+
+    The image TAGS are the load-bearing part of that, not a nicety. Both apps
+    auto-update from a moving tag, so if the dev branch pushed `:latest` the
+    production app's hourly sweep would pick up a dev build and deploy it —
+    silently, because a deploy that succeeds looks identical whichever commit it
+    carries. main therefore owns `:latest`, dev owns `:dev`, and each also gets a
+    per-commit tag so either side can be rolled back.
+
+    The deploy key cannot come from a step output the way the app id does: that
+    would print a secret into the workflow's own outputs. It is selected inline
+    at each use instead, which keeps it in the secrets context throughout.
+    """
+    if dev_app:
+        branches = [*branches, "dev"] if "dev" not in branches else list(branches)
+        app_ref = "${{ steps.target.outputs.app }}"
+        key_ref = ("${{ github.ref_name == 'dev' "
+                   "&& secrets.PAAS_KEY_DEV || secrets.PAAS_KEY }}")
+        moving_ref = "${{ steps.target.outputs.moving }}"
+        commit_ref = "${{ steps.target.outputs.commit }}"
+    else:
+        app_ref = app_id
+        key_ref = "${{ secrets.PAAS_KEY }}"
+        moving_ref = "latest"
+        commit_ref = "${{ steps.tag.outputs.value }}"
+    # Three comments and one error message are worded per mode, and they are
+    # rewrapped by hand rather than generated so that a single-app file comes
+    # out byte-identical to the one this generator has always produced. A
+    # regenerated workflow that differs only in prose reads as a real change in
+    # a diff, which is a cost paid by every repo that re-runs this tool.
+    C = "\n        # "            # the top-level comment's continuation
+    K = "\n              # "      # inside a step
+    race_note = (
+        f"Every run pushes the same moving tag for its branch — :latest on{C}"
+        f"main, :dev on dev — and the box deploys whatever that points at, so{C}"
+        f"two overlapping runs on ONE branch race and the one that FINISHES{C}"
+        f"last wins regardless of which commit is newer: a quick follow-up{C}"
+        f"commit can land first and then be undone by its predecessor. The two{C}"
+        f"branches never race each other, because they move different tags.{C.rstrip(' ')}"
+        if dev_app else
+        f"Every run pushes the same :latest tag and the box deploys whatever that{C}"
+        f"points at, so two overlapping runs race and the one that FINISHES last{C}"
+        f"wins regardless of which commit is newer — a quick follow-up commit can{C}"
+        "land first and then be undone by its predecessor.")
+    # The secret reference is an inline conditional, so a reader meeting
+    # PAAS_KEY_DEV halfway through a line needs to know it is a whole second app
+    # being deployed and not a variant credential.
+    key_note = (
+        f"Authenticated with the{K}"
+        f"TARGET app's scoped deploy key — PAAS_KEY on main, PAAS_KEY_DEV on{K}"
+        f"dev — each of which can only deploy its own app. The control plane{K}"
+        f"redeploys itself often and answers 404 while it restarts, so{K}"
+        "transient codes are retried rather than believed."
+        if dev_app else
+        f"Authenticated with this{K}"
+        f"app's scoped deploy key (PAAS_KEY), which can only deploy this one{K}"
+        f"app. The control plane redeploys itself often and answers 404{K}"
+        f"while it restarts, so transient codes are retried rather than{K}"
+        "believed.")
+    # A key scoped to the sibling is the likely mistake once there are two, and
+    # it fails here with exactly the 401 a missing secret gives.
+    key_401 = (f"the key is not {app_ref}'s - on dev that secret is "
+               "PAAS_KEY_DEV, on main PAAS_KEY"
+               if dev_app else "PAAS_KEY is not this app's deploy key")
+    tag_step = _target_step(app_id, dev_app) if dev_app else _sha_tag_step()
     branch_list = ", ".join(branches)
     return dedent(f"""\
         name: deploy
@@ -90,10 +209,7 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
           push:
             branches: [{branch_list}]
 
-        # Every run pushes the same :latest tag and the box deploys whatever that
-        # points at, so two overlapping runs race and the one that FINISHES last
-        # wins regardless of which commit is newer — a quick follow-up commit can
-        # land first and then be undone by its predecessor. Build times still vary
+        # {race_note} Build times still vary
         # with image size, so don't build a polling timeout around a guess; time
         # your own first run and use that. One run at a time, newest wins.
         concurrency:
@@ -125,8 +241,7 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                   username: ${{{{ github.actor }}}}
                   password: ${{{{ secrets.GITHUB_TOKEN }}}}
 
-              - id: tag
-                run: echo "value=sha-${{GITHUB_SHA::7}}" >> $GITHUB_OUTPUT
+{indent(tag_step.rstrip(), "              ")}
 
               - uses: docker/build-push-action@v6
                 with:
@@ -146,18 +261,14 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                   build-args: |
                     GIT_SHA=${{{{ github.sha }}}}
                   tags: |
-                    ghcr.io/{GHCR_OWNER}/{repo_name}:latest
-                    ghcr.io/{GHCR_OWNER}/{repo_name}:${{{{ steps.tag.outputs.value }}}}
+                    ghcr.io/{GHCR_OWNER}/{repo_name}:{moving_ref}
+                    ghcr.io/{GHCR_OWNER}/{repo_name}:{commit_ref}
 
               # Tells the box what this build pushed. On the app's FIRST deploy
               # that image is what creates its container — the app was registered
               # as a bare id, because only this pipeline knows what it runs. After
               # that the box watches the tag itself and this just asks it to check
-              # now rather than at the next hourly sweep. Authenticated with this
-              # app's scoped deploy key (PAAS_KEY), which can only deploy this one
-              # app. The control plane redeploys itself often and answers 404
-              # while it restarts, so transient codes are retried rather than
-              # believed.
+              # now rather than at the next hourly sweep. {key_note}
               #
               # 202 means QUEUED, not deployed. The hook used to hold the
               # connection open until it had verified the deploy, but Cloudflare
@@ -170,17 +281,17 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                 run: |
                   for i in $(seq 1 10); do
                     code=$(curl -sS -o /tmp/out -w '%{{http_code}}' -X POST \\
-                      -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" \\
+                      -H "Authorization: Bearer {key_ref}" \\
                       -H "Content-Type: application/json" \\
-                      -d '{{"image": "ghcr.io/{GHCR_OWNER}/{repo_name}:latest"}}' \\
-                      "https://api-coolify.bogdanripa.com/apps/{app_id}/refresh" || echo 000)
+                      -d '{{"image": "ghcr.io/{GHCR_OWNER}/{repo_name}:{moving_ref}"}}' \\
+                      "https://api-coolify.bogdanripa.com/apps/{app_ref}/refresh" || echo 000)
                     case "$code" in
                       2*) cat /tmp/out; echo
                           python3 -c "import json;print('id='+json.load(open('/tmp/out')).get('deploy',''))" \\
                             >> $GITHUB_OUTPUT
                           exit 0 ;;
                       404|000|503|504) echo "attempt $i: $code, retrying"; sleep 10 ;;
-                      401) echo "PAAS_KEY is not this app's deploy key"; exit 1 ;;
+                      401) echo "{key_401}"; exit 1 ;;
                       *)  cat /tmp/out; echo; echo "refresh failed ($code)"; exit 1 ;;
                     esac
                   done
@@ -200,16 +311,16 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
               # check below have the last word.
               - name: Wait for the deploy to be verified
                 run: |
-                  url="https://api-coolify.bogdanripa.com/apps/{app_id}/refresh?deploy=${{{{ steps.refresh.outputs.id }}}}"
+                  url="https://api-coolify.bogdanripa.com/apps/{app_ref}/refresh?deploy=${{{{ steps.refresh.outputs.id }}}}"
                   for i in $(seq 1 60); do
-                    body=$(curl -sS -H "Authorization: Bearer ${{{{ secrets.PAAS_KEY }}}}" "$url" || echo '{{}}')
+                    body=$(curl -sS -H "Authorization: Bearer {key_ref}" "$url" || echo '{{}}')
                     state=$(printf '%s' "$body" | python3 -c "import json,sys;print(json.load(sys.stdin).get('state',''))" 2>/dev/null || echo)
                     case "$state" in
                       succeeded) echo "deploy verified on the box"; exit 0 ;;
                       failed) printf '%s\\n' "$body"
                               echo "the new container never came up healthy, so Coolify rolled"
                               echo "the deploy back — the PREVIOUS version is still serving and"
-                              echo "will answer the health check below. check: apps_logs {app_id}"
+                              echo "will answer the health check below. check: apps_logs {app_ref}"
                               exit 1 ;;
                       running|"") sleep 5 ;;
                       unknown) printf '%s\\n' "$body"
@@ -233,7 +344,7 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
               # step tests something.
               - name: Wait for the new version to be healthy
                 run: |
-                  url="https://{app_id}{DOMAIN_SUFFIX}{health_path}"
+                  url="https://{app_ref}{DOMAIN_SUFFIX}{health_path}"
                   for i in $(seq 1 40); do
                     code=$(curl -s -o /dev/null -w '%{{http_code}}' "$url" || echo 000)
                     case "$code" in
@@ -262,7 +373,7 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                     esac
                   done
                   echo "no 2xx from $url — either the app did not come up"
-                  echo "(check: apps_logs {app_id}) or the app does not serve"
+                  echo "(check: apps_logs {app_ref}) or the app does not serve"
                   echo "{health_path}; fix the route or change health_path"
                   exit 1
         """)
@@ -355,7 +466,8 @@ def _dockerfile_rules(health_path: str) -> str:
 
 @router.get("/{app_id}/deploy-workflow", operation_id="apps_deploy_workflow",
             summary="Get the GitHub Actions workflow that redeploys this app on every push")
-async def deploy_workflow(app_id: str, repo_name: str | None = None):
+async def deploy_workflow(app_id: str, repo_name: str | None = None,
+                          dev_app: str | None = None):
     """Return everything needed to wire an app up to automatic deployment from
     GitHub: the complete workflow file, where to save it, which repository
     secret to create, and the constraints its Dockerfile must satisfy.
@@ -377,22 +489,30 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
     the generated file is how the parts that must not change get changed by
     accident.
 
-    **The workflow always deploys from `main` and only `main` — this is not
-    configurable.** There used to be a `branches` parameter here, with advice to
+    **The trigger branches are not configurable, and `dev` is the only addition
+    to `main`.** There used to be a `branches` parameter here, with advice to
     "pass the branch actually being worked on" so a feature-branch push wouldn't
     look like a silently-missing run. That advice is exactly what put two apps
     into production serving whatever a stale feature branch built:
     `ping-pong`'s workflow ended up wired to `[main, 'claude/**']` and `snake`'s
     to a single named branch from a finished PR — both left over from a session
     scaffolding CI mid-feature, and both meant a push to that branch redeployed
-    the live app with no PR and no merge to main. A workflow that only ever
-    triggers on `main` is the safe default: on a feature branch it looks
-    "missing" because it correctly did not run, and that is the point, not a
-    bug to work around by widening the trigger.
+    the live app with no PR and no merge to main. On a feature branch the
+    workflow looks "missing" because it correctly did not run, and that is the
+    point, not a bug to work around by widening the trigger.
 
-    Secrets: one, PAAS_KEY — the app's scoped deploy key, which authenticates
-    both halves of a deploy (the backend's /refresh call and the frontend
-    upload). It can only ever deploy this one app.
+    `dev_app` below is the one sanctioned exception, and it is not the old
+    parameter under a new name: the branch name is fixed at `dev`, it is never
+    taken from the caller, and it deploys a SEPARATE app rather than the live
+    one. What made `ping-pong` and `snake` dangerous was an arbitrary branch
+    pushing to the production app; a declared sister app has neither half of
+    that.
+
+    Secrets: one per app, and PAAS_KEY is this app's — its scoped deploy key,
+    which authenticates both halves of a deploy (the backend's /refresh call and
+    the frontend upload). It can only ever deploy this one app, so a repository
+    with a `dev_app` needs a second, PAAS_KEY_DEV, holding the sister app's own
+    key. `required_secrets` in the result lists exactly the ones to install.
 
     Do not ask the user to create that secret by hand — set it yourself. The key
     is returned by apps_create (as `paas_key`) and re-issued by apps_deploy_key,
@@ -402,6 +522,28 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
 
     `repo_name` defaults to the app id. Pass it explicitly when the GitHub
     repository is named differently from the app.
+
+    `dev_app` — for a repository with a **dev branch**, the id of the sister app
+    that `dev` deploys to. Pass it and the returned workflow serves both from one
+    file: `main` deploys `app_id`, `dev` deploys `dev_app`, each to its own
+    hostname, database, environment, schedule and release cadence. `dev` is added
+    to the trigger branches automatically.
+
+    Create the sister app first — `apps_create <id>-dev` with its own db_engine —
+    and install ITS key as a second repository secret named **PAAS_KEY_DEV**
+    (apps_create returns it; github_secret_set writes it). The main app keeps
+    PAAS_KEY. Two apps means two scoped keys, and each can only deploy its own.
+
+    The convention is `<id>` and `<id>-dev`, which gives the dev app the URL
+    `<id>-dev-coolify.bogdanripa.com`. Ids are capped at 31 characters, so the
+    base id must be 27 or shorter for the suffix to fit.
+
+    **The image tags differ per branch, and that is the point.** main pushes
+    `:latest`, dev pushes `:dev`, each with a per-commit tag alongside. Both apps
+    auto-update from their moving tag, so if dev pushed `:latest` the box's
+    hourly sweep would deploy a dev build to production — silently, because a
+    deploy that succeeds looks identical whichever commit it carries. Do not
+    collapse the two tags.
     """
     async with pool().acquire() as c:
         row = await c.fetchrow(
@@ -410,19 +552,44 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         raise HTTPException(404, "no such app — create it first with apps_create")
 
     repo = repo_name or app_id
-    branch_list = ["main"]
     health_path = row["health_path"] or "/"
 
+    # The sister app must already exist, for the same reason the main one must:
+    # the workflow's first /refresh is what creates its container, and a deploy
+    # aimed at an app that is not registered fails at the hook with a 404 that
+    # reads like an auth problem. Checked here rather than left to the run.
+    if dev_app:
+        if dev_app == app_id:
+            raise HTTPException(422, "dev_app must be a different app from app_id")
+        async with pool().acquire() as c:
+            if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", dev_app):
+                raise HTTPException(
+                    404, f"no such app '{dev_app}' — create the sister app first "
+                         f"with apps_create, then re-run this")
+
+    branch_list = ["main", "dev"] if dev_app else ["main"]
+
     notes = [
-        "Each push to main builds an arm64 image and pushes it to ghcr.io "
-        "tagged ':latest' (and with the commit sha for traceability), then "
-        "calls this app's /refresh hook so the box redeploys the new image "
-        "right away. A push to any other branch does nothing, deliberately — "
-        "this is not a parameter to widen. Work on a feature branch and merge "
-        "it to main to ship; do not repoint the trigger at the branch you are "
-        "on, which is how a feature branch ends up deploying to production "
-        "indefinitely after the feature is done (ARCHITECTURE.md has the "
-        "ping-pong/snake incident).",
+        ("Each push to main builds an arm64 image and pushes it to ghcr.io "
+         f"tagged ':latest' (and with the commit sha for traceability), then "
+         f"calls {app_id}'s /refresh hook; a push to dev does the same with "
+         f"':dev' and {dev_app}. A push to any OTHER branch does nothing, "
+         "deliberately — the trigger is main and dev, and that is not a "
+         "parameter to widen. Work on a feature branch and merge it to main or "
+         "dev to ship; do not repoint the trigger at the branch you are on, "
+         "which is how a feature branch ends up deploying to a live app "
+         "indefinitely after the feature is done (ARCHITECTURE.md has the "
+         "ping-pong/snake incident)."
+         if dev_app else
+         "Each push to main builds an arm64 image and pushes it to ghcr.io "
+         "tagged ':latest' (and with the commit sha for traceability), then "
+         "calls this app's /refresh hook so the box redeploys the new image "
+         "right away. A push to any other branch does nothing, deliberately — "
+         "this is not a parameter to widen. Work on a feature branch and merge "
+         "it to main to ship; do not repoint the trigger at the branch you are "
+         "on, which is how a feature branch ends up deploying to production "
+         "indefinitely after the feature is done (ARCHITECTURE.md has the "
+         "ping-pong/snake incident)."),
         "The image is built natively on an arm64 runner rather than cross-built "
         "under QEMU, so build time is dominated by the image itself and not by "
         "emulation. It still varies with size and with what has to compile. Do "
@@ -444,11 +611,17 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "this app also ships a frontend, keep health_path on a path the BACKEND "
         "owns: '/' is served by the static bundle from the CDN with no container "
         "involved, so a '/' check passes even with a dead API.",
-        "The workflow needs ONE secret: PAAS_KEY, this app's scoped deploy key. "
+        ("The workflow needs TWO secrets: PAAS_KEY for this app and "
+         f"PAAS_KEY_DEV for {dev_app}, each that app's own scoped deploy key. "
+         "Set both with github_secret_set — apps_create returns each key as "
+         "`paas_key` — rather than asking the user to paste them. Each is scoped "
+         "to its own app, so a leaked copy can only deploy that one."
+         if dev_app else
+         "The workflow needs ONE secret: PAAS_KEY, this app's scoped deploy key. "
         "Set it yourself with github_secret_set — apps_create returns the key as "
         "`paas_key` and apps_deploy_key re-issues one — rather than asking the "
         "user to paste it. It is scoped to this app alone, so a leaked copy can "
-        "only deploy this one app.",
+        "only deploy this one app."),
         "The first /refresh call is what CREATES the app's container: an app is "
         "registered as a bare id, and its pipeline reports what it built. After "
         "that the box watches the tag itself and redeploys only when the digest "
@@ -473,6 +646,24 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
         "Actions access → add this repo with the Write role, or let CI create the "
         "package from the start.",
     ]
+    if dev_app:
+        notes.insert(0,
+            f"This repository deploys TWO apps: pushes to main deploy {app_id} "
+            f"(image tag :latest), pushes to dev deploy {dev_app} (image tag "
+            ":dev). They share a repository and a Dockerfile and nothing else — "
+            "separate hostname, database, environment variables, scheduled jobs, "
+            "sleep behaviour, analytics and deploy key. Release them "
+            "independently; neither waits for the other, and the concurrency "
+            "group is per-branch so they never serialise.")
+        notes.insert(1,
+            "The two image tags must never be collapsed into one. Each app "
+            "auto-updates from its own moving tag, so a dev build pushed to "
+            ":latest would be deployed to production by the box's hourly sweep, "
+            "with nothing to notice it: a deploy that succeeds looks the same "
+            "whichever commit it carries. Each branch also gets a per-commit tag "
+            "(:sha-xxxxxxx on main, :dev-xxxxxxx on dev) so either side can be "
+            "rolled back to a specific build.")
+
     if row["db_engine"]:
         notes.append(
             f"This app has a {row['db_engine']} database. Its connection string is "
@@ -480,40 +671,65 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
             "read it from the environment, never hardcode it. Run migrations from "
             "the app's own startup code or via db_run_script, not from the workflow.")
 
+    secrets = [
+        {"name": "PAAS_KEY",
+         "value_from": f"{app_id}'s scoped deploy key — apps_create returns it "
+                       "as `paas_key`, apps_deploy_key re-issues one",
+         "install_with": "github_secret_set",
+         "used_by": "the main branch: both the backend /refresh call and the "
+                    "frontend upload"},
+    ]
+    if dev_app:
+        secrets.append(
+            {"name": "PAAS_KEY_DEV",
+             "value_from": f"{dev_app}'s OWN scoped deploy key — the sister app's "
+                           "`paas_key`, not a copy of PAAS_KEY, which cannot "
+                           "deploy it",
+             "install_with": "github_secret_set",
+             "used_by": "the dev branch: both the backend /refresh call and the "
+                        "frontend upload"})
+
     return {
         "app_id": app_id,
         "url": app_url(app_id),
         "setup": [
-            "Drive this end to end with your GitHub tools — including the secret. "
-            "No human step. Do not build the image locally.",
-            "0. Install PAAS_KEY in the app's repo with github_secret_set, using "
-            "the key from apps_create (or apps_deploy_key). Do this first: the "
-            "workflow's deploy step fails without it. Set the app's own secrets "
-            "now too (apps_env_set) — they are staged until the first container "
-            "exists, and an app that needs one at import cannot boot without it.",
+            "Drive this end to end with your GitHub tools — including the "
+            "secrets. No human step. Do not build the image locally.",
+            "0. Install every secret in `required_secrets` in the app's repo "
+            "with github_secret_set, using the key apps_create returned for "
+            "EACH app (apps_deploy_key re-issues one). Do this first: the "
+            "workflow's deploy step fails without it. Set each app's own "
+            "secrets now too (apps_env_set) — they are staged until the first "
+            "container exists, and an app that needs one at import cannot boot "
+            "without it.",
             "1. Write `workflow` verbatim to `workflow_path` in the app's repo "
             "and commit it. If the repository name does not match the app id, "
             "call this tool again with `repo_name` rather than editing the file "
             "by hand — never repoint the branch trigger.",
             "2. Make sure the app's Dockerfile satisfies "
             "`dockerfile_requirements`.",
-            "3. Merge to main. CI builds and pushes the arm64 image and calls "
-            "the app's /refresh hook; the box redeploys the new image. "
-            "Deploying is CI's job — there is no tool to deploy an app by hand, "
-            "and pushing straight to a feature branch will not trigger it.",
+            ("3. Merge to dev to ship the dev app, to main to ship production. "
+             "CI builds and pushes the arm64 image for that branch and calls "
+             "that app's /refresh hook; the box redeploys the new image. "
+             "Deploying is CI's job — there is no tool to deploy an app by "
+             "hand, and pushing straight to a feature branch will not trigger "
+             "it."
+             if dev_app else
+             "3. Merge to main. CI builds and pushes the arm64 image and calls "
+             "the app's /refresh hook; the box redeploys the new image. "
+             "Deploying is CI's job — there is no tool to deploy an app by "
+             "hand, and pushing straight to a feature branch will not trigger "
+             "it."),
         ],
         "workflow_path": ".github/workflows/deploy.yml",
-        "workflow": _workflow(app_id, repo, branch_list, health_path),
-        "deploys_from_branch": "main",
+        "workflow": _workflow(app_id, repo, branch_list, health_path, dev_app),
+        # A list, not their singular "main": with a sister app this is
+        # ["main", "dev"] and reporting one of them would be a lie.
+        "deploys_from_branches": branch_list,
         "health_path": health_path,
-        # One secret, and the platform installs it itself (see the notes).
-        "required_secrets": [
-            {"name": "PAAS_KEY",
-             "value_from": "the app's scoped deploy key — apps_create returns it "
-                           "as `paas_key`, apps_deploy_key re-issues one",
-             "install_with": "github_secret_set",
-             "used_by": "both the backend /refresh call and the frontend upload"},
-        ],
+        # The platform installs these itself (see the notes). One per app, so a
+        # repository with a sister app needs two — one scoped key each.
+        "required_secrets": secrets,
         "dockerfile_requirements": _dockerfile_rules(health_path),
         "notes": notes,
         # Two variants because a static site is not always a built site. Picking
@@ -527,8 +743,8 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None):
                      "apps_frontend_write would publish. Running the build "
                      "variant against a no-build site fails on the missing "
                      "package.json or the missing script.",
-            "with_build": _frontend_job(app_id),
-            "no_build": _frontend_job_no_build(app_id),
+            "with_build": _frontend_job(*_fe_refs(app_id, dev_app)),
+            "no_build": _frontend_job_no_build(*_fe_refs(app_id, dev_app)),
         },
         "frontend_notes": [
             "An app can have a backend (docker image), a static frontend (a zip of "

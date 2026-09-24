@@ -768,6 +768,44 @@ this works for backend-only apps. Validation rejects the mistakes that would
 otherwise fail silently: a target placeholder the pattern never captures, a
 duplicate source, or a rule pointing at itself.
 
+## A dev branch: two sister apps
+
+A repository with a `dev` branch deploys **two apps**, not one branch of one app:
+
+| | main | dev |
+|---|---|---|
+| app id | `notes` | `notes-dev` |
+| URL | `notes-coolify.bogdanripa.com` | `notes-dev-coolify.bogdanripa.com` |
+| image tags | `:latest`, `:sha-xxxxxxx` | `:dev`, `:dev-xxxxxxx` |
+| repo secret | `PAAS_KEY` | `PAAS_KEY_DEV` |
+| database, env, crons, sleep, analytics | its own | its own |
+
+There is no new concept here — an app already *is* a hostname plus a container
+plus a database plus a release cadence, so two apps is exactly the right shape.
+They share a repository and a Dockerfile and nothing else, and neither waits for
+the other.
+
+Setting it up, all of which the model can do without a human step:
+
+```
+apps_create notes-dev --db_engine postgres     # its own database
+github_secret_set notes PAAS_KEY_DEV <its key> # alongside the existing PAAS_KEY
+apps_deploy_workflow notes --dev_app notes-dev # one workflow, both branches
+```
+
+`<id>-dev` is a convention, not something the platform enforces — nothing links
+the two rows. Ids are capped at 31 characters, so the base id must be 27 or
+shorter for the suffix to fit. Turning `sleep_when_idle` on for the dev app is
+usually worth it: it is idle far more than production.
+
+**The two image tags must never be collapsed into one.** Each app auto-updates
+from its own moving tag, so if the dev branch pushed `:latest` the box's hourly
+sweep would deploy a dev build to production — silently, because a deploy that
+succeeds looks identical whichever commit it carries. That is the entire safety
+property of this arrangement, and it is one string away from being lost;
+`tests/test_deploy_workflow.py` asserts it. Each branch also gets a per-commit
+tag so either side can be rolled back to a specific build.
+
 ## Custom domains
 
 An app can answer on hostnames of its own **in addition to** the generated
