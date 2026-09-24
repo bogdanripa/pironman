@@ -94,9 +94,32 @@ def main_():
         if m in ("GET", "PUT", "DELETE"):
             if not t.annotations.idempotentHint:
                 check(f"{n} ({m}) is idempotent", False)
-        elif m == "POST" and t.annotations.idempotentHint:
-            check(f"{n} (POST) is not marked idempotent", False)
+        elif (m == "POST" and t.annotations.idempotentHint
+              and not t.annotations.readOnlyHint):
+            # A read-only POST is idempotent by definition — repeating a read
+            # changes nothing. Only a POST that WRITES has to disclaim it.
+            check(f"{n} (POST, not read-only) is not marked idempotent", False)
     check("idempotency matches every route's verb", True)
+
+    print("\n[the database pair: one readable, one gated]")
+    # The point of db_read_query is that an agent can be handed the reading it
+    # does all day without being handed the tool that can also drop a table. If
+    # these two ever carry the same annotations, that separation is gone and
+    # nothing else would say so.
+    if "db_read_query" in tools and "db_run_script" in tools:
+        ro, rw = tools["db_read_query"], tools["db_run_script"]
+        check("db_read_query is read-only", ro.annotations.readOnlyHint is True)
+        check("db_read_query is not destructive",
+              ro.annotations.destructiveHint is False)
+        check("db_run_script is still destructive",
+              rw.annotations.destructiveHint is True)
+        check("the two are genuinely annotated differently",
+              ro.annotations.readOnlyHint != rw.annotations.readOnlyHint)
+        # Both are POSTs; the method cannot tell them apart, which is exactly
+        # why the override exists.
+        check("and the HTTP method alone could NOT have told them apart",
+              methods.get("db_read_query") == methods.get("db_run_script") == "POST",
+              f"{methods.get('db_read_query')} / {methods.get('db_run_script')}")
 
     print("\n[openWorldHint marks the tools that leave this box]")
     for n in ("github_secret_set", "github_secrets_list", "github_secret_delete"):

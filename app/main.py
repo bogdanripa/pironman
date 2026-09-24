@@ -692,6 +692,15 @@ try:
     # the warning.
     _DESTRUCTIVE = {"host_run_script", "db_run_script"}
 
+    # The mirror image: a POST that genuinely only reads. db_read_query sends a
+    # query in a body, which is why it is a POST rather than a GET, but it
+    # connects as a role holding SELECT and nothing else inside a read-only
+    # transaction — so the method says "writes" and the database says otherwise.
+    # The database is right. Kept as a short explicit list because the honest
+    # alternative, trusting the verb, would hide this tool from exactly the
+    # autonomous callers it was built for.
+    _READ_ONLY = {"db_read_query"}
+
     # Reaches something outside this box. Everything else acts on the Pi alone,
     # which is a closed world: the tool's effects are bounded by the machine.
     _OPEN_WORLD = {"github_secret_set", "github_secret_delete",
@@ -714,6 +723,10 @@ try:
         if _tool.name in _DESTRUCTIVE:
             hints["readOnlyHint"] = False
             hints["destructiveHint"] = True
+        elif _tool.name in _READ_ONLY:
+            hints["readOnlyHint"] = True
+            hints["destructiveHint"] = False
+            hints["idempotentHint"] = True
         hints["openWorldHint"] = _tool.name in _OPEN_WORLD
         _tool.annotations = ToolAnnotations(**hints)
 

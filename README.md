@@ -890,6 +890,40 @@ the first run, with an error naming a missing file rather than a wrong workflow
 
 All three kinds work with a `dev_app` pair.
 
+## Reading an app's data without being able to change it
+
+`db_read_query` connects as a second login, `<app>_ro`, that holds SELECT and
+nothing else. `db_run_script` — the one that can migrate, seed and repair — is
+unchanged and marked destructive, so an agent platform can gate it while the
+reading an agent does all day stays available.
+
+**The restriction is the database's.** Nothing parses the SQL, because a
+"does it start with SELECT" check reads as a guardrail and is not one:
+`WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x` passes it, and a
+VOLATILE function can write. A privilege does not care how the write is spelled.
+
+Measured on this box (PostgreSQL 18.4), as the read-only role:
+
+| attempt | answer |
+|---|---|
+| `SELECT` | works |
+| `INSERT` / `UPDATE` / `DELETE` | `permission denied for table …` |
+| `DELETE` hidden in a CTE | `permission denied for table …` |
+| `DROP TABLE` | `must be owner of table …` |
+| `CREATE TABLE` | `permission denied for schema public` |
+| another app's database | connects, but every read is `permission denied` |
+
+The role also carries `default_transaction_read_only = on`. **That part is
+defence in depth, not a second wall** — a caller can `SET` it off, and because
+the script is piped to psql on stdin each statement runs in its own
+transaction, so the setting applies to everything after it. The grants are what
+actually hold. Widening them is what would make this tool writable; the
+transaction setting would not save it.
+
+The login is created the first time the tool is used for an app, and its grants
+are refreshed on each call, so tables created since stay readable
+(`ALTER DEFAULT PRIVILEGES` covers what the app's own user creates).
+
 ## What is actually live (`deploys_status`)
 
 Per app, **two** entries — the last image deploy and the last frontend upload —

@@ -7,6 +7,7 @@ means the script stays usable by hand for debugging.
 import asyncio
 import json
 import re
+import secrets
 from urllib.parse import quote
 
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
@@ -136,3 +137,137 @@ async def run_script(engine: str, database: str, user: str, password: str,
         proc.kill()
         raise ProvisionError("script timed out")
     return out.decode()
+
+
+# The read-only role's name is derived, never chosen: one per app, so a leaked
+# credential names exactly one database and the tool that uses it cannot be
+# pointed anywhere else.
+def ro_user(name: str) -> str:
+    return f"{name}_ro"
+
+
+async def _as_superuser(engine: str, sql: str, database: str | None = None,
+                        timeout: int = 30) -> str:
+    """Run one statement batch as the engine's own superuser.
+
+    Needed because granting is the owner's prerogative and the app's user cannot
+    create a role. Deliberately NOT reachable from any tool — the only callers
+    are the provisioning paths in this module.
+    """
+    host = await current_host(engine)
+    if engine == "postgres":
+        cmd = ["docker", "exec", "-i",
+               "-e", f"PGOPTIONS=-c statement_timeout={timeout * 1000}",
+               host, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1",
+               "-d", database or "postgres"]
+    else:
+        cmd = ["docker", "exec", "-i", host, "mongosh", "--quiet"]
+        u = await _mongo_root(host)
+        if u:
+            cmd = ["docker", "exec", "-i", host, "mongosh", "--quiet",
+                   "-u", u[0], "-p", u[1], "--authenticationDatabase", "admin"]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(sql.encode()),
+                                        timeout + 10)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise ProvisionError("privileged statement timed out")
+    text = out.decode()
+    if proc.returncode != 0:
+        raise ProvisionError(text.strip()[:400] or "privileged statement failed")
+    return text
+
+
+async def _mongo_root(host: str) -> tuple[str, str] | None:
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", host, "printenv", "MONGO_INITDB_ROOT_USERNAME",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    user = out.decode().strip()
+    if not user:
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", host, "printenv", "MONGO_INITDB_ROOT_PASSWORD",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    return user, out.decode().strip()
+
+
+async def ensure_readonly(name: str, engine: str,
+                          password: str | None = None) -> str:
+    """Create (or re-grant) a read-only login for one app's database, and return
+    its password.
+
+    **The restriction is the database's, not the tool's.** Nothing here inspects
+    the SQL a caller sends, because a "SELECT-only" check is the kind of
+    guardrail that reads as security and is not: `WITH x AS (DELETE FROM t
+    RETURNING *) SELECT * FROM x` starts with the wrong word, a function can
+    write, and a statement can be spelled a dozen ways. An engine-enforced
+    privilege has none of those edges — it does not care how the write is
+    spelled.
+
+    Two layers, and it matters which one is load-bearing:
+
+      1. **The grants are the boundary.** The role holds SELECT and nothing
+         else, so a write has no privilege to use, and no amount of session
+         fiddling creates one. Measured on this box 2026-09-24 against
+         PostgreSQL 18.4: INSERT/UPDATE/DELETE and a DELETE hidden in a CTE all
+         answer `permission denied for table …`, DROP answers `must be owner`,
+         and CREATE TABLE answers `permission denied for schema public`.
+      2. `default_transaction_read_only = on` on the role is defence in depth,
+         NOT a second wall. A caller can turn it off — `SET
+         default_transaction_read_only = off` succeeds, and because run_script
+         pipes the script to psql on stdin each statement runs in its own
+         implicit transaction, so the setting takes effect for the ones that
+         follow. It was verified failing exactly that way. What it still buys
+         is a clearer error for an honest mistake, and a backstop if a SELECT
+         grant is ever widened by accident — it does not stop someone who
+         means it, and it must not be described as though it does.
+
+    So the thing to protect is the grant list. Widening it is what would make
+    this tool writable; the transaction setting would not save it.
+
+    Idempotent: re-applies grants every time, which is what picks up tables
+    created since the role was made. ALTER DEFAULT PRIVILEGES covers what the
+    app's own user creates from here on; the blanket GRANT covers what already
+    exists and anything created by another owner.
+    """
+    password = password or secrets.token_hex(24)
+    ro = ro_user(name)
+    if engine == "postgres":
+        # Role first, in the maintenance database; grants second, inside the
+        # app's own database, because that is where the schema lives.
+        await _as_superuser("postgres", f"""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{ro}') THEN
+                CREATE ROLE "{ro}" LOGIN;
+              END IF;
+            END $$;
+            ALTER ROLE "{ro}" WITH PASSWORD '{password}'
+              NOSUPERUSER NOCREATEDB NOCREATEROLE;
+            ALTER ROLE "{ro}" SET default_transaction_read_only = on;
+            GRANT CONNECT ON DATABASE "{name}" TO "{ro}";
+        """)
+        await _as_superuser("postgres", f"""
+            GRANT USAGE ON SCHEMA public TO "{ro}";
+            GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{ro}";
+            ALTER DEFAULT PRIVILEGES FOR ROLE "{name}" IN SCHEMA public
+              GRANT SELECT ON TABLES TO "{ro}";
+        """, database=name)
+    else:
+        # Mongo's built-in `read` role is exactly this, scoped to one database.
+        await _as_superuser("mongo", f"""
+            db = db.getSiblingDB({name!r});
+            if (db.getUser({ro!r})) {{
+              db.updateUser({ro!r}, {{pwd: {password!r},
+                                      roles: [{{role: 'read', db: {name!r}}}]}});
+            }} else {{
+              db.createUser({{user: {ro!r}, pwd: {password!r},
+                              roles: [{{role: 'read', db: {name!r}}}]}});
+            }}
+        """)
+    return password

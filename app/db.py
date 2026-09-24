@@ -243,6 +243,14 @@ CREATE INDEX IF NOT EXISTS deploys_app ON deploys (app_id, queued_at DESC);
 -- hides behind a fresh image. `commit` is the source sha the pipeline built
 -- from, sent by the generated workflows — without it the only way to tell what
 -- is deployed is to compare timestamps, which is a guess dressed as a fact.
+-- A second, read-only login per app, created lazily the first time
+-- db_read_query is used. Stored rather than derived: it is a real credential
+-- the engine checks, and regenerating it on every call would race with itself.
+-- Its restriction lives in the database (SELECT-only grants plus
+-- default_transaction_read_only on the role), never in this codebase — see
+-- provision.ensure_readonly.
+ALTER TABLE IF EXISTS apps ADD COLUMN IF NOT EXISTS db_ro_password text;
+
 ALTER TABLE IF EXISTS deploys ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'backend';
 ALTER TABLE IF EXISTS deploys ADD COLUMN IF NOT EXISTS commit_sha text;
 CREATE INDEX IF NOT EXISTS deploys_app_kind ON deploys (app_id, kind, queued_at DESC);

@@ -87,6 +87,8 @@ SAFE_OPTIONAL = {
     "host_run_script":    {"timeout": "a wrong timeout kills the script early; "
                                       "it cannot make it do more"},
     "db_run_script":      {"timeout": "as host_run_script"},
+    "db_read_query":      {"timeout": "a wrong timeout ends the read early; "
+                                      "the connection cannot write either way"},
     "apps_logs":          {"lines": "a read, bounded either way",
                            "since": "a read, bounded either way"},
     "apps_stats":         {"app_id": "absent means every app — a read"},

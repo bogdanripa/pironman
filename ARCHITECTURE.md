@@ -541,6 +541,37 @@ an MCP client with no auth configured will see on its first call.
 > database** — it uses `_paas`, which lives outside the per-app attach model, so
 > its `apps` row has no `db_engine`.
 
+### Two logins per app: the owner, and a read-only one
+
+Each app's database has its own owner role (`<app>`) created at provisioning,
+and — lazily, the first time `db_read_query` is used — a second login
+`<app>_ro` holding SELECT and nothing else. Its password lives in
+`apps.db_ro_password`; its grants are re-applied on every call, which is what
+keeps tables created since the role was made readable.
+
+The split exists so the reading an autonomous agent does constantly does not
+require the tool that can also drop a table: `db_run_script` stays
+`destructiveHint` and gateable, `db_read_query` is `readOnlyHint`. Both are
+POSTs, so the HTTP method cannot tell them apart — the annotation override in
+`app/main.py` is what does, and `tests/test_mcp_annotations.py` pins it.
+
+**The grants are the security boundary, and nothing else is.** The role also
+has `default_transaction_read_only = on`, which is worth having but is not a
+wall: `SET default_transaction_read_only = off` is a USERSET GUC and simply
+succeeds, and because `provision.run_script` pipes the script to psql on stdin,
+each statement runs in its own implicit transaction — so the setting applies to
+everything after it. Verified failing exactly that way on 2026-09-24. Verified
+holding, in the same run: with the read-only default disabled, INSERT, UPDATE,
+DELETE and a DELETE hidden inside a CTE all answered `permission denied`, DROP
+answered `must be owner`, CREATE TABLE answered `permission denied for schema
+public`, and the data was unchanged afterwards.
+
+Note also what the per-app split does NOT buy: any app's role can CONNECT to
+another app's database and read `pg_tables`, because Postgres catalogs are
+world-readable. Data is unreachable (`permission denied` on every table) and so
+is creating anything, but table *names* leak across apps. That is a property of
+Postgres, not of this platform's grants.
+
 ### Self-migrating schema
 
 `app/db.py` holds a `_SCHEMA` of `CREATE TABLE IF NOT EXISTS` /
