@@ -12,7 +12,7 @@ from ..auth import require_key
 from ..db import pool
 from ..locks import app_lock
 from ..config import app_url, STATIC_HOST_APP
-from .. import cdn, frontends, routing
+from .. import deploys, cdn, frontends, routing
 
 router = APIRouter(prefix="/apps", tags=["frontend"],
                    dependencies=[Depends(require_key)])
@@ -62,7 +62,8 @@ async def _sync_manifest(c, app_id: str) -> dict:
 @router.put("/{app_id}/frontend", operation_id="apps_frontend_deploy",
             summary="Upload a static frontend bundle (zip) for an app",
             include_in_schema=True)
-async def deploy_frontend(app_id: str, request: Request):
+async def deploy_frontend(app_id: str, request: Request,
+                          commit: str | None = None):
     """Deploy a frontend by uploading its built static files as a zip.
 
     Send the raw zip as the request body (`--data-binary @site.zip`). The zip
@@ -90,6 +91,13 @@ async def deploy_frontend(app_id: str, request: Request):
         await c.execute("UPDATE apps SET has_frontend = true WHERE id = $1", app_id)
         cfg = await _sync_manifest(c, app_id)
     purged = await cdn.purge(app_id, res.pop("paths", []))
+    # A frontend upload is a deploy that begins and ends inside one request —
+    # no container, no image, nothing to poll — so it had no record anywhere,
+    # and "what is live" could only be answered for the backend half. Recorded
+    # here so deploys_status can report both halves separately, which is the
+    # only way a stale bundle behind a fresh image shows up as what it is.
+    await deploys.record(app_id, "frontend", True, commit=commit,
+                         files=res.get("files"))
     return {"id": app_id, "deployed": True, "url": app_url(app_id),
             **res, **cfg, "cdn": purged}
 

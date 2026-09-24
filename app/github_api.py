@@ -60,3 +60,40 @@ async def set_secret(owner: str, repo: str, name: str, value: str) -> None:
 
 async def delete_secret(owner: str, repo: str, name: str) -> None:
     await _request("DELETE", f"/repos/{owner}/{repo}/actions/secrets/{name}")
+
+
+async def read_file(owner: str, repo: str, path: str) -> str | None:
+    """A repository file's text, or None if it is not there.
+
+    None means "not in the repo"; anything else raises. That distinction is the
+    whole point — a 404 is an answer, while a 403 from a token that cannot see
+    the repo is not, and treating the second as the first is how "this repo has
+    no Dockerfile" gets concluded about a repository nobody could read.
+
+    Deliberately not routed through _request: that helper calls .json() on every
+    response, and this one asks for the file RAW, so the body is a Dockerfile,
+    not JSON.
+    """
+    if not GITHUB_TOKEN:
+        raise GitHubError("no GitHub token configured (set GITHUB_TOKEN)")
+    async with _client() as c:
+        r = await c.get(f"/repos/{owner}/{repo}/contents/{path}",
+                        headers={"Accept": "application/vnd.github.raw"})
+    if r.status_code == 404:
+        return None
+    if r.status_code >= 400:
+        raise GitHubError(
+            f"GET /repos/{owner}/{repo}/contents/{path} -> {r.status_code}: "
+            f"{r.text[:300]}")
+    ctype = r.headers.get("content-type", "")
+    if ctype.startswith("application/json"):
+        # The raw header was ignored, or this path is a directory.
+        data = r.json()
+        if isinstance(data, dict) and data.get("content"):
+            return base64.b64decode(data["content"]).decode("utf-8", "replace")
+        return None
+    return r.text
+
+
+async def has_file(owner: str, repo: str, path: str) -> bool:
+    return await read_file(owner, repo, path) is not None

@@ -258,12 +258,33 @@ stops the run dead. The connector's approval gate keys on the MCP annotations in
 | `readOnlyHint=False` (the `else` bucket) | untested — see below |
 | `destructiveHint=True` | **prompts, and the run blocks until a human answers** |
 
-`host_run_script` and `db_run_script` are kept out of `_DESTRUCTIVE` for exactly
-this reason. The cost is real and worth stating plainly: a root shell on the box
-and arbitrary SQL now execute in a scheduled run with no interactive
-confirmation. What replaces the gate is the routine's own prompt — its
-MUST-NOT-without-asking list is, as that prompt says, the only guardrail left.
-Write those lists as if nothing else will stop the model, because nothing will.
+**Changed 2026-09-24, and it breaks the nightly audit unless you act.**
+`host_run_script` and `db_run_script` were kept out of `_DESTRUCTIVE` for
+exactly the reason above. They are marked destructive now, at the owner's
+instruction, because the Tasks agent platform hides destructive tools unless an
+admin allows them and an unreviewed root shell is the wrong default to hand an
+autonomous agent.
+
+Both readings are right, and they point opposite ways. Tasks wants the gate;
+claude.ai Routines are killed by it. Nothing in the repo can satisfy both,
+because the annotation is one static flag per tool and both platforms read the
+same flag.
+
+So: **any claude.ai Routine that calls either tool needs an explicit allowance,
+or it will block on its first call exactly as the 2026-08-03 audit did** — and
+that audit's liveness probe is `host_run_script`, so it is the one most
+affected. Check the next unattended run actually completed rather than assuming
+it did; see the symptom below, which is that it produces nothing at all.
+
+Annotations are no longer two hand-maintained lists. They are derived from each
+route's HTTP method (GET read-only and idempotent, DELETE destructive and
+idempotent, PUT idempotent, POST neither), with the two script tools as the only
+override. A tool whose method cannot be resolved is annotated conservatively
+*and* logged, because the previous lists had silently drifted:
+`platform_tasks_health` and `platform_events` are plain GETs that were
+advertised as state-changing for months — the first being the highest-signal
+check the audit makes. `tests/test_mcp_annotations.py` keeps the derivation
+honest.
 
 **Whether the middle row prompts is not established.** On 2026-08-03 the audit
 was blocked by a destructive tool and, once approved, every later call ran — but
@@ -768,7 +789,43 @@ this works for backend-only apps. Validation rejects the mistakes that would
 otherwise fail silently: a target placeholder the pattern never captures, a
 duplicate source, or a rule pointing at itself.
 
+## Creating an app: what you are asked, and why
+
+`apps_create` requires `db_engine`, and `none` is one of the choices. It used to
+be optional, and on 2026-09-24 an agent provisioned a Postgres nobody wanted —
+not because it decided a database was needed, but because **strict tool calling
+fills every property in the schema**. To such a caller an optional parameter is
+not an unanswered question, it is a guessed one.
+
+Requiring the choice does not stop the guessing. What it changes is which answer
+is obvious: `none` costs nothing. The same reasoning made
+`crons_create.path` and `apps_redirects_set.status` required — only the caller
+knows the first, and 301 is the one answer browsers cache indefinitely.
+`tests/test_tool_parameters.py` enforces the rule rather than the list: a new
+optional parameter on a writing tool fails the suite until someone records why
+its default is safe to apply unasked.
+
+**Keys do not have to pass through the conversation.** Pass
+`github_repo="owner/repo"` to `apps_create` or `apps_deploy_key` and the deploy
+key goes straight into GitHub's secrets API; the result says only that it was
+installed, and the key is absent from it — including on the error path, because
+failing to install a key is not a reason to publish it. `apps_get` masks the
+database password unless `reveal_db_password=true` is asked for. A deployed app
+never needs the reveal: `DATABASE_URL` is injected into its container on every
+deploy, and `db_run_script` queries without credentials.
+
+"Shown once" was always true of the mint and never of the transcript, which is
+what gets read by people who were not in the conversation.
+
 ## A dev branch: two sister apps
+
+`apps_create` with `staging: true` creates both halves in one call — `<id>` and
+`<id>-dev`, each with its own hostname, database, environment, schedule and
+deploy key (the sister's installed as `PAAS_KEY_DEV`). A pair is all-or-nothing:
+any failure after the first app is registered rolls both back, because half a
+pair is worse than none — the missing half's id is then free for something else
+to take while the half that exists looks deliberate.
+
 
 A repository with a `dev` branch deploys **two apps**, not one branch of one app:
 
@@ -805,6 +862,51 @@ succeeds looks identical whichever commit it carries. That is the entire safety
 property of this arrangement, and it is one string away from being lost;
 `tests/test_deploy_workflow.py` asserts it. Each branch also gets a per-commit
 tag so either side can be rolled back to a specific build.
+
+## What a workflow looks like depends on what the repo ships
+
+`apps_deploy_workflow` takes `kind`: `frontend`, `backend` or `both`. Leave it
+out and the platform asks the repository — it keys on whether a `Dockerfile` is
+present, and a repo it cannot read is an error rather than a guess ("no
+Dockerfile" and "no answer" are different facts).
+
+| kind | what the file does | detected when |
+|---|---|---|
+| `backend` | build arm64 image → push to ghcr → `/refresh` → verify | a Dockerfile exists |
+| `frontend` | zip the site → `PUT /apps/<id>/frontend` | no Dockerfile |
+| `both` | the backend file with the frontend job already in it | never — say it explicitly |
+
+`both` is never detected, on purpose: a Dockerfile beside a `package.json` is
+the ordinary shape of a Node service that serves its own assets, and adding a
+frontend job there would publish a bundle the app never asked to have hosted
+separately.
+
+A frontend workflow has **no image, no moving tag and no verification step**,
+and that is the design rather than an omission. There is no digest for the
+hourly sweep to watch and no rollback to catch: the upload *is* the deploy. A
+static site handed the backend workflow fails at `docker build`, minutes into
+the first run, with an error naming a missing file rather than a wrong workflow
+— which is what happened on 2026-09-24 and needed a human to unpick.
+
+All three kinds work with a `dev_app` pair.
+
+## What is actually live (`deploys_status`)
+
+Per app, **two** entries — the last image deploy and the last frontend upload —
+each with its state and the commit it was built from. They are separate because
+an app that ships both runs two CI jobs that finish at different times and can
+fail independently, so there is no single "last deploy" that is not a lie about
+one of them.
+
+The commit is the point. Without it the only way to answer "is what I pushed
+live?" is to compare a deploy time against a commit time, and that is wrong in
+exactly the case that matters: Coolify rolls a failed deploy back silently, so
+the container is *newer* than the commit and still running the previous build. A
+timestamp says something happened; a commit says what.
+
+The generated workflows send it — `"commit"` in the `/refresh` body, `?commit=`
+on the frontend upload. A null commit with a note means that repo is still on a
+workflow that predates this; regenerate it.
 
 ## Custom domains
 

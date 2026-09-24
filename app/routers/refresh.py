@@ -81,6 +81,13 @@ class RefreshBody(BaseModel):
                     "'ghcr.io/owner/repo:latest'. Required on an app's FIRST "
                     "backend deploy — it is what creates the container. Optional "
                     "afterwards: the box already watches the tag.")
+    commit: str | None = Field(
+        default=None,
+        description="The git sha this image was built from, e.g. "
+                    "${{ github.sha }}. Recorded against the deploy and "
+                    "reported by deploys_status, so 'is what I pushed live?' "
+                    "can be answered by comparing commits instead of "
+                    "timestamps. The generated workflows send it.")
 
 
 async def _deploy(app_id: str, image: str | None) -> dict:
@@ -164,6 +171,7 @@ async def refresh(app_id: str, response: Response, body: RefreshBody | None = No
     an error on the call that made it rather than as a status to go and look up.
     """
     image = body.image if body else None
+    commit = body.commit if body else None
 
     async with pool().acquire() as c:
         app = await c.fetchrow(
@@ -184,7 +192,8 @@ async def refresh(app_id: str, response: Response, body: RefreshBody | None = No
     # Written before the 202 so the id the caller is handed already resolves the
     # first time it polls. A caller that gets an id and then a 404 for it cannot
     # tell "too early" from "wrong id", and would have to guess.
-    await deploys.start(deploy_id, app_id, image=image)
+    await deploys.start(deploy_id, app_id, kind="backend",
+                        commit=commit, image=image)
 
     task = asyncio.create_task(_run(deploy_id, app_id, image))
     _running.add(task)

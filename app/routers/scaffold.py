@@ -1,9 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
+import json
+from typing import Literal
 from textwrap import dedent, indent
 
 from ..auth import require_key
 from ..db import pool
 from ..config import app_url, DOMAIN_SUFFIX, GHCR_OWNER
+from .. import github_api
 
 router = APIRouter(prefix="/apps", tags=["apps"],
                    dependencies=[Depends(require_key)])
@@ -17,12 +20,18 @@ def _upload_step(app_ref: str, key_ref: str) -> str:
         # PAAS_KEY is this app's scoped deploy key. It is already in the repo:
         # apps_create returns it and github_secret_set installs it. Nothing for
         # a human to paste.
+        #
+        # ?commit= is what lets deploys_status say WHICH build is live. Without
+        # it the only way to answer that is to compare an upload time against a
+        # commit time, which is a guess — and a wrong one whenever a deploy was
+        # rolled back, because then the newer timestamp belongs to the older
+        # build.
         - name: Upload the frontend
           run: |
             curl -fsS -X PUT \\
               -H "Authorization: Bearer {key_ref}" \\
               --data-binary @site.zip \\
-              "https://api-coolify.bogdanripa.com/apps/{app_ref}/frontend"
+              "https://api-coolify.bogdanripa.com/apps/{app_ref}/frontend?commit=${{{{ github.sha }}}}"
         """)
 
 
@@ -79,6 +88,80 @@ def _frontend_job_no_build(app_ref: str, key_ref: str) -> str:
                   -x '.git/*' '.github/*' '.gitignore' 'README.md'
 
         """) + indent(_upload_step(app_ref, key_ref), "    "), "  ")
+
+
+def _frontend_workflow(app_id: str, branches: list[str], build: bool,
+                       dev_app: str | None = None) -> str:
+    """A COMPLETE workflow for a repository that ships only a static site.
+
+    Not the backend workflow with the frontend job bolted on: a frontend-only
+    repo has no Dockerfile, so every step of the backend job fails — and it
+    fails at `docker build`, minutes in, with an error about a missing file
+    rather than about the workflow being the wrong shape. An agent handed that
+    workflow for a static site has no way to tell it was given the wrong one.
+
+    There is no image, so there is no moving tag, nothing for the box's hourly
+    sweep to watch, and no deploy to verify: the upload IS the deploy, and the
+    static host serves the new bundle on the next request. That is why this file
+    is so much shorter than the backend one, and the shortness is the point
+    rather than an omission.
+    """
+    job = (_frontend_job(*_fe_refs(app_id, dev_app)) if build
+           else _frontend_job_no_build(*_fe_refs(app_id, dev_app)))
+    picker = (indent(_target_step_frontend(app_id, dev_app), "      ") + "\n"
+              if dev_app else "")
+    head = dedent(f"""\
+        name: deploy
+
+        on:
+          push:
+            branches: [{", ".join(branches)}]
+
+        # One upload at a time per branch: two overlapping runs would both PUT a
+        # bundle and the one that finishes last wins, regardless of which commit
+        # is newer.
+        concurrency:
+          group: deploy-${{{{ github.ref }}}}
+          cancel-in-progress: true
+
+        # A static site has no container and no image. The upload is the whole
+        # deploy — there is no digest to watch, no healthcheck to wait on and no
+        # rollback to catch, which is why there is no verification step here and
+        # why its absence is not an oversight. If this repo later grows a
+        # Dockerfile, call apps_deploy_workflow again with kind='both' rather
+        # than hand-editing this file.
+
+        jobs:
+        """)
+    if not picker:
+        return head + job
+    # Paired mode needs the picker to run before the upload, inside the job.
+    lines = job.splitlines(keepends=True)
+    out = []
+    for line in lines:
+        out.append(line)
+        if line.strip() == "- uses: actions/checkout@v4":
+            out.append(picker)
+    return head + "".join(out)
+
+
+def _target_step_frontend(app_id: str, dev_app: str) -> str:
+    """The branch picker for a frontend-only paired repo. Only the app id is
+    resolved: there are no image tags to pick, because there is no image."""
+    return dedent(f"""\
+        # main -> {app_id}, dev -> {dev_app}. Separate apps, separate
+        # hostnames, separate deploy keys — one repository.
+        - name: Pick the target app
+          id: target
+          run: |
+            if [ "${{{{ github.ref_name }}}}" = "dev" ]; then
+              app={dev_app}
+            else
+              app={app_id}
+            fi
+            echo "app=$app" >> $GITHUB_OUTPUT
+            echo "branch ${{{{ github.ref_name }}}} -> app $app"
+        """)
 
 
 def _fe_refs(app_id: str, dev_app: str | None) -> tuple[str, str]:
@@ -283,7 +366,7 @@ def _workflow(app_id: str, repo_name: str, branches: list[str],
                     code=$(curl -sS -o /tmp/out -w '%{{http_code}}' -X POST \\
                       -H "Authorization: Bearer {key_ref}" \\
                       -H "Content-Type: application/json" \\
-                      -d '{{"image": "ghcr.io/{GHCR_OWNER}/{repo_name}:{moving_ref}"}}' \\
+                      -d '{{"image": "ghcr.io/{GHCR_OWNER}/{repo_name}:{moving_ref}", "commit": "${{{{ github.sha }}}}"}}' \\
                       "https://api-coolify.bogdanripa.com/apps/{app_ref}/refresh" || echo 000)
                     case "$code" in
                       2*) cat /tmp/out; echo
@@ -464,10 +547,83 @@ def _dockerfile_rules(health_path: str) -> str:
     """)
 
 
+def _assembled_workflow(kind: str, build: bool, app_id: str, repo: str,
+                        branches: list[str], health_path: str,
+                        dev_app: str | None) -> str:
+    """The one file to write, complete for this repository's shape.
+
+    'both' returns the backend workflow with the frontend job already in it,
+    rather than leaving it in optional_frontend_job for the caller to splice.
+    Splicing YAML by hand is where indentation goes wrong, and a workflow whose
+    indentation is wrong fails on GitHub, not locally — so the assembly happens
+    here, once, where a test can see it.
+    """
+    if kind == "frontend":
+        return _frontend_workflow(app_id, branches, build, dev_app)
+    backend = _workflow(app_id, repo, branches, health_path, dev_app)
+    if kind != "both":
+        return backend
+    job = (_frontend_job(*_fe_refs(app_id, dev_app)) if build
+           else _frontend_job_no_build(*_fe_refs(app_id, dev_app)))
+    return backend.rstrip("\n") + "\n\n" + job
+
+
+async def _detect_kind(repo: str) -> tuple[str, str]:
+    """Ask the repository what shape it is. Returns (kind, evidence).
+
+    The rule is the Dockerfile, because that is what the backend half of the
+    workflow actually needs: no Dockerfile, no `docker build`, so a backend
+    workflow cannot work however the repo is described. A repo that has one is
+    called 'backend' rather than 'both' on purpose — a Dockerfile plus a
+    package.json is the ordinary shape of a Node service that serves its own
+    assets, and guessing 'both' there would add a frontend job uploading a
+    bundle the app never asked to have hosted separately. Say kind='both'
+    explicitly for that.
+
+    A repository the platform cannot read is NOT reported as frontend-only.
+    "No Dockerfile" and "no answer" are different facts, and collapsing them is
+    how a private repo silently gets the wrong workflow.
+    """
+    owner, _, name = repo.partition("/") if "/" in repo else (GHCR_OWNER, "", repo)
+    name = name or repo
+    try:
+        dockerfile = await github_api.has_file(owner, name, "Dockerfile")
+    except github_api.GitHubError as e:
+        raise HTTPException(
+            502, f"could not read {owner}/{name} to work out whether it ships a "
+                 f"container ({e}). Pass kind='frontend', 'backend' or 'both' "
+                 f"explicitly and this call needs no repository access.")
+    if dockerfile:
+        return "backend", f"{owner}/{name} has a Dockerfile"
+    return "frontend", f"{owner}/{name} has no Dockerfile"
+
+
+async def _detect_build(repo: str) -> bool:
+    """Whether the static site has a build step, i.e. a package.json with a
+    `build` script. Wrong either way is a loud failure at the first run — `npm
+    run build` against a repo with no script, or a bundle of unbuilt sources —
+    so it is worth one API call rather than a coin flip. Unreadable means
+    "assume no build", which is the variant that fails on a missing file rather
+    than publishing sources as if they were a site."""
+    owner, _, name = repo.partition("/") if "/" in repo else (GHCR_OWNER, "", repo)
+    name = name or repo
+    try:
+        pkg = await github_api.read_file(owner, name, "package.json")
+    except github_api.GitHubError:
+        return False
+    if not pkg:
+        return False
+    try:
+        return "build" in (json.loads(pkg).get("scripts") or {})
+    except ValueError:
+        return False
+
+
 @router.get("/{app_id}/deploy-workflow", operation_id="apps_deploy_workflow",
             summary="Get the GitHub Actions workflow that redeploys this app on every push")
 async def deploy_workflow(app_id: str, repo_name: str | None = None,
-                          dev_app: str | None = None):
+                          dev_app: str | None = None,
+                          kind: Literal["frontend", "backend", "both"] | None = None):
     """Return everything needed to wire an app up to automatic deployment from
     GitHub: the complete workflow file, where to save it, which repository
     secret to create, and the constraints its Dockerfile must satisfy.
@@ -520,6 +676,19 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
     the app, take its key, install it as PAAS_KEY, write the workflow, push — needs
     no human step. Only a frontend-shipping app needs this at all.
 
+    `kind` says what the repository ships — 'frontend' (a static site: zip and
+    upload, no container), 'backend' (a Docker image) or 'both'. **Leave it out
+    and the platform asks the repository**, keying on whether it has a
+    Dockerfile. Pass it when you already know, or when the repo is one the
+    platform's GitHub token cannot read.
+
+    This matters because the two are not variations of one file. A static site
+    handed the backend workflow fails at `docker build`, minutes into the first
+    run, with an error about a missing Dockerfile rather than about the workflow
+    being the wrong shape — which is exactly what happened on 2026-09-24. A
+    frontend-only workflow has no image, no moving tag and no deploy
+    verification, because the upload IS the deploy.
+
     `repo_name` defaults to the app id. Pass it explicitly when the GitHub
     repository is named differently from the app.
 
@@ -568,6 +737,17 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
                          f"with apps_create, then re-run this")
 
     branch_list = ["main", "dev"] if dev_app else ["main"]
+
+    # What does this repository actually ship? Asked, not assumed — a static
+    # site handed the backend workflow fails at `docker build` minutes into the
+    # first run, and the error names a missing Dockerfile rather than a wrong
+    # workflow, so nobody reading it learns what went wrong.
+    detected_from = "given explicitly"
+    if kind is None:
+        kind, detected_from = await _detect_kind(repo)
+    wants_build = None
+    if kind in ("frontend", "both"):
+        wants_build = await _detect_build(repo)
 
     notes = [
         ("Each push to main builds an arm64 image and pushes it to ghcr.io "
@@ -722,7 +902,10 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
              "it."),
         ],
         "workflow_path": ".github/workflows/deploy.yml",
-        "workflow": _workflow(app_id, repo, branch_list, health_path, dev_app),
+        "kind": kind,
+        "kind_detected_from": detected_from,
+        "workflow": _assembled_workflow(kind, bool(wants_build), app_id, repo,
+                                        branch_list, health_path, dev_app),
         # A list, not their singular "main": with a sister app this is
         # ["main", "dev"] and reporting one of them would be a lie.
         "deploys_from_branches": branch_list,

@@ -358,6 +358,31 @@ It runs *as one of its own apps* (`api`), which is why it can redeploy itself
   must list every GET-backed tool, and anything genuinely needed by a scheduled
   run must stay out of `_DESTRUCTIVE`. See README "Running a routine unattended".
 
+### The control plane can say what went wrong (fixed 2026-09-24)
+
+Two gaps, both of which made a real failure unreadable.
+
+**Nothing configured logging.** No `basicConfig`, no `dictConfig`, no
+`setLevel` anywhere in `app/`. uvicorn's own defaults touch only the `uvicorn*`
+loggers, so the root logger kept zero handlers and its default WARNING level.
+WARNING and above still surfaced through Python's `lastResort` handler — which
+is why `_swallow`'s `log.exception` and the analytics warnings were always
+visible — but **every INFO line was discarded**. `analytics: counted N lines`
+has never once been printed, in a loop that has run every two minutes for
+months, so "the log is quiet" could not distinguish a healthy pass from a
+truncating one. `_configure_logging()` now gives the root logger a handler at
+INFO; `PAAS_LOG_LEVEL` overrides it.
+
+**An exception inside a tool call reached nobody.** fastapi-mcp invokes routes
+in-process over an ASGI transport rather than through uvicorn, so the protocol
+layer that normally prints "Exception in ASGI application" never runs. A raising
+route produced a bare 500 with no traceback and no access-log line; the entire
+trace on the box was `ERROR:fastapi_mcp.server:Error calling <tool>. Status
+code: 500.` That is why `apps_detach_db`'s failure had to be diagnosed by
+reading the code and reproducing the Coolify call by hand. There is an
+`@app.exception_handler(Exception)` now that logs the traceback and returns a
+body naming where to look.
+
 ### Two rules for the control plane's own logs
 
 **The connector key must never reach a log line.** claude.ai connectors cannot
@@ -473,6 +498,27 @@ connector prompts.
 - **Deploy keys** (`app_id` set) — scoped to one app, may only
   `PUT /apps/<id>/code`. Handed out freely as an app's CI secret; a leak can only
   redeploy that one app to an already-published image.
+
+**How to send it, in order of preference.** `Authorization: Bearer <key>` is the
+real mechanism — `require_key` reads that header and nothing else. Use it for
+every client that can set headers, which is every CI job, every curl and every
+MCP client that supports header auth, including against `/mcp`.
+
+`?key=<key>` on the URL exists for one reason: **claude.ai custom connectors
+cannot set an Authorization header.** `PromoteKeyMiddleware` (`app/main.py`)
+rewrites such a request's scope into the bearer header before anything else sees
+it, so it is the same code path from `require_key` onwards — not a second
+authentication scheme, just a second way to carry the same token.
+
+Prefer the header, because the query string leaks in ways the header does not: a
+URL ends up in logs, in referrers, in a connector's saved configuration and in
+screenshots. This box has already had a working **admin** key land in the access
+log in plaintext that way, which is why `RedactKeyFilter` exists — it strips
+`?key=` from uvicorn's access lines, and it is a mitigation, not a fix. Use a
+dedicated key for any connector URL so it can be revoked on its own.
+
+Without either, a tool call answers `401 missing bearer token` — which is what
+an MCP client with no auth configured will see on its first call.
 
 ---
 

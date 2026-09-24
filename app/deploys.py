@@ -36,14 +36,49 @@ STALE_AFTER = "20 minutes"
 RETAIN_DAYS = 30
 
 
-async def start(deploy_id: str, app_id: str, **detail) -> None:
+async def start(deploy_id: str, app_id: str, kind: str = "backend",
+                commit: str | None = None, **detail) -> None:
     """Record that a deploy has been queued. Written before the 202 is sent, so
     the id the caller is handed is already resolvable when it first polls."""
     async with pool().acquire() as c:
         await c.execute(
-            "INSERT INTO deploys (id, app_id, detail) VALUES ($1, $2, $3) "
-            "ON CONFLICT (id) DO NOTHING",
-            deploy_id, app_id, detail or None)
+            "INSERT INTO deploys (id, app_id, kind, commit_sha, detail) "
+            "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+            deploy_id, app_id, kind, _short(commit), detail or None)
+
+
+def _short(commit: str | None) -> str | None:
+    """A full 40-character sha is what CI has and a 7-character one is what a
+    person reads. Stored short, because everything that consumes this — a
+    report, a comparison against `git log --oneline`, a question of "is this the
+    build I think it is" — is done by eye."""
+    if not commit:
+        return None
+    commit = commit.strip()
+    return commit[:7] if len(commit) >= 7 else commit
+
+
+async def record(app_id: str, kind: str, ok: bool, commit: str | None = None,
+                 **detail) -> None:
+    """Write a deploy that was never queued: one that began and ended inside a
+    single request. A frontend upload is exactly that — no container, no image,
+    no polling — so it has no deploy id to hand back, but it is still a deploy
+    and "what is live" is wrong without it.
+
+    Best-effort like finish(): an upload that happened but could not be written
+    down is better than one that fails because the bookkeeping did.
+    """
+    import uuid
+    try:
+        async with pool().acquire() as c:
+            await c.execute(
+                "INSERT INTO deploys (id, app_id, kind, commit_sha, ok, "
+                "finished_at, detail) VALUES ($1, $2, $3, $4, $5, now(), $6)",
+                f"{kind}-{uuid.uuid4().hex[:12]}", app_id, kind,
+                _short(commit), ok, detail or None)
+    except Exception:
+        _log.warning("could not record the %s deploy of %s", kind, app_id,
+                     exc_info=True)
 
 
 async def finish(deploy_id: str, ok: bool, **detail) -> None:
@@ -113,3 +148,62 @@ async def trim() -> None:
                 f"'{RETAIN_DAYS} days'")
     except Exception:
         _log.warning("could not trim deploys", exc_info=True)
+
+
+async def status(app_id: str | None = None, limit: int = 20) -> list[dict]:
+    """What is live, per app, for each half of a deploy.
+
+    Two rows per app at most — the latest `backend` and the latest `frontend` —
+    because an app that ships both runs them as separate CI jobs that finish at
+    different times. Collapsing them into one "last deploy" is how a stale
+    bundle hides behind a fresh image: the timestamp moves, so everything looks
+    shipped, and the half that failed is the half nobody looked at.
+
+    Without this, the only way to answer "is what I just pushed live?" is to
+    compare a deploy time against a commit time and hope. That is a guess
+    dressed as a fact, and it is wrong in exactly the cases that matter: a
+    rolled-back deploy leaves a container that is newer than the commit and
+    running the previous build.
+    """
+    sql = """
+        SELECT DISTINCT ON (app_id, kind)
+               app_id, kind, id, queued_at, finished_at, ok, commit_sha, detail,
+               queued_at < now() - interval '{stale}' AS stale
+        FROM deploys
+        {where}
+        ORDER BY app_id, kind, queued_at DESC
+    """.format(stale=STALE_AFTER, where="WHERE app_id = $1" if app_id else "")
+    async with pool().acquire() as c:
+        rows = await c.fetch(sql, *( [app_id] if app_id else [] ))
+
+    by_app: dict[str, dict] = {}
+    for r in rows:
+        if r["ok"] is None:
+            state = "unknown" if r["stale"] else "running"
+        else:
+            state = "succeeded" if r["ok"] else "failed"
+        entry = {
+            "state": state,
+            "at": (r["finished_at"] or r["queued_at"]).isoformat(),
+            "commit": r["commit_sha"],
+            "deploy": r["id"],
+        }
+        if r["commit_sha"] is None:
+            # Said out loud rather than left as a null to interpret. An older
+            # deploy predates the workflows that send it; a recent one means the
+            # repo is still on a workflow that does not.
+            entry["commit_note"] = (
+                "this pipeline did not report a commit — regenerate the "
+                "workflow with apps_deploy_workflow, which sends it")
+        if r["detail"]:
+            entry["detail"] = r["detail"]
+        by_app.setdefault(r["app_id"], {"app": r["app_id"]})[r["kind"]] = entry
+
+    out = sorted(by_app.values(), key=lambda a: a["app"])
+    for app in out:
+        halves = [k for k in ("backend", "frontend") if k in app]
+        app["summary"] = ", ".join(
+            f"{k} {app[k]['state']}"
+            + (f" ({app[k]['commit']})" if app[k].get("commit") else "")
+            for k in halves) or "no deploy on record"
+    return out[:limit]

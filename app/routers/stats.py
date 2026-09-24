@@ -4,7 +4,7 @@ the static path never collides with /apps/{app_id}."""
 from fastapi import APIRouter, Depends, Query
 
 from ..auth import require_key
-from .. import events, heartbeat, stats
+from .. import deploys, events, heartbeat, stats
 
 router = APIRouter(prefix="/stats", tags=["stats"],
                    dependencies=[Depends(require_key)])
@@ -98,3 +98,53 @@ async def platform_events(
     sablier" row, not by a stop event.
     """
     return {"events": await events.recent(limit, app_id)}
+
+
+@router.get("/deploys", operation_id="deploys_status",
+            summary="What is actually live per app: last image deploy and last frontend upload")
+async def deploys_status(
+    app_id: str | None = Query(None, description="One app, or every app when "
+                               "left out"),
+    limit: int = Query(20, ge=1, le=100,
+                       description="Maximum apps to return"),
+):
+    """What each app has actually shipped, for both halves of a deploy.
+
+    Answers "is what I just pushed live?" without comparing timestamps, which is
+    what a caller has to do otherwise — and which is wrong in exactly the case
+    that matters: Coolify rolls a failed deploy back silently, so the container
+    is newer than the commit and still running the previous build. A deploy time
+    later than a commit time proves nothing.
+
+    Per app, up to two entries:
+
+    - **backend** — the last image deploy, its state (succeeded / failed /
+      running / unknown) and the commit it was built from;
+    - **frontend** — the last static bundle upload, same shape.
+
+    They are reported separately on purpose. An app that ships both runs two CI
+    jobs that finish at different times and can fail independently, so there is
+    no single "last deploy" that is not a lie about one of them. `summary` is
+    the one-line reading of both.
+
+    **commit** is the source sha the pipeline built from, sent by the workflows
+    apps_deploy_workflow generates. A null commit with a note means that
+    pipeline does not send one yet — regenerate its workflow. It is never
+    inferred from timing.
+    """
+    rows = await deploys.status(app_id, limit)
+    return {
+        "apps": rows,
+        "note": (
+            "Two halves per app, reported separately because they ship "
+            "separately. 'unknown' means the control plane was recycled while "
+            "a deploy ran and its outcome was never written down — check the "
+            "app rather than reading it as a pass or a fail."),
+    } if rows else {
+        "apps": [],
+        "note": (f"no deploy on record{'' if not app_id else f' for {app_id}'}. "
+                 "Records start when an app first deploys through CI, and are "
+                 "kept for 30 days — an app that has not shipped in that window "
+                 "reads as empty here, which is not the same as never having "
+                 "shipped. apps_get reports what is currently configured."),
+    }
