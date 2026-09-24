@@ -259,11 +259,13 @@ async def main():
         # is {"set-cookie": "a=1, b=2"} — and for Set-Cookie that is fatal,
         # because a cookie value may itself contain a comma, so the browser
         # cannot split the join back apart. It keeps one malformed cookie and
-        # drops the other. That is how Google sign-in on `tasks` broke on
-        # 2026-09-24: the callback clears the OAuth state cookie AND sets the
-        # session, so the session was the one thrown away, and every visible
-        # signal said success — the session existed, the 302 was correct, the
-        # browser followed it back to the login page.
+        # drops the other — so an OAuth callback that clears a state cookie AND
+        # sets a session loses the session.
+        #
+        # This was filed as the cause of a `tasks` sign-in failure on
+        # 2026-09-24 and was not: that fault stopped after an app deploy, 7.5
+        # minutes before the fix shipped. The corruption is real all the same,
+        # which is what this case pins.
         STATE["up"] = True
         r = await c.get(base + "/auth/callback", headers=H,
                         follow_redirects=False)

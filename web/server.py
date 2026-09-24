@@ -301,12 +301,17 @@ def _stream(client: httpx.AsyncClient, r: httpx.Response) -> StreamingResponse:
     # two cookies. It takes the whole thing as ONE malformed cookie and drops the
     # rest.
     #
-    # That broke Google sign-in on `tasks` on 2026-09-24. The callback sets two
-    # cookies — clearing the OAuth state cookie and setting the session — so the
-    # session cookie was the one thrown away. Every symptom pointed elsewhere:
-    # the session really was created server-side, the callback really did answer
-    # 302, and the browser really did follow it — straight back to the login
-    # page, because it had no session cookie. Nothing in any log was an error.
+    # This was filed as the cause of a Google sign-in failure on `tasks` on
+    # 2026-09-24. It was NOT: the proxy log dates nine failed sign-ins to
+    # 19:57:54-20:00:31 and the first success to 20:04:39, right after a tasks
+    # backend deploy at 20:01:37 and 7.5 minutes BEFORE this fix reached the box
+    # at 20:08:59. Something in the app fixed it. Whether the fold ever affected
+    # that callback is unknown and now unprovable.
+    #
+    # The bug is real regardless, which is why the fix stands: any response that
+    # legitimately repeats a header — two Set-Cookie headers, clearing one
+    # cookie and setting another — was being corrupted in transit by every
+    # fronted app on this box.
     #
     # The pairs are applied to raw_headers below rather than passed as a mapping,
     # because a mapping is exactly the thing that cannot express a repeat.
