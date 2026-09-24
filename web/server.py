@@ -288,10 +288,29 @@ def _stream(client: httpx.AsyncClient, r: httpx.Response) -> StreamingResponse:
     completes, so the caller waits for the timeout instead of receiving events,
     and a large download is held in memory before a byte reaches the client.
     """
-    out = dict(r.headers)
-    # Hop-by-hop headers describe the backend connection, not this one, and
-    # content-length would contradict a streamed body.
+    # multi_items(), NEVER dict(r.headers). A response may legitimately repeat a
+    # header, and httpx folds repeats into one comma-joined value when you ask
+    # for a mapping:
     #
+    #     dict(Headers([("set-cookie", "a=1"), ("set-cookie", "b=2")]))
+    #     -> {"set-cookie": "a=1, b=2"}
+    #
+    # For most headers that is lossless. For Set-Cookie it is fatal, and RFC 6265
+    # says so outright: a cookie's own value may contain a comma (`Expires=Wed,
+    # 09 Jun 2027 ...`), so the browser cannot split the joined string back into
+    # two cookies. It takes the whole thing as ONE malformed cookie and drops the
+    # rest.
+    #
+    # That broke Google sign-in on `tasks` on 2026-09-24. The callback sets two
+    # cookies — clearing the OAuth state cookie and setting the session — so the
+    # session cookie was the one thrown away. Every symptom pointed elsewhere:
+    # the session really was created server-side, the callback really did answer
+    # 302, and the browser really did follow it — straight back to the login
+    # page, because it had no session cookie. Nothing in any log was an error.
+    #
+    # The pairs are applied to raw_headers below rather than passed as a mapping,
+    # because a mapping is exactly the thing that cannot express a repeat.
+    drop = {"content-length", "transfer-encoding", "connection", "cache-control"}
     # content-encoding is deliberately NOT dropped. The body is forwarded raw,
     # exactly as it arrived, and Traefik's gzip middleware sits on the backend's
     # router — so removing the header while still sending compressed bytes tells
@@ -299,10 +318,11 @@ def _stream(client: httpx.AsyncClient, r: httpx.Response) -> StreamingResponse:
     # page looked like: a screenful of mojibake. Small responses were unaffected
     # (Traefik only compresses above ~1KB), which is why JSON endpoints and
     # healthchecks looked fine.
-    for h in ("content-length", "transfer-encoding", "connection"):
-        out.pop(h, None)
-    # Never let a proxied (potentially per-user) response be cached at the edge.
-    out["cache-control"] = NO_STORE
+    #
+    # cache-control is dropped from the backend's set and re-added once below:
+    # never let a proxied (potentially per-user) response be cached at the edge.
+    passthrough = [(k, v) for k, v in r.headers.multi_items()
+                   if k.lower() not in drop]
 
     async def body():
         try:
@@ -312,7 +332,14 @@ def _stream(client: httpx.AsyncClient, r: httpx.Response) -> StreamingResponse:
             await r.aclose()
             await client.aclose()
 
-    response = StreamingResponse(body(), status_code=r.status_code, headers=out)
+    response = StreamingResponse(body(), status_code=r.status_code)
+    # Built empty and filled here: Starlette's `headers=` argument takes a
+    # mapping, so passing one would re-introduce the fold this function exists
+    # to avoid. raw_headers is the only representation that can carry the same
+    # name twice.
+    response.raw_headers = (
+        [(k.encode("latin-1"), v.encode("latin-1")) for k, v in passthrough]
+        + [(b"cache-control", NO_STORE.encode("latin-1"))])
     # So a caller that decides not to use this response can still close what is
     # behind it — see _release.
     response.upstream = (client, r)

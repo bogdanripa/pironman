@@ -118,6 +118,21 @@ async def route(request: Request, p: str = ""):
             page = ("<html><body>" + "CONSENT PAGE " * 200 + "</body></html>").encode()
             return _Resp(_gzip.compress(page), media_type="text/html",
                          headers={"content-encoding": "gzip"})
+        if request.url.path == "/auth/callback":
+            # What an OAuth callback does: clear the state cookie it set before
+            # the redirect, and set the session. TWO Set-Cookie headers, one
+            # response. The first carries a comma inside its own value
+            # (`Expires=Wed, 09 Jun 2027`) — which is what makes a comma-joined
+            # pair unsplittable by the browser rather than merely ugly.
+            from fastapi.responses import Response as _R
+            resp = _R(status_code=302)
+            resp.raw_headers = [
+                (b"location", b"/app"),
+                (b"set-cookie",
+                 b"oauth_state=; Path=/; Expires=Wed, 09 Jun 2027 10:18:14 GMT"),
+                (b"set-cookie", b"session=abc123; Path=/; HttpOnly; SameSite=Lax"),
+            ]
+            return resp
         if request.url.path.startswith("/api/"):
             return JSONResponse({"backend": True, "path": request.url.path})
         return JSONResponse({"error": "not_found"}, status_code=404)
@@ -136,10 +151,18 @@ async def route(request: Request, p: str = ""):
             f"http://127.0.0.1:{WEB_PORT}{raw}" + (f"?{q}" if q else ""),
             headers={k: v for k, v in request.headers.items()},
             content=await request.body())
-    return PlainTextResponse(r.text, status_code=r.status_code,
-                             headers={k: v for k, v in r.headers.items()
-                                      if k.lower() not in ("content-length",
-                                                           "content-encoding")})
+    # multi_items(), not .items(): real Traefik relays repeated headers, and a
+    # double that folds them would hide exactly the bug this file now tests —
+    # the static host could be fixed and the assertion would still see one
+    # mangled Set-Cookie, coming from the test double rather than from the code
+    # under test. A test double that shares the defect under test is worse than
+    # no double at all.
+    out = PlainTextResponse(r.text, status_code=r.status_code)
+    out.raw_headers = [
+        (k.encode("latin-1"), v.encode("latin-1"))
+        for k, v in r.headers.multi_items()
+        if k.lower() not in ("content-length", "content-encoding")]
+    return out
 
 
 sablier = FastAPI()
@@ -229,6 +252,51 @@ async def main():
         check("json client keeps the backend's 404", r.status_code == 404, r.text[:60])
         r = await c.get(base + "/.pironman.json", headers=H)
         check("manifest is never served", "has_backend" not in r.text, r.text[:60])
+
+        print("\n[two Set-Cookie headers survive the hop]")
+        # A response may repeat a header. httpx folds repeats when asked for a
+        # mapping — dict(Headers([("set-cookie","a=1"),("set-cookie","b=2")]))
+        # is {"set-cookie": "a=1, b=2"} — and for Set-Cookie that is fatal,
+        # because a cookie value may itself contain a comma, so the browser
+        # cannot split the join back apart. It keeps one malformed cookie and
+        # drops the other. That is how Google sign-in on `tasks` broke on
+        # 2026-09-24: the callback clears the OAuth state cookie AND sets the
+        # session, so the session was the one thrown away, and every visible
+        # signal said success — the session existed, the 302 was correct, the
+        # browser followed it back to the login page.
+        STATE["up"] = True
+        r = await c.get(base + "/auth/callback", headers=H,
+                        follow_redirects=False)
+        cookies = [v for k, v in r.headers.multi_items()
+                   if k.lower() == "set-cookie"]
+        check("BOTH Set-Cookie headers arrive, as two headers",
+              len(cookies) == 2, f"{len(cookies)}: {cookies}")
+        check("the session cookie is intact and unjoined",
+              any(v.startswith("session=abc123;") for v in cookies), str(cookies))
+        check("the cleared cookie is intact, comma in Expires and all",
+              any(v.startswith("oauth_state=;") and "Expires=Wed, 09 Jun 2027" in v
+                  for v in cookies), str(cookies))
+        check("neither header contains the other (no comma-join)",
+              not any("session=" in v and "oauth_state=" in v for v in cookies),
+              str(cookies))
+        check("the redirect itself still works", r.status_code == 302
+              and r.headers.get("location") == "/app",
+              f"{r.status_code} {r.headers.get('location')}")
+        # The rewrite builds raw_headers by hand, so the ordinary headers have
+        # to be checked too — dropping them would be a silent regression that
+        # no cookie assertion would catch.
+        check("cache-control is still forced to no-store",
+              r.headers.get("cache-control") == server.NO_STORE,
+              r.headers.get("cache-control"))
+        # `connection` is the backend's, and must not be relayed. NOT
+        # transfer-encoding: every HTTP/1.1 server sets its own for a streamed
+        # body, so the one the client sees here belongs to the last hop, not to
+        # the backend — asserting its absence tests the web server, not this
+        # code. A stale content-length is the real hazard, because it would
+        # contradict the streamed body.
+        check("the backend's hop-by-hop headers are not relayed",
+              "connection" not in r.headers and "content-length" not in r.headers,
+              str([k for k in r.headers]))
 
         print("\n[backend asleep -> wakes]")
         STATE["up"] = False; STATE["wakes"] = 0
