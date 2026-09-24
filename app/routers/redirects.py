@@ -8,6 +8,8 @@ which is why setting a rule can move where its hostname points.
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from ..auth import require_key
@@ -34,11 +36,15 @@ class Redirect(BaseModel):
                     "substituted — '/blog/*' -> '/news/:splat', '/posts/:id' -> "
                     "'/articles/:id'. The incoming query string is carried over "
                     "unless this sets its own.")
-    status: int = Field(
-        default=301,
-        description="301 permanent (the default, and what search engines act on), "
-                    "302 temporary, 308/307 the method-preserving equivalents — "
-                    "use 308 when a redirected POST must stay a POST.")
+    status: Literal[301, 302, 307, 308] = Field(
+        description="REQUIRED. 301 permanent (what search engines act on, and "
+                    "what browsers cache indefinitely), 302 temporary, 308/307 "
+                    "the method-preserving equivalents — use 308 when a "
+                    "redirected POST must stay a POST.\n\n"
+                    "No default, because 301 is the one answer here that is hard "
+                    "to take back: browsers cache it, so a guessed permanent "
+                    "redirect outlives the rule that created it. If you are not "
+                    "sure the move is permanent, say 302.")
 
     model_config = {"populate_by_name": True}
 

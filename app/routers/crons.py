@@ -26,9 +26,14 @@ class CronIn(BaseModel):
     schedule: str = Field(description=_SCHEDULE_DOC)
     method: Method = Field(default="GET", description="HTTP method for the call.")
     path: str = Field(
-        default="/",
-        description="Path appended to the app's base URL, e.g. '/jobs/digest'. "
-                    "Must start with '/'.")
+        description="REQUIRED. Path appended to the app's base URL, e.g. "
+                    "'/jobs/digest'. Must start with '/'. Use '/' only if the "
+                    "app's root really is the job endpoint.\n\n"
+                    "No default, because only the caller knows it and a caller "
+                    "using strict tool-calling fills every parameter in the "
+                    "schema — so a default here is a guessed URL that then gets "
+                    "requested on a schedule, for ever, against a path that may "
+                    "not exist.")
     body: str | None = Field(
         default=None,
         description="Request body, sent with Content-Type: application/json. "

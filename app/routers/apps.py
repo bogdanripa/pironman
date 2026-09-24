@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -7,8 +9,10 @@ from ..db import pool
 from ..locks import app_lock
 from ..config import app_url, app_fqdn, CONTROL_PLANE_APP
 from .. import (apperr, coolify, provision, envs, autoupdate, sablier,
-                frontends, routing, stats)
+                frontends, routing, stats, github_api)
 from ..provision import SLUG_RE
+
+log = logging.getLogger("pironman.apps")
 
 router = APIRouter(prefix="/apps", tags=["apps"], dependencies=[Depends(require_key)])
 
@@ -26,16 +30,147 @@ DB_URL_NOTE = (
     "between environments.")
 
 
+async def _register(app_id: str, engine: str | None, health_path: str,
+                    spa: bool) -> str:
+    """Provision an app's database (if any) and its row, and mint its deploy
+    key. Returns the key. Raises with nothing left behind for THIS app."""
+    db_info = await provision.create(app_id, engine) if engine else None
+    try:
+        async with pool().acquire() as c:
+            await c.execute(
+                "INSERT INTO apps (id, image, coolify_uuid, db_engine, "
+                "db_user, db_password, db_name, health_path, sleep_when_idle, "
+                "spa) "
+                "VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, false, $7)",
+                app_id, engine,
+                db_info["user"] if db_info else None,
+                db_info["password"] if db_info else None,
+                db_info["database"] if db_info else None,
+                health_path, spa)
+            return await mint_key(c, f"ci-{app_id}", app_id=app_id)
+    except Exception:
+        if db_info:
+            try:
+                await provision.drop(app_id, engine)
+            except Exception:
+                pass
+        raise
+
+
+async def _unregister(app_id: str, engine: str | None) -> None:
+    """Undo _register. Best-effort by design: this runs while another exception
+    is on its way up, and a failure to clean up must not replace the error that
+    actually explains what went wrong."""
+    try:
+        if engine:
+            await provision.drop(app_id, engine)
+    except Exception:
+        log.warning("could not drop %s's database while rolling back",
+                    app_id, exc_info=True)
+    try:
+        async with pool().acquire() as c:
+            await c.execute("DELETE FROM api_keys WHERE app_id = $1", app_id)
+            await c.execute("DELETE FROM apps WHERE id = $1", app_id)
+    except Exception:
+        log.warning("could not remove %s's row while rolling back", app_id,
+                    exc_info=True)
+
+
+async def _deliver_key(key: str, app_id: str, github_repo: str | None,
+                       secret_name: str | None) -> dict:
+    """Either install a deploy key as a repository secret, or hand it back.
+
+    A tool result is a transcript. It is read by people who were not in the
+    conversation, summarised into other conversations, and stored by systems
+    nobody audited — so a credential in a result is a credential published, and
+    "shown once" is only true of the mint, not of the transcript. When the
+    caller names a repository the key goes straight from here to GitHub's
+    secrets API, encrypted with the repo's public key, and the result says only
+    that it was installed.
+
+    Returning it remains supported, because a caller with no repository (a
+    human wiring something by hand, a non-GitHub pipeline) has nowhere else to
+    put it — and a platform that makes the safe path the *only* path just gets
+    routed around. The default is the safe one; the other needs asking for.
+    """
+    if not github_repo:
+        return {
+            "paas_key": key,
+            "paas_key_note":
+                "Shown once and never stored in plaintext. Install it as the "
+                f"repo's PAAS_KEY secret. Better: re-call this with "
+                f"github_repo='owner/repo' and the platform installs it "
+                "directly, so the key never appears in a tool result at all. "
+                "Do not echo it back to the user or write it into a file.",
+        }
+    if "/" not in github_repo:
+        raise HTTPException(
+            422, "github_repo must be 'owner/repo', e.g. 'bogdanripa/notes'")
+    owner, _, repo = github_repo.partition("/")
+    name = (secret_name or "PAAS_KEY").upper()
+    try:
+        await github_api.set_secret(owner, repo, name, key)
+    except github_api.GitHubError as e:
+        msg = str(e)
+        # The app (and its key) exist either way — say so, so the caller does
+        # not retry creation and collide on the id. The key is deliberately NOT
+        # included in this error: a failure to install it is not a reason to
+        # publish it into a transcript, and apps_deploy_key re-issues one.
+        if "-> 404" in msg:
+            raise HTTPException(
+                404, f"the deploy key was created but '{github_repo}' could not "
+                     "be found, or the platform's GitHub token cannot see it. "
+                     "Fix the repo name and call apps_deploy_key with it.")
+        if "-> 403" in msg or "-> 401" in msg:
+            raise HTTPException(
+                403, f"the deploy key was created but the platform's GitHub "
+                     f"token cannot write secrets to '{github_repo}' — it needs "
+                     "`repo` scope (classic) or Secrets: write (fine-grained). "
+                     "Then call apps_deploy_key with the repo again.")
+        raise HTTPException(
+            502, f"the deploy key was created but installing it in "
+                 f"'{github_repo}' failed: {msg}. Call apps_deploy_key with the "
+                 "repo to retry.")
+    return {
+        "paas_key": None,
+        "paas_key_installed": {"repo": github_repo, "secret": name},
+        "paas_key_note":
+            f"The deploy key was installed as {name} in {github_repo} and is "
+            "deliberately NOT included here — it never passed through this "
+            "result. Nothing else needs to be done with it. To get a copy for "
+            "a human, call apps_deploy_key without github_repo, which mints a "
+            "fresh key and revokes this one.",
+    }
+
+
+def _mask_url_password(url: str) -> str:
+    """Replace the password in a connection URL, keeping the rest readable.
+
+    The host, user and database name are the parts a caller actually reasons
+    with; the password is the part that must not end up in a transcript. Masking
+    rather than dropping the field keeps the string recognisable as the URL it
+    is, so nobody mistakes a redacted value for a missing database.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep or "@" not in rest:
+        return url
+    creds, at, hostpart = rest.rpartition("@")
+    user, colon, _pw = creds.partition(":")
+    if not colon:
+        return url
+    return f"{scheme}://{user}:{'*' * 8}@{hostpart}"
+
+
 class CreateApp(BaseModel):
     id: str = Field(
         description="Short lowercase slug, e.g. 'notes'. Must match "
                     "^[a-z][a-z0-9-]{1,30}$. This becomes the hostname: the app "
                     "will be served at https://<id>-coolify.bogdanripa.com. "
                     "Cannot be changed later.")
-    db_engine: Literal["postgres", "mongo"] | None = Field(
-        default=None,
-        description="Whether to provision a dedicated database for this app, and "
-                    "which engine. Omit (null) for an app that needs no database. "
+    db_engine: Literal["none", "postgres", "mongo"] = Field(
+        description="REQUIRED, and 'none' is the answer unless the app needs its "
+                    "own database. Whether to provision a dedicated database for "
+                    "this app, and which engine. "
                     "There is no default engine — pick from the app's data model, "
                     "do not assume one: 'postgres' for relational data, "
                     "transactions or SQL querying (its JSONB type also handles "
@@ -44,7 +179,15 @@ class CreateApp(BaseModel):
                     "documents. When it is not clear-cut, ask the user which they "
                     "want rather than choosing for them. Whichever is chosen, its "
                     "connection string is injected as the DATABASE_URL "
-                    "environment variable.")
+                    "environment variable.\n\n"
+                    "This has no default ON PURPOSE. It used to be optional, and "
+                    "a caller using strict tool-calling — which fills every "
+                    "parameter in the schema, whether or not the model has an "
+                    "opinion — provisioned a Postgres nobody wanted on "
+                    "2026-09-24. An optional parameter is not an unanswered "
+                    "question to such a caller; it is a guessed one. Requiring "
+                    "the choice does not stop the guess, so the fix is that the "
+                    "obvious guess is 'none', which costs nothing.")
     health_path: str = Field(
         default="/",
         description="Path the container healthcheck requests, e.g. '/health'. Must "
@@ -62,6 +205,34 @@ class CreateApp(BaseModel):
                     "frontend should ALWAYS set a backend-owned path such as "
                     "'/api/health', because '/' is answered by the static bundle "
                     "with no container in the path.")
+    staging: bool = Field(
+        default=False,
+        description="Create a matching '<id>-dev' staging app alongside this "
+                    "one, for a repository with a dev branch. The two are "
+                    "SEPARATE apps that share nothing: their own hostname, "
+                    "database, environment variables, scheduled jobs, sleep "
+                    "behaviour, analytics and deploy key. dev deploys from the "
+                    "dev branch and main from main, on different image tags, so "
+                    "either ships without waiting for the other. Pass the pair "
+                    "to apps_deploy_workflow as app_id + dev_app and one "
+                    "workflow file serves both branches.\n\n"
+                    "The id is capped at 31 characters, so the base id must be "
+                    "27 or shorter for '-dev' to fit.")
+    github_repo: str | None = Field(
+        default=None,
+        description="'owner/repo' of the app's GitHub repository. Given it, the "
+                    "deploy key is installed directly as that repo's PAAS_KEY "
+                    "secret and is NOT returned in the result — prefer this, "
+                    "because a tool result is a transcript and a key in one is "
+                    "a key published. With staging=true the sister app's key is "
+                    "installed as PAAS_KEY_DEV in the same repo. Omit it only "
+                    "when there is no repository to install into.")
+    secret_name: str | None = Field(
+        default=None,
+        description="Override the secret name the deploy key is installed as "
+                    "(default PAAS_KEY). Only meaningful with github_repo. With "
+                    "staging=true the sister app's key uses this name plus "
+                    "'_DEV'.")
     spa: bool = Field(
         default=False,
         description="Set true only for a single-page app whose client-side router "
@@ -221,8 +392,17 @@ def _sleep_summary(row) -> dict:
 
 @router.get("/{app_id}", operation_id="apps_get",
             summary="Get one app's full configuration, including database credentials")
-async def get_app(app_id: str):
+async def get_app(app_id: str, reveal_db_password: bool = False):
     """Full detail for a single app — read this before changing anything about it.
+
+    **The database password is masked** in `db_url` unless you pass
+    `reveal_db_password=true`. An MCP result is transcript, and transcripts get
+    read by people who were not in the room and stored by systems nobody
+    audited — so the credential is withheld by default and asked for on purpose.
+    A deployed app never needs the reveal: the real connection string is
+    injected into its container as DATABASE_URL on every deploy, and
+    db_run_script reaches the database without a password at all. Ask for it
+    only when a human is going to connect by hand, and say so when you do.
 
     **kind** tells you the app's shape: 'backend' (a container), 'frontend' (a
     static bundle, no container) or 'both'. Everything else follows from that:
@@ -299,9 +479,18 @@ async def get_app(app_id: str):
         "env": [{"key": r["key"], "preview": envs.mask(r["value"])} for r in env],
     }
     if row["db_engine"]:
-        out["db_url"] = await provision.compose_url(
+        url = await provision.compose_url(
             row["db_engine"], row["db_user"], row["db_password"], row["db_name"])
+        out["db_url"] = url if reveal_db_password else _mask_url_password(url)
         out["db_url_note"] = DB_URL_NOTE
+        if not reveal_db_password:
+            out["db_password_note"] = (
+                "The password in db_url is masked. It is not needed to run the "
+                "app — DATABASE_URL is injected into the container on every "
+                "deploy with the real one — nor to query the database, which "
+                "db_run_script does without credentials. Pass "
+                "reveal_db_password=true only if a person is going to connect "
+                "by hand, and keep the result out of anything you write down.")
         try:
             size = await provision.db_size(row["db_engine"], row["db_name"],
                                            row["db_user"], row["db_password"])
@@ -334,11 +523,18 @@ async def create_app(body: CreateApp):
     so it lands the first time code ships. There is no default engine — choose
     from the app's data model, and ask the user when it is not clear-cut.
 
-    The response includes **paas_key**, a deploy key scoped to this app, used by
-    both halves of a deploy (the backend's /refresh call and the frontend
-    upload). Install it as the repo's PAAS_KEY secret with github_secret_set
-    rather than asking the user to paste it. Shown once; re-issue with
-    apps_deploy_key.
+    A **deploy key** scoped to this app is created either way. Pass
+    `github_repo='owner/repo'` and the platform installs it as that repository's
+    PAAS_KEY secret itself, and the key never appears in this result — prefer
+    that, because a tool result is a transcript and a credential in one is a
+    credential published. Without it, the key comes back as `paas_key`, shown
+    once; re-issue with apps_deploy_key.
+
+    Pass **staging=true** for a repository with a dev branch and you get a
+    matching `<id>-dev` app in the same call: its own hostname, database,
+    environment, schedule and deploy key (installed as PAAS_KEY_DEV). Then call
+    apps_deploy_workflow with `dev_app` and one workflow file serves both
+    branches — main deploys the production app, dev deploys the sister.
     """
     if not SLUG_RE.match(body.id):
         raise HTTPException(422, "id must match ^[a-z][a-z0-9-]{1,30}$")
@@ -350,36 +546,59 @@ async def create_app(body: CreateApp):
     # A database can be provisioned now even though there is no container yet:
     # DATABASE_URL is composed and injected on every deploy, so it lands the first
     # time the app's pipeline ships code.
-    db_info = None
-    if body.db_engine:
-        db_info = await provision.create(body.id, body.db_engine)
+    # "none" is a real, explicit answer — not a missing one. Normalised to NULL
+    # here so the column keeps meaning "this app has no database".
+    engine = None if body.db_engine == "none" else body.db_engine
 
-    try:
+    dev_id = f"{body.id}-dev" if body.staging else None
+    if dev_id:
+        if not SLUG_RE.match(dev_id):
+            raise HTTPException(
+                422, f"'{dev_id}' is not a valid id — ids are capped at 31 "
+                     f"characters, so a staging pair needs a base id of 27 or "
+                     f"fewer ('{body.id}' is {len(body.id)})")
         async with pool().acquire() as c:
-            await c.execute(
-                "INSERT INTO apps (id, image, coolify_uuid, db_engine, "
-                "db_user, db_password, db_name, health_path, sleep_when_idle, "
-                "spa) "
-                "VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, false, $7)",
-                body.id, body.db_engine,
-                db_info["user"] if db_info else None,
-                db_info["password"] if db_info else None,
-                db_info["database"] if db_info else None,
-                body.health_path, body.spa)
-            key = await mint_key(c, f"ci-{body.id}", app_id=body.id)
+            if await c.fetchval("SELECT 1 FROM apps WHERE id = $1", dev_id):
+                raise HTTPException(409, f"app '{dev_id}' already exists")
+
+    # Register the pair, or just the one. _register provisions the database
+    # before the row, so `created` is what has to be undone if a later step
+    # fails: a half-made pair is worse than no pair, because the id of the
+    # missing half is then taken by nothing and free to collide later.
+    created: list[tuple[str, str | None]] = []
+    keys: dict[str, str] = {}
+    try:
+        for app_id in [body.id] + ([dev_id] if dev_id else []):
+            keys[app_id] = await _register(app_id, engine, body.health_path,
+                                           body.spa)
+            created.append((app_id, engine))
     except Exception:
-        if db_info:
-            try:
-                await provision.drop(body.id, body.db_engine)
-            except Exception:
-                pass
+        for app_id, eng in created:
+            await _unregister(app_id, eng)
+        raise
+
+    key = keys[body.id]
+
+    # Install the key(s), or return them. Done AFTER both apps exist so a
+    # GitHub failure cannot leave one app registered and the other not.
+    try:
+        delivery = await _deliver_key(key, body.id, body.github_repo,
+                                      body.secret_name)
+        if dev_id:
+            dev_secret = (f"{body.secret_name}_DEV" if body.secret_name
+                          else "PAAS_KEY_DEV")
+            dev_delivery = await _deliver_key(keys[dev_id], dev_id,
+                                              body.github_repo, dev_secret)
+    except Exception:
+        for app_id, eng in created:
+            await _unregister(app_id, eng)
         raise
 
     out = {
         "id": body.id,
         "url": app_url(body.id),
         "kind": "registered — no code deployed yet",
-        "paas_key": key,
+        **delivery,
         "health_path": body.health_path,
         # "Is the first request after a quiet night slow?" is a first-class
         # question for anything handed to other people, and the two flags that
@@ -401,11 +620,13 @@ async def create_app(body: CreateApp):
             "The app now owns its hostname. What it becomes is decided by what "
             "its pipeline ships: a frontend if CI uploads a bundle, a backend if "
             "CI deploys an image, or both.",
-            "1. Install the paas_key above as the repo's PAAS_KEY secret with "
-            "github_secret_set — it authenticates both halves of a deploy and can "
-            "only deploy this app.",
+            "1. Install the deploy key as the repo's PAAS_KEY secret with "
+            "github_secret_set — unless github_repo was given, in which case "
+            "this is already done and there is no key to handle.",
             "2. Call apps_deploy_workflow and write what it returns into the "
-            "app's repo: the backend job, the frontend job, or both.",
+            "app's repo verbatim. Pass kind if you know the app is "
+            "frontend-only or backend-only; it is detected from the repo "
+            "otherwise.",
             "3. Set the app's secrets now with apps_env_set — before the first "
             "deploy, not after. They are staged until the container exists and "
             "injected when it is created. An app that reads config at import (an "
@@ -416,11 +637,48 @@ async def create_app(body: CreateApp):
             "there is no tool here to deploy by hand.",
         ],
     }
-    if db_info:
-        out["db_url"] = await provision.compose_url(
-            body.db_engine, db_info["user"], db_info["password"],
-            db_info["database"])
+    if dev_id:
+        out["staging"] = {
+            "id": dev_id,
+            "url": app_url(dev_id),
+            **{f"dev_{k}": v for k, v in dev_delivery.items()},
+            "how_they_pair": (
+                f"Two independent apps. Push to main deploys {body.id}; push to "
+                f"dev deploys {dev_id}. They share a repository and a "
+                "Dockerfile and nothing else — separate database, environment "
+                "variables, scheduled jobs and analytics — so neither release "
+                "waits for the other."),
+            "next": (
+                f"Call apps_deploy_workflow with app_id='{body.id}' and "
+                f"dev_app='{dev_id}' for ONE workflow file that serves both "
+                "branches. Do not generate two."),
+        }
+
+    # Each app's own database, composed fresh. The password is masked here for
+    # the same reason apps_get masks it: this result is a transcript. The
+    # container never needs it read out — DATABASE_URL is injected on deploy.
+    if engine:
+        async with pool().acquire() as c:
+            rows = await c.fetch(
+                "SELECT id, db_user, db_password, db_name FROM apps "
+                "WHERE id = ANY($1::text[])",
+                [body.id] + ([dev_id] if dev_id else []))
+        for r in rows:
+            url = _mask_url_password(await provision.compose_url(
+                engine, r["db_user"], r["db_password"], r["db_name"]))
+            if r["id"] == body.id:
+                out["db_url"] = url
+            else:
+                out["staging"]["db_url"] = url
         out["db_url_note"] = DB_URL_NOTE
+        out["db_password_note"] = (
+            "The password is masked. The app does not need it read out: the "
+            "real DATABASE_URL is injected into its container on every deploy, "
+            "and db_run_script queries the database without credentials. "
+            "apps_get with reveal_db_password=true returns the full string if "
+            "a person has to connect by hand."
+            + (f" {dev_id} has its OWN database and its own password — they are "
+               "not interchangeable." if dev_id else ""))
     return out
 
 
@@ -468,15 +726,24 @@ async def adopt_app(app_id: str, body: AdoptApp):
 
 @router.post("/{app_id}/deploy-key", operation_id="apps_deploy_key",
              summary="Issue (or reissue) this app's scoped deploy key")
-async def deploy_key(app_id: str):
-    """Mint a fresh deploy key for an app and return it. Use this when the key
-    from apps_create was lost, when rotating it, or for an app that predates
-    per-app keys (e.g. one brought in with apps_adopt).
+async def deploy_key(app_id: str, github_repo: str | None = None,
+                     secret_name: str | None = None):
+    """Mint a fresh deploy key for an app. Use this when the key from apps_create
+    was lost, when rotating it, or for an app that predates per-app keys (e.g.
+    one brought in with apps_adopt).
 
-    The key is scoped: it can only redeploy this app (PUT /apps/<id>/code), so it
-    is safe to store as the app's PAAS_KEY repository secret. Issuing a new one
-    **revokes** any previous deploy key for this app, so update the repo secret
-    after calling this. Shown once.
+    **Pass `github_repo='owner/repo'` and the key never appears in this
+    result** — the platform installs it as that repository's PAAS_KEY secret
+    itself and reports only that it did. Prefer this: a tool result is a
+    transcript, and a credential in one is a credential published. Use
+    `secret_name` for a different name, e.g. PAAS_KEY_DEV for a sister app.
+
+    Without `github_repo` the plaintext key is returned, for a caller that has
+    nowhere else to put it. Do not echo it back to the user afterwards.
+
+    The key is scoped: it can only deploy this app, so it is safe as a repo
+    secret. Issuing a new one **revokes** any previous deploy key for this app,
+    so if the old one is installed somewhere, update it.
     """
     async with pool().acquire() as c:
         if not await c.fetchval("SELECT 1 FROM apps WHERE id = $1", app_id):
@@ -484,9 +751,12 @@ async def deploy_key(app_id: str):
         # One active deploy key per app: drop the old before minting the new.
         await c.execute("DELETE FROM api_keys WHERE app_id = $1", app_id)
         paas_key = await mint_key(c, f"ci-{app_id}", app_id=app_id)
-    return {"app_id": app_id, "paas_key": paas_key,
-            "note": "Scoped to this app. Set it as the PAAS_KEY repo secret; "
-                    "any previous deploy key for this app is now revoked."}
+    return {"app_id": app_id,
+            **await _deliver_key(paas_key, app_id, github_repo, secret_name),
+            "note": "Scoped to this app — it can deploy this one app and "
+                    "nothing else. Any previous deploy key for this app is now "
+                    "revoked, so anywhere the old one is installed must be "
+                    "updated."}
 
 
 @router.get("/{app_id}/logs", operation_id="apps_logs",

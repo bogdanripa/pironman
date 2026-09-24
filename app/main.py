@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
@@ -18,6 +19,35 @@ from .routers import (apps, crons, query, scaffold, env, refresh, ghsecrets,
 
 
 log = logging.getLogger("pironman")
+
+
+def _configure_logging() -> None:
+    """Give the root logger a handler and a level. Nothing here did before.
+
+    uvicorn's default config touches only the `uvicorn*` loggers, so the root
+    logger kept zero handlers and its default WARNING level. WARNING and above
+    still surfaced, through Python's `lastResort` handler — which is why
+    `_swallow`'s log.exception and the analytics warnings have always been
+    visible — but **every INFO line was silently discarded**. So
+    `analytics: counted N lines` has never once been printed, in a loop that has
+    run every two minutes for months, and "the log is quiet" could not
+    distinguish a healthy pass from a truncating one. Success signals that do
+    not exist are not a cosmetic problem: they are the difference between a
+    failure you can see and one you infer.
+
+    PAAS_LOG_LEVEL overrides it, so a noisy day can be turned down to WARNING
+    without a deploy-time code change.
+    """
+    root = logging.getLogger()
+    if root.handlers:      # something already configured it — do not double up
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    root.addHandler(handler)
+    root.setLevel(os.getenv("PAAS_LOG_LEVEL", "INFO").upper())
+
+
+_configure_logging()
 
 
 def _swallow(what: str) -> None:
@@ -512,6 +542,34 @@ async def dashboard_moved():
     return RedirectResponse(app_url("dashboard"), status_code=308)
 
 
+@app.exception_handler(Exception)
+async def _log_unhandled(request, exc):
+    """Log the traceback of anything that reaches the top of a request.
+
+    Nothing did. An unhandled exception in a route normally reaches uvicorn's
+    protocol layer, which prints "Exception in ASGI application" with the
+    traceback — but **fastapi-mcp does not go through uvicorn**. It invokes the
+    route in-process over an ASGI transport, so a tool call that raises produced
+    a bare 500 with no traceback, no access-log line, and nothing in the
+    container log but the MCP layer's own one-liner:
+    `ERROR:fastapi_mcp.server:Error calling <tool>. Status code: 500.`
+
+    That is exactly what apps_detach_db did on 2026-09-24. The bug was findable
+    only by reading the code and reproducing the Coolify call by hand; the box
+    itself had no record of which line raised. A failure whose only trace says
+    "something went wrong" is the same defect this platform is built against,
+    one level up — so the handler exists to make the trace real, and the body
+    now names where to look instead of saying "Internal Server Error".
+    """
+    log.exception("unhandled error in %s %s", request.method, request.url.path)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"internal error handling {request.method} "
+                           f"{request.url.path} — the traceback is in the api "
+                           f"container's log (apps_logs api)"})
+
+
 @app.get("/health", tags=["meta"], operation_id="health", include_in_schema=False)
 async def health():
     return {"ok": True}
@@ -602,33 +660,72 @@ if getattr(_mcp, "server", None) is not None:
 try:
     from mcp.types import ToolAnnotations  # noqa: E402
 
-    _READONLY = {"apps_list", "apps_get", "apps_logs", "apps_deploy_workflow",
-                 "apps_env_list", "crons_list", "env_list", "github_secrets_list",
-                 "analytics_overview", "analytics_timeseries", "analytics_cohorts",
-                 "analytics_agents", "analytics_recent", "apps_stats",
-                 "apps_redirects_list", "apps_domains_list",
-                 "platform_tasks_health", "platform_events"}
-    # The test for this set is whether the tool's PURPOSE is removal: every call
-    # destroys something, so a prompt every time carries real information. That
-    # is what the two script tools fail — the annotation is static per tool, so
-    # marking them destructive prompts identically for `docker ps` and for
-    # `rm -rf`, and nearly every call is a read. An approval that fires on every
-    # read is one you learn to click through, which is worse than no approval:
-    # it spends attention on the harmless majority and has none left for the
-    # call that matters. Their guard is the tool description and CLAUDE.md,
-    # which can tell a SELECT from a DROP; this flag cannot.
-    _DESTRUCTIVE = {"apps_delete", "apps_detach_db", "apps_env_delete",
-                    "crons_delete", "env_delete", "github_secret_delete",
-                    "apps_domain_remove"}
+    # Derived from the ROUTE METHOD, not from what a tool's name suggests —
+    # every hand-maintained list here has drifted at least once. GET is
+    # read-only and idempotent; DELETE is destructive and idempotent (deleting
+    # twice lands in the same place); PUT is idempotent; POST is neither.
+    _METHOD_HINTS = {
+        "GET":    dict(readOnlyHint=True,  destructiveHint=False, idempotentHint=True),
+        "DELETE": dict(readOnlyHint=False, destructiveHint=True,  idempotentHint=True),
+        "PUT":    dict(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+        "PATCH":  dict(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+        "POST":   dict(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+    }
+
+    # Overrides, each for a reason the method cannot express.
+    #
+    # The two script tools are the ones that cost something. They are POSTs, so
+    # the method says "not destructive", and this repo previously left them that
+    # way on purpose: the annotation is static per tool, so marking them
+    # destructive prompts identically for `docker ps` and for `rm -rf`, and
+    # nearly every call is a read. Verified 2026-08-03, the nightly audit fired
+    # at ~02:00 and sat blocked until 07:35 because its liveness probe is
+    # host_run_script and the connector's approval gate keys on this flag.
+    #
+    # They are marked destructive now anyway, at the owner's instruction: the
+    # Tasks agent platform hides destructiveHint tools unless an admin allows
+    # them, and an unreviewed root shell is the wrong thing to leave in the
+    # hands of an autonomous agent by default. The cost is real and is NOT
+    # solved in this file — any claude.ai Routine that calls either tool must be
+    # granted an explicit allowance, or it will block on its first call exactly
+    # as the 2026-08-03 audit did. README "Running a routine unattended" carries
+    # the warning.
+    _DESTRUCTIVE = {"host_run_script", "db_run_script"}
+
+    # Reaches something outside this box. Everything else acts on the Pi alone,
+    # which is a closed world: the tool's effects are bounded by the machine.
+    _OPEN_WORLD = {"github_secret_set", "github_secret_delete",
+                   "github_secrets_list", "apps_create", "apps_deploy_key"}
+
+    # operation_id -> HTTP method, read off the routes themselves.
+    _methods: dict[str, str] = {}
+    for _route in app.routes:
+        _op = getattr(_route, "operation_id", None)
+        for _m in (getattr(_route, "methods", None) or ()):
+            if _op and _m not in ("HEAD", "OPTIONS"):
+                _methods[_op] = _m
+
+    _unannotated = []
     for _tool in getattr(_mcp, "tools", None) or []:
-        if _tool.name in _READONLY:
-            _tool.annotations = ToolAnnotations(readOnlyHint=True)
-        elif _tool.name in _DESTRUCTIVE:
-            _tool.annotations = ToolAnnotations(readOnlyHint=False,
-                                                destructiveHint=True)
-        else:  # create/set/update/adopt/… — changes state, not destructive
-            _tool.annotations = ToolAnnotations(readOnlyHint=False)
+        _method = _methods.get(_tool.name)
+        if _method is None:
+            _unannotated.append(_tool.name)
+        hints = dict(_METHOD_HINTS.get(_method or "POST", _METHOD_HINTS["POST"]))
+        if _tool.name in _DESTRUCTIVE:
+            hints["readOnlyHint"] = False
+            hints["destructiveHint"] = True
+        hints["openWorldHint"] = _tool.name in _OPEN_WORLD
+        _tool.annotations = ToolAnnotations(**hints)
+
+    # A tool whose method could not be resolved was annotated from the POST
+    # fallback — safe (not read-only, not destructive), but it means the
+    # derivation missed something, and a read-only tool advertised as
+    # state-changing is how platform_tasks_health and platform_events were
+    # mis-tagged for months. Say so rather than letting it pass silently.
+    if _unannotated:
+        log.warning("MCP tools with no resolvable route method, annotated as "
+                    "POST: %s", ", ".join(sorted(_unannotated)))
 except Exception:  # pragma: no cover - never block startup on annotations
-    pass
+    log.warning("could not set MCP tool annotations", exc_info=True)
 
 _mcp.mount_http()
