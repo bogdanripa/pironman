@@ -672,16 +672,44 @@ async def detach_db(app_id: str):
         raise HTTPException(400, "app has no database")
 
     await provision.drop(app_id, row["db_engine"])
-    await coolify.delete_env(row["coolify_uuid"], "DATABASE_URL")
+
+    # Clear the row IMMEDIATELY after the drop, before anything that can fail.
+    # The database no longer exists, so a row still naming it is a lie the rest
+    # of the platform acts on: apps_get composes a DATABASE_URL to nothing,
+    # apps_attach_db refuses with 409, and this very route 400s on "app has no
+    # database" — so the state cannot even be retried out of. That is what
+    # stranded `pingpong` on 2026-09-24: the Coolify call below ran before this
+    # write, raised, and the 500 skipped it. Ordering, not just the guard, is
+    # the fix — a Coolify failure must never leave the registry claiming a
+    # database that has been destroyed.
     async with pool().acquire() as c:
         await c.execute(
             "UPDATE apps SET db_engine=NULL, db_user=NULL, db_password=NULL, "
             "db_name=NULL WHERE id=$1", app_id)
-        await envs.sync_env(c, row["coolify_uuid"], app_id,
-                            None, None, None, None)
-    await coolify.deploy(
-        row["coolify_uuid"], app_id=app_id,
-        reason="detached its database, so the connection variables had to go")
+
+    # No container to clean up: an app registered but never deployed has no
+    # Coolify application, and calling Coolify with an empty uuid is a 404 —
+    # GET /applications//envs answers `{"message":"Not found."}`. apps_delete
+    # has always guarded this; this route did not.
+    if not row["coolify_uuid"]:
+        return {"id": app_id, "detached": True, "container": None}
+
+    try:
+        await coolify.delete_env(row["coolify_uuid"], "DATABASE_URL")
+        async with pool().acquire() as c:
+            await envs.sync_env(c, row["coolify_uuid"], app_id,
+                                None, None, None, None)
+        await coolify.deploy(
+            row["coolify_uuid"], app_id=app_id,
+            reason="detached its database, so the connection variables had to go")
+    except coolify.CoolifyError as e:
+        # The destructive half is done and recorded. Say so, and say what is
+        # left, rather than reporting a failure that hides a completed drop.
+        raise HTTPException(
+            502, f"the database was dropped and {app_id} no longer claims one, "
+                 f"but its container could not be updated: {e}. DATABASE_URL may "
+                 "still be set on it — remove it with apps_env_delete and "
+                 "redeploy with apps_update.")
     return {"id": app_id, "detached": True}
 
 
