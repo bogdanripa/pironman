@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+import re
 import json
 from typing import Literal
 from textwrap import dedent, indent
@@ -66,32 +67,136 @@ def _frontend_job(app_ref: str, key_ref: str) -> str:
         """) + indent(_upload_step(app_ref, key_ref), "    "), "  ")
 
 
-def _frontend_job_no_build(app_ref: str, key_ref: str) -> str:
+# What a bundle may contain, as zip include patterns. An ALLOWLIST, because the
+# two ways of getting this wrong are not symmetric: a pattern missing from a
+# denylist publishes source on a public URL and says nothing, while a pattern
+# missing from an allowlist 404s one asset and is noticed within a minute. Only
+# one of those can be found by the person who caused it.
+#
+# zip's `*` crosses `/`, so each of these matches at any depth.
+_WEB_ASSETS = (
+    "*.html", "*.htm", "*.css", "*.js", "*.mjs", "*.map", "*.json", "*.txt",
+    "*.xml", "*.svg", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.avif",
+    "*.ico", "*.bmp", "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+    "*.mp3", "*.mp4", "*.webm", "*.ogg", "*.wav", "*.pdf", "*.webmanifest",
+    "*.csv",
+)
+
+# Files that match the allowlist by extension and still are not the site.
+_NEVER_PUBLISH = (
+    ".git/*", ".github/*", ".gitignore",
+    "node_modules/*", "package.json", "package-lock.json", "yarn.lock",
+    "pnpm-lock.yaml",
+    "Dockerfile*", ".dockerignore", "docker-compose*",
+    "test/*", "tests/*", "__tests__/*", "*.test.js", "*.spec.js",
+    "migrations/*", "*.sql",
+    "*.md", ".env", ".env.*",
+)
+
+# Where a repository conventionally keeps a site it does not build. Ordered
+# most-explicit-first; `dist` and `build` come first because a repo that has one
+# of those AND a `public` means the second is an input to the first.
+_PUBLISH_DIRS = ("dist", "build", "public", "static", "site", "www")
+
+# src=/href= in HTML, and the module specifiers a script of the site's own would
+# use. Only the basename matters: what is being asked is "does the site refer to
+# this root-level file at all", not how the path is spelled.
+_REFERENCE_RE = re.compile(
+    r"""(?:src|href)\s*=\s*["']([^"']+)["']"""
+    r"""|(?:^|[\s(])(?:import|from)\s*\(?\s*["']([^"']+)["']""",
+    re.I | re.M)
+
+
+def _referenced_names(text: str) -> set[str]:
+    """The basenames a page or script refers to, query and fragment stripped."""
+    out = set()
+    for a, b in _REFERENCE_RE.findall(text):
+        ref = a or b
+        ref = ref.split("?")[0].split("#")[0].rstrip("/")
+        if ref:
+            out.add(ref.rsplit("/", 1)[-1])
+    return out
+
+
+def _zip_patterns(flag: str, patterns: tuple[str, ...],
+                  per_line: int = 5) -> list[str]:
+    """`flag` and its patterns as shell lines, each pattern single-quoted and
+    the wrapped ones aligned under the first. The caller joins them with
+    continuations."""
+    quoted = [f"'{p}'" for p in patterns]
+    rows = [" ".join(quoted[i:i + per_line])
+            for i in range(0, len(quoted), per_line)]
+    pad = " " * (len(flag) + 1)
+    return [f"{flag} {rows[0]}"] + [pad + r for r in rows[1:]]
+
+
+def _frontend_job_no_build(app_ref: str, key_ref: str, publish_dir: str = ".",
+                           extra_excludes: tuple[str, ...] = ()) -> str:
     """The same job for a site that has no build step — the files in the repo are
     the site. A game, a landing page, a status page: plain HTML/CSS/JS, which is
     also what apps_frontend_write publishes. Running `npm ci && npm run build`
-    against one of those fails on a missing package.json or a missing script."""
-    return indent(dedent("""\
+    against one of those fails on a missing package.json or a missing script.
+
+    The bundle is scoped, and that is not tidiness. This job used to zip the
+    whole checkout minus `.git`, `.github`, `.gitignore` and `README.md`, which
+    is correct for a repository that is only a site and wrong for every
+    `kind='both'` repository, where the site shares a root with the service. On
+    2026-09-25 `ping-pong` published `server.js`, `Dockerfile`, `package.json`,
+    `migrations/001_leaderboard.sql` and `specs/PIN-13.md` on its public URL —
+    all `200 OK`, all from a workflow this file generated. Nothing failed, so
+    nothing reported it; the site worked perfectly.
+
+    `publish_dir` is the clean answer and is preferred whenever the repo has one.
+    `extra_excludes` is for the case that has no clean answer: a root-level file
+    the allowlist admits by extension but which belongs to the backend, worked
+    out from the repo at generation time rather than guessed from its name —
+    `index.js` and `main.js` are as often a site's entry point as a server's.
+    """
+    excludes = _NEVER_PUBLISH + tuple(extra_excludes)
+    at_root = publish_dir in (".", "", None)
+    where = ("the repo root, so the site shares a directory with everything else"
+             if at_root else f"'{publish_dir}', which holds only the site")
+    # Every pattern is single-quoted and every wrapped line carries its
+    # continuation. Both matter and neither is cosmetic: an unquoted '*.html'
+    # is expanded by the SHELL against the working directory before zip ever
+    # sees it, so it would match only top-level pages and silently drop every
+    # asset in a subdirectory; and a wrapped line without a trailing backslash
+    # is a separate command, so the excludes would be run as a program.
+    zip_cmd = (" \\\n" + " " * 18).join(
+        ['zip -qr "$GITHUB_WORKSPACE/site.zip" .']
+        + _zip_patterns("-i", _WEB_ASSETS)
+        + _zip_patterns("-x", excludes))
+    return indent(dedent(f"""\
         frontend:
           runs-on: ubuntu-latest
           steps:
             - uses: actions/checkout@v4
 
-            # No build step: the checked-out files ARE the site. Point `cd` at the
-            # directory holding index.html — '.' when that is the repo root, in
-            # which case the -x list keeps repo plumbing out of the bundle.
-            # index.html must end up at the zip's root.
+            # No build step: the checked-out files ARE the site. Publishing from
+            # {where}.
+            #
+            # -i is an ALLOWLIST of web assets and -x removes what matches it by
+            # extension but is not the site. It is an allowlist on purpose: a gap
+            # here makes one asset 404, which you will notice; a gap in a
+            # denylist publishes source code on the public URL, which nobody
+            # notices. If an asset is missing from the deployed site, it is
+            # almost certainly an extension not in the -i list.
+            #
+            # index.html must end up at the zip's ROOT.
             - name: Package the bundle
               run: |
-                cd .
-                zip -qr "$GITHUB_WORKSPACE/site.zip" . \\
-                  -x '.git/*' '.github/*' '.gitignore' 'README.md'
+                cd {publish_dir}
+                {zip_cmd}
+                # Printed on every run: the bundle is PUBLIC, so what went into
+                # it is worth one line of log rather than a discovery later.
+                unzip -l "$GITHUB_WORKSPACE/site.zip"
 
         """) + indent(_upload_step(app_ref, key_ref), "    "), "  ")
 
 
 def _frontend_workflow(app_id: str, branches: list[str], build: bool,
-                       dev_app: str | None = None) -> str:
+                       dev_app: str | None = None, publish_dir: str = ".",
+                       extra_excludes: tuple[str, ...] = ()) -> str:
     """A COMPLETE workflow for a repository that ships only a static site.
 
     Not the backend workflow with the frontend job bolted on: a frontend-only
@@ -107,7 +212,8 @@ def _frontend_workflow(app_id: str, branches: list[str], build: bool,
     rather than an omission.
     """
     job = (_frontend_job(*_fe_refs(app_id, dev_app)) if build
-           else _frontend_job_no_build(*_fe_refs(app_id, dev_app)))
+           else _frontend_job_no_build(*_fe_refs(app_id, dev_app),
+                                       publish_dir, extra_excludes))
     head = dedent(f"""\
         name: deploy
 
@@ -537,7 +643,8 @@ def _dockerfile_rules(health_path: str) -> str:
 
 def _assembled_workflow(kind: str, build: bool, app_id: str, repo: str,
                         branches: list[str], health_path: str,
-                        dev_app: str | None) -> str:
+                        dev_app: str | None, publish_dir: str = ".",
+                        extra_excludes: tuple[str, ...] = ()) -> str:
     """The one file to write, complete for this repository's shape.
 
     'both' returns the backend workflow with the frontend job already in it,
@@ -547,12 +654,14 @@ def _assembled_workflow(kind: str, build: bool, app_id: str, repo: str,
     here, once, where a test can see it.
     """
     if kind == "frontend":
-        return _frontend_workflow(app_id, branches, build, dev_app)
+        return _frontend_workflow(app_id, branches, build, dev_app,
+                                  publish_dir, extra_excludes)
     backend = _workflow(app_id, repo, branches, health_path, dev_app)
     if kind != "both":
         return backend
     job = (_frontend_job(*_fe_refs(app_id, dev_app)) if build
-           else _frontend_job_no_build(*_fe_refs(app_id, dev_app)))
+           else _frontend_job_no_build(*_fe_refs(app_id, dev_app),
+                                       publish_dir, extra_excludes))
     return backend.rstrip("\n") + "\n\n" + job
 
 
@@ -607,11 +716,87 @@ async def _detect_build(repo: str) -> bool:
         return False
 
 
+def _split_repo(repo: str) -> tuple[str, str]:
+    owner, _, name = repo.partition("/") if "/" in repo else (GHCR_OWNER, "", repo)
+    return owner, (name or repo)
+
+
+async def _detect_publish_dir(repo: str) -> tuple[str, str]:
+    """Where this repository keeps the site it does not build. Returns
+    (dir, evidence); '.' means the repo root.
+
+    A directory is far better than the root, because it answers the question the
+    root cannot: which of these files are the site? So it is looked for first,
+    and only its absence falls back to filtering the root.
+
+    Unreadable means '.', which is the conservative answer here — the root case
+    is the one with the allowlist and the exclusions on it.
+    """
+    owner, name = _split_repo(repo)
+    for d in _PUBLISH_DIRS:
+        try:
+            if await github_api.has_file(owner, name, f"{d}/index.html"):
+                return d, f"{owner}/{name} keeps its site in {d}/"
+        except github_api.GitHubError:
+            return ".", f"could not read {owner}/{name}; assuming the repo root"
+    return ".", f"{owner}/{name} has no dist/build/public/static/site/www holding "\
+                f"an index.html, so the site is the repo root"
+
+
+async def _root_backend_files(repo: str) -> tuple[str, ...]:
+    """Root-level files that pass the web-asset allowlist by extension but are
+    the BACKEND's, not the site's — worked out from the repo rather than guessed.
+
+    The test is reachability: a root `.js`/`.mjs`/`.json` that no HTML page in
+    the root refers to, directly or through one hop of module imports, is not
+    part of the site. `ping-pong`'s `server.js` is exactly that, while its
+    `game-controls.js` is referenced by index.html and must stay.
+
+    Name-matching would not do. `index.js` and `main.js` are as often a site's
+    entry point as a server's, so a list of likely server filenames would break
+    real sites to protect ones that happen to be spelled differently.
+
+    Best-effort: an unreadable repo returns nothing, which publishes as much as
+    the allowlist admits. It never returns a file an HTML page refers to, so it
+    cannot break a site that this function could see.
+    """
+    owner, name = _split_repo(repo)
+    try:
+        entries = await github_api.list_dir(owner, name)
+    except github_api.GitHubError:
+        return ()
+    if not entries:
+        return ()
+    files = [e["name"] for e in entries if e["type"] == "file"]
+    candidates = [f for f in files
+                  if f.endswith((".js", ".mjs", ".cjs", ".json", ".ts"))]
+    if not candidates:
+        return ()
+
+    pages = [f for f in files if f.endswith((".html", ".htm"))]
+    reachable: set[str] = set()
+    try:
+        for page in pages[:10]:
+            text = await github_api.read_file(owner, name, page) or ""
+            reachable |= _referenced_names(text)
+        # One hop further, so a page that loads a module which imports a sibling
+        # does not lose the sibling. One hop rather than a full walk because the
+        # cost is a round trip each and the depth that matters in a hand-written
+        # site is one.
+        for f in [c for c in candidates if c in reachable][:10]:
+            text = await github_api.read_file(owner, name, f) or ""
+            reachable |= _referenced_names(text)
+    except github_api.GitHubError:
+        return ()
+    return tuple(sorted(c for c in candidates if c not in reachable))
+
+
 @router.get("/{app_id}/deploy-workflow", operation_id="apps_deploy_workflow",
             summary="Get the GitHub Actions workflow that redeploys this app on every push")
 async def deploy_workflow(app_id: str, repo_name: str | None = None,
                           dev_app: str | None = None,
-                          kind: Literal["frontend", "backend", "both"] | None = None):
+                          kind: Literal["frontend", "backend", "both"] | None = None,
+                          publish_dir: str | None = None):
     """Return everything needed to wire an app up to automatic deployment from
     GitHub: the complete workflow file, where to save it, which repository
     secret to create, and the constraints its Dockerfile must satisfy.
@@ -680,6 +865,16 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
     `repo_name` defaults to the app id. Pass it explicitly when the GitHub
     repository is named differently from the app.
 
+    `publish_dir` — for a static site with **no build step**, the directory
+    holding index.html. Leave it out and the platform looks for one
+    (dist, build, public, static, site, www) and otherwise packages the repo
+    root. It matters most for a `kind='both'` repository, where the site shares
+    a directory with the service: the bundle is served on the app's public URL,
+    so anything swept into it is published. The generated job filters the root
+    to an allowlist of web assets and drops the backend's own files, but a
+    directory that holds only the site is a better answer than any filter, and
+    this is how to say so.
+
     `dev_app` — for a repository with a **dev branch**, the id of the sister app
     that `dev` deploys to. Pass it and the returned workflow serves both from one
     file: `main` deploys `app_id`, `dev` deploys `dev_app`, each to its own
@@ -734,8 +929,24 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
     if kind is None:
         kind, detected_from = await _detect_kind(repo)
     wants_build = None
+    publish_from, publish_from_evidence, backend_files = ".", None, ()
     if kind in ("frontend", "both"):
         wants_build = await _detect_build(repo)
+        # Only a site with no build step is packaged from the checkout; the
+        # build variant publishes its build output, which is already just the
+        # site. So this only has to be worked out for the no-build case.
+        if not wants_build:
+            if publish_dir:
+                publish_from = publish_dir.strip("/") or "."
+                publish_from_evidence = "given explicitly"
+            else:
+                publish_from, publish_from_evidence = \
+                    await _detect_publish_dir(repo)
+            # A dedicated directory holds only the site, so there is nothing to
+            # work out; the root is the ambiguous case and the only one that
+            # needs the repo inspected file by file.
+            if publish_from == "." and kind == "both":
+                backend_files = await _root_backend_files(repo)
 
     notes = [
         ("Each push to main builds an arm64 image and pushes it to ghcr.io "
@@ -892,8 +1103,24 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
         "workflow_path": ".github/workflows/deploy.yml",
         "kind": kind,
         "kind_detected_from": detected_from,
+        # Said out loud because the bundle is PUBLIC: every file in it is served
+        # on the app's hostname, and the failure this reports is silent
+        # otherwise — a published source file works perfectly and looks like
+        # nothing at all.
+        "publishes": ({"from": publish_from,
+                       "chosen_because": publish_from_evidence,
+                       "excluded_as_backend_files": list(backend_files),
+                       "note": "the bundle is served on this app's public URL. "
+                               "The job packages an allowlist of web assets and "
+                               "drops repo plumbing, lockfiles, tests, "
+                               "migrations, markdown and .env; check the "
+                               "`unzip -l` output on the first run and pass "
+                               "publish_dir if anything in it should not be "
+                               "public."}
+                      if publish_from_evidence else None),
         "workflow": _assembled_workflow(kind, bool(wants_build), app_id, repo,
-                                        branch_list, health_path, dev_app),
+                                        branch_list, health_path, dev_app,
+                                        publish_from, backend_files),
         # A list, not their singular "main": with a sister app this is
         # ["main", "dev"] and reporting one of them would be a lie.
         "deploys_from_branches": branch_list,
@@ -915,7 +1142,8 @@ async def deploy_workflow(app_id: str, repo_name: str | None = None,
                      "variant against a no-build site fails on the missing "
                      "package.json or the missing script.",
             "with_build": _frontend_job(*_fe_refs(app_id, dev_app)),
-            "no_build": _frontend_job_no_build(*_fe_refs(app_id, dev_app)),
+            "no_build": _frontend_job_no_build(*_fe_refs(app_id, dev_app),
+                                               publish_from, backend_files),
         },
         "frontend_notes": [
             "An app can have a backend (docker image), a static frontend (a zip of "

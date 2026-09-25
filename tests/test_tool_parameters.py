@@ -69,7 +69,12 @@ SAFE_OPTIONAL = {
     "apps_deploy_workflow": {"repo_name": "defaults to the app id, which is the "
                                           "convention",
                              "dev_app": "absent means a single-app workflow",
-                             "kind": "absent means detect it from the repo"},
+                             "kind": "absent means detect it from the repo",
+                             "publish_dir": "absent means detect it, and the "
+                                            "fallback is the filtered repo "
+                                            "root — the safe direction, since "
+                                            "a guessed directory that does not "
+                                            "exist would publish nothing"},
     "crons_create":       {"method": "GET is the safe verb to guess; a guessed "
                                      "POST would submit something",
                            "body": "null sends no body",

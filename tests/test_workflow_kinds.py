@@ -65,11 +65,17 @@ def main():
             check(f"{label}: no '{forbidden}'", forbidden not in w)
         # "Dockerfile" may appear in a comment — the file says what to do if the
         # repo later grows one — but must never appear in a step that RUNS.
+        #
+        # Quoted strings are stripped first, because the packaging step's
+        # exclude list contains the pattern 'Dockerfile*'. That is the bundle
+        # REFUSING to publish a Dockerfile, which is the opposite of the fault
+        # this guards, and a check that cannot tell the two apart would have to
+        # be deleted the first time the bundle was scoped properly.
         live = [l for l in w.splitlines()
                 if l.strip() and not l.lstrip().startswith("#")]
-        check(f"{label}: nothing executable mentions a Dockerfile",
-              not [l for l in live if "Dockerfile" in l],
-              str([l.strip() for l in live if "Dockerfile" in l])[:120])
+        builds = [l for l in live if "Dockerfile" in re.sub(r"'[^']*'", "", l)]
+        check(f"{label}: nothing executable BUILDS from a Dockerfile",
+              not builds, str([l.strip() for l in builds])[:120])
         check(f"{label}: it uploads a bundle", "/frontend" in w and "site.zip" in w)
         check(f"{label}: no deploy-verification step",
               "verified" not in w and "deploy=" not in w)

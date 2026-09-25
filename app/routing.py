@@ -41,6 +41,7 @@ metadata, `WWW-Authenticate` challenges and redirects — none of which resolve.
 Keeping the real hostname end-to-end means an app cannot tell it is behind the
 static host, which is the only way absolute URLs can be right.
 """
+import asyncio
 import logging
 import re
 
@@ -263,6 +264,117 @@ def unscoped(labels: dict[str, str], app_id: str,
     return out
 
 
+# How long to wait for a deploy to put our labels on the container, and how many
+# times to ask. A deploy on this box recreates a container in 17-20s, so one
+# window is ~4x the normal case; three of them bound the worst case at ~4.5
+# minutes, which is still an order of magnitude better than waiting for the
+# hourly sweep.
+LABEL_WINDOW = 90
+LABEL_ATTEMPTS = 3
+
+# Strong references to the confirmations in flight. asyncio only holds a weak
+# one, so a task nobody keeps can be collected mid-await and the retry would
+# simply never happen — the same silent nothing this whole mechanism exists to
+# remove. Same idiom as refresh.py's `_running`.
+_confirming: set = set()
+
+
+def _operative(labels: dict[str, str]) -> dict[str, str]:
+    """The labels that actually decide how an app is routed and whether it
+    sleeps — the only ones worth confirming reached the container.
+
+    Everything else in the block is Coolify's (its compose hashes, its
+    `coolify.*` bookkeeping, the Caddy set it writes for a proxy this box does
+    not use) and churns for reasons that have nothing to do with us.
+    """
+    return {k: v for k, v in labels.items()
+            if k.startswith("traefik.http.routers.")
+            or k.startswith("traefik.http.middlewares.sablier-")
+            or k.startswith("sablier.")}
+
+
+async def _confirm_labels_landed(app_id: str, uuid: str,
+                                 desired: dict[str, str]) -> bool:
+    """Wait until the running container actually carries the labels we just
+    wrote, asking Coolify to deploy again if it does not. Returns whether they
+    landed.
+
+    This exists because **Coolify answers `200 OK` to a deploy it then drops.**
+    Its deploy endpoint is asynchronous and it will not start a second
+    `ApplicationDeploymentJob` for an app while one is already running — but it
+    says nothing about declining, so the call, and every layer above it, reports
+    success.
+
+    That is not hypothetical. On 2026-09-25 `ping-pong` gained its first backend:
+    `apply_image` deployed at 07:50:25.530 and this function's caller deployed
+    again at 07:50:38.750, thirteen seconds later, both answered `200 OK`. Coolify
+    ran exactly one deployment job (RUNNING 07:50:26, DONE 07:50:46) and the
+    second request produced no queue row and no job at all. So the marker
+    condition and the Sablier enrollment were written into Coolify's stored
+    `custom_labels`, where they sat, while the container kept the bare rule
+    `Host(...) && PathPrefix(`/`)`. That rule is LONGER than the static host's
+    `Host(...)`, so Traefik's rule-length tiebreak handed the backend every
+    browser request and the app served its API's `{"status":"ok"}` at `/` instead
+    of its site — for twelve minutes, and it would have been an hour had the
+    sweep not been the only thing that repairs this.
+
+    Nothing reported it, and that is the point: Coolify returned 200,
+    `verify_deploy` returned `verified: True` (it watches the CONTAINER, which
+    genuinely was up and healthy — Coolify's own job had another 11s of work to
+    do), `_maybe_enroll_sablier` returned True and wrote `sablier_enrolled=true`.
+    Four honest success signals for a change that never happened.
+
+    The gap cannot be closed by asking Coolify whether it is busy — that is the
+    same trust that failed. It is closed by reading the container, which is the
+    fact rather than the claim.
+    """
+    want = _operative(desired)
+    if not want:
+        return True
+    for attempt in range(1, LABEL_ATTEMPTS + 1):
+        waited = 0
+        while waited < LABEL_WINDOW:
+            live = await sablier._current_labels(uuid)
+            # A SUBSET check, not equality: Coolify adds labels of its own on
+            # every deploy, and an over-strict comparison would never match and
+            # would redeploy the app for ever. What is being asked is only "did
+            # what we wrote arrive", which is exactly a subset test.
+            if live and all(live.get(k) == v for k, v in want.items()):
+                if attempt > 1:
+                    _log.warning(
+                        "%s: labels landed on attempt %d — the earlier deploy "
+                        "request was accepted and dropped", app_id, attempt)
+                return True
+            await asyncio.sleep(5)
+            waited += 5
+        if attempt < LABEL_ATTEMPTS:
+            _log.warning(
+                "%s: %ds after the deploy the container still does not carry the "
+                "labels we wrote; Coolify accepted the request and dropped it. "
+                "Asking again (attempt %d of %d).",
+                app_id, LABEL_WINDOW, attempt + 1, LABEL_ATTEMPTS)
+            try:
+                await coolify.deploy(
+                    uuid, app_id=app_id,
+                    reason="re-deploy: the previous request was accepted but the "
+                           "labels never reached the container")
+            except Exception:
+                # This runs as a bare task, so an escaping exception would be
+                # collected as "never retrieved" and the retry would vanish
+                # exactly as quietly as the deploy it is chasing.
+                _log.warning("%s: could not ask Coolify to deploy again",
+                             app_id, exc_info=True)
+    # Loud, because the consequence is invisible from every other angle: a
+    # fronted app whose backend kept the unscoped rule answers its own hostname
+    # and the site is never served, while the app looks perfectly healthy.
+    _log.error(
+        "%s: gave up after %d deploys — the container does not carry the routing "
+        "labels that were written for it. If this app has a frontend, its site is "
+        "NOT being served: the backend is answering the public hostname directly. "
+        "The hourly route sync will retry.", app_id, LABEL_ATTEMPTS)
+    return False
+
+
 async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
                                fronted: bool) -> bool:
     """Write everything the platform stamps on a backend's container labels, in
@@ -354,6 +466,21 @@ async def apply_backend_labels(app_id: str, uuid: str, *, sleeps: bool,
     await coolify.deploy(
         uuid, app_id=app_id,
         reason="; ".join(changes) or "container labels rewritten")
+    # The deploy call returning is not the labels arriving, and Coolify will
+    # accept a request it silently drops — see _confirm_labels_landed. Writing
+    # them is the easy half; this is the half that was missing.
+    #
+    # Out of band, because the caller must not wait for it. `_sync` walks every
+    # fronted app in turn and is awaited INSIDE the frontend-upload request,
+    # which is documented to take about a second — blocking it for up to
+    # LABEL_WINDOW * LABEL_ATTEMPTS per app would trade one silent fault for a
+    # loud regression in the path apps deploy through all day. Nothing needs the
+    # answer synchronously either: the confirmation's whole job is to re-ask
+    # Coolify and to complain if it still does not take, and both are as true a
+    # minute later.
+    task = asyncio.create_task(_confirm_labels_landed(app_id, uuid, desired))
+    _confirming.add(task)
+    task.add_done_callback(_confirming.discard)
     return True
 
 

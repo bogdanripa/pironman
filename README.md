@@ -881,6 +881,37 @@ the ordinary shape of a Node service that serves its own assets, and adding a
 frontend job there would publish a bundle the app never asked to have hosted
 separately.
 
+### What ends up in the bundle is public
+
+The bundle is served on the app's own hostname, so every file in it is
+published. For a site with a build step that is settled — the job ships the
+build output. For a site with **no** build step it is a real question, and for a
+`kind='both'` repo, where the site shares a root with the service, the obvious
+answer is wrong: zipping the checkout publishes the server's source. On
+2026-09-25 `ping-pong` was serving `200 OK` on `/server.js`, `/Dockerfile`,
+`/package.json`, `/migrations/001_leaderboard.sql` and `/specs/PIN-13.md`.
+
+That is nasty because it has no symptom. The site works, nothing 404s, nothing
+is logged; it is found by listing the bundle, or not at all.
+
+So the no-build job now packages, in order of preference:
+
+* **`publish_dir`** — a directory holding only the site. Pass it to
+  `apps_deploy_workflow`, or let the platform find one (`dist`, `build`,
+  `public`, `static`, `site`, `www`). This is the clean answer: it makes the
+  filtering below irrelevant.
+* otherwise the repo root, filtered to an **allowlist** of web-asset extensions
+  — not a denylist of plumbing. A gap in a denylist publishes source and says
+  nothing; a gap in an allowlist 404s one asset and is noticed within a minute.
+* minus root `.js`/`.json` files that no root HTML page references, worked out
+  from the repo when the workflow is generated. `server.js` goes,
+  `game-controls.js` stays. Filenames are not consulted — `index.js` and
+  `main.js` are as often a site's entry point as a server's.
+
+Every run ends with `unzip -l`, so the run log says what was published. If an
+asset is missing from a deployed site, the first suspect is an extension not in
+the allowlist; `publish_dir` is the escape hatch.
+
 A frontend workflow has **no image, no moving tag and no verification step**,
 and that is the design rather than an omission. There is no digest for the
 hourly sweep to watch and no rollback to catch: the upload *is* the deploy. A

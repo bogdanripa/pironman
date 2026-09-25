@@ -97,3 +97,34 @@ async def read_file(owner: str, repo: str, path: str) -> str | None:
 
 async def has_file(owner: str, repo: str, path: str) -> bool:
     return await read_file(owner, repo, path) is not None
+
+
+async def list_dir(owner: str, repo: str, path: str = "") -> list[dict] | None:
+    """A repository directory's entries as `[{"name": ..., "type": ...}, ...]`,
+    or None if there is no such directory.
+
+    Same None-vs-raise contract as read_file, and for the same reason: "the
+    directory is not there" and "nobody could look" are different answers, and
+    a caller that collapses them decides what a repository contains on the
+    strength of a 403.
+
+    `type` is GitHub's own — "file", "dir" or "symlink". Only the top level is
+    returned; this is not a tree walk.
+    """
+    if not GITHUB_TOKEN:
+        raise GitHubError("no GitHub token configured (set GITHUB_TOKEN)")
+    async with _client() as c:
+        r = await c.get(f"/repos/{owner}/{repo}/contents/{path}")
+    if r.status_code == 404:
+        return None
+    if r.status_code >= 400:
+        raise GitHubError(
+            f"GET /repos/{owner}/{repo}/contents/{path} -> {r.status_code}: "
+            f"{r.text[:300]}")
+    data = r.json()
+    # A file path answers with an object rather than a list. That is not a
+    # directory, so it is not a listing.
+    if not isinstance(data, list):
+        return None
+    return [{"name": e.get("name", ""), "type": e.get("type", "")}
+            for e in data]

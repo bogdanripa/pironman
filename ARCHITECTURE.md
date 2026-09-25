@@ -812,6 +812,45 @@ regardless of which commit is newer, and a quick follow-up commit can land first
 and then be undone by its predecessor. Every workflow this repo ships or
 scaffolds carries a `concurrency` group with `cancel-in-progress`.
 
+**And the lock does not cover the gap that actually bit.** `app_lock` serialises
+*this platform* against itself; it cannot serialise this platform against
+Coolify, whose deploy is asynchronous and which **will answer `200 OK` to a
+deploy it then drops**. It refuses to start a second `ApplicationDeploymentJob`
+for an app while one is running, and says nothing about refusing.
+
+An app's **first** backend deploy asks twice, inside one lock and necessarily so:
+`apply_image` deploys the image, and only then does a container exist whose
+labels `apply_backend_labels` can read and rewrite — so the marker condition and
+the Sablier enrollment need a second deploy. On 2026-09-25 `ping-pong` made those
+two calls at `07:50:25.530` and `07:50:38.750`, thirteen seconds apart, both
+`200 OK`. Coolify ran **one** job (RUNNING 07:50:26, DONE 07:50:46); the second
+request produced no queue row and no job. The container's own
+`com.docker.compose.project.config_files` names the first deployment's uuid,
+which is how you tell after the fact which deploy a container came from.
+
+The labels therefore sat in Coolify's stored `custom_labels` — where they still
+read correctly, which is what makes this so hard to see — while the container
+kept the bare `Host(...) && PathPrefix(`/`)`. That rule is **longer** than the
+static host's `Host(...)`, so Traefik's rule-length tiebreak gave the backend
+every browser request and a fronted app served its API at `/` instead of its
+site. Four honest success signals covered it: Coolify's 200, `verify_deploy`'s
+`verified: True` (it watches the **container**, which really was up and healthy
+while Coolify had another 11s of work), `_maybe_enroll_sablier` returning True,
+and `sablier_enrolled` being written true.
+
+`routing._confirm_labels_landed` closes it, and not by asking Coolify whether it
+is busy — that is the same trust that failed. It reads the **container** until it
+carries what was written, and asks again if it does not (`LABEL_WINDOW` 90s,
+`LABEL_ATTEMPTS` 3), logging at ERROR if it never does. The check is a **subset**
+test, because Coolify adds labels of its own every deploy and an equality test
+would never match and would redeploy for ever. It runs as a background task:
+`_sync` is awaited inside the frontend-upload request, which is documented to
+take about a second.
+
+Before this, the only thing that repaired it was the hourly route sweep — so the
+exposure was up to an hour of a production app serving the wrong content, with
+nothing anywhere reporting a fault.
+
 ### Build natively on arm64 — never emulate it
 
 The box is arm64, and these workflows used to build `linux/arm64` on an x86
@@ -1071,6 +1110,49 @@ of the above — ordered, first match wins, `*` → `:splat` and `:name` segment
 placeholders, 301/302/307/308, query string preserved, path or absolute-URL
 targets. They need no redeploy, and an app with redirects but no bundle is routed
 through the static host so they work for backend-only apps too.
+
+**Everything in the bundle is public, and for a `kind='both'` repo that is a
+decision, not a detail.** The bundle is served on the app's own hostname, so a
+file swept into it is published — and a published source file has no symptom.
+The site works; nothing 404s; nothing is logged.
+
+The no-build packaging step used to zip the whole checkout minus `.git`,
+`.github`, `.gitignore` and `README.md`. That is right for a repository that is
+only a site and wrong for every repo where the site shares a root with the
+service that serves it. On 2026-09-25 `ping-pong` was serving `200 OK` on
+`/server.js`, `/package.json`, `/Dockerfile`, `/.dockerignore`,
+`/migrations/001_leaderboard.sql` and `/specs/PIN-13.md`, from a workflow this
+platform generated.
+
+Three things changed in `app/routers/scaffold.py`, in order of preference:
+
+1. **`publish_dir`.** A directory holding only the site answers the question the
+   root cannot — which of these files *are* the site. Detected
+   (`dist`, `build`, `public`, `static`, `site`, `www`) or passed to
+   `apps_deploy_workflow`.
+2. **An allowlist of web-asset extensions** (`-i`) for the root case, not a
+   denylist of plumbing. The two are not equally wrong when incomplete: a gap in
+   an allowlist 404s one asset, which whoever caused it sees at once; a gap in a
+   denylist publishes source and is silent. Fail closed when a miss means
+   disclosure.
+3. **Root scripts the site never references** are dropped, worked out from the
+   repo at generation time — root `.js`/`.json` reachable from no root HTML page
+   (one hop of module imports included). `ping-pong`'s `server.js` goes,
+   `game-controls.js` stays. Name-matching would not do: `index.js` and
+   `main.js` are as often a site's entry point as a server's.
+
+Two mechanical traps in the generated shell, both measured rather than reasoned
+about (`tests/test_frontend_bundle.py` runs the step for real):
+
+* **every pattern must be single-quoted.** An unquoted `*.css` is expanded by
+  the *shell* before zip sees it, and then matches only root-level files. With a
+  `style.css` in the root, the unquoted form silently dropped `assets/app.css`
+  and `assets/img/paddle.png`; with nothing matching at the root the shell
+  leaves the pattern literal and it works, so this passes a careless test.
+* **every wrapped line must carry its continuation**, or the exclude list is a
+  separate command the shell tries to run.
+
+The step ends with `unzip -l`, so every run prints what it published.
 
 Because it is same-origin, the frontend calls its API with a relative path: no
 CORS, no API base URL, no cookie-domain juggling.
