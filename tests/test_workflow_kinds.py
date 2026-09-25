@@ -17,6 +17,7 @@ be verifying nothing; its absence here is the design, not an omission, and these
 cases pin it so a later "consistency" tidy-up cannot quietly add one.
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -84,19 +85,19 @@ def main():
 
     print("\n[frontend-only, paired: the upload follows the branch]")
     w = build("frontend", False, DEV)
-    check("there is a picker step", "Pick the target app" in w)
-    check("the upload targets the resolved app",
-          "steps.target.outputs.app }}/frontend" in w)
+    check("the upload targets the app resolved inline",
+          f"github.ref_name == 'dev' && '{DEV}' || '{APP}' }}}}/frontend" in w,
+          next((l.strip()[:90] for l in w.splitlines() if "/frontend" in l), ""))
     check("the dev key is selected for dev", "PAAS_KEY_DEV" in w)
     check("triggers on both branches",
           sorted(yaml.safe_load(w)[True]["push"]["branches"]) == ["dev", "main"])
     check("no image tags are resolved — there is no image",
           "moving=" not in w and ":latest" not in w)
-    # The picker's shell variables belong to that step alone; a later step
-    # saying "$app" gets the empty string, with no error and no output.
-    after = w.split("Pick the target app", 1)[1].split("- name:", 1)[-1]
-    check("no bare $app leaks into a later step", "$app" not in after,
-          next((l.strip() for l in after.splitlines() if "$app" in l), ""))
+    # There is no picker step here at all any more, and that is the fix rather
+    # than an omission: one inline conditional works in any job, whereas a step
+    # output only works in the job that wrote it.
+    check("no picker step is needed", "Pick the target app" not in w)
+    check("and no step output is read", "steps.target" not in w)
 
     print("\n[backend: unchanged]")
     w = build("backend", False)
@@ -124,10 +125,31 @@ def main():
     doc = yaml.safe_load(w)
     check("backend targets the resolved app",
           "/apps/${{ steps.target.outputs.app }}/refresh" in w)
-    check("frontend targets the resolved app",
-          "steps.target.outputs.app }}/frontend" in w)
-    check("the frontend job does not re-run the picker",
-          w.count("id: target") == 1, str(w.count("id: target")))
+    check("frontend targets the app resolved INLINE, not via a step output",
+          f"github.ref_name == 'dev' && '{DEV}' || '{APP}' }}}}/frontend" in w,
+          next((l.strip()[:90] for l in w.splitlines() if "/frontend" in l), ""))
+
+    print("\n[no job may read a step output belonging to another job]")
+    # GitHub scopes step outputs to their own job. A cross-job reference is not
+    # an error — it silently resolves to the empty string, so the upload PUTs to
+    # /apps//frontend and only that half of the run fails. This is the check
+    # that was missing: the old suite asserted the picker appeared exactly ONCE
+    # and called that a feature, which is precisely the bug, and the workflow it
+    # blessed failed on bogdanripa/ping-pong's dev branch on 2026-09-25.
+    for kind in ("backend", "frontend", "both"):
+        for dev in (None, DEV):
+            text = build(kind, True, dev)
+            doc = yaml.safe_load(text)
+            for job, spec in (doc.get("jobs") or {}).items():
+                blob = yaml.dump(spec)
+                defines = {m for m in re.findall(r"id:\s*(\S+)", blob)}
+                uses = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outputs", blob))
+                orphan = uses - defines
+                check(f"{kind}/{'paired' if dev else 'single'}: job '{job}' "
+                      f"defines every step output it reads",
+                      not orphan,
+                      f"reads {sorted(uses)}, defines {sorted(defines)}"
+                      + (f", ORPHANED {sorted(orphan)}" if orphan else ""))
 
     print("\n[every generated workflow reports the commit it built]")
     # deploys_status is only better than comparing timestamps if the pipeline

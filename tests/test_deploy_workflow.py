@@ -113,8 +113,14 @@ def main():
     fe_single = scaffold._frontend_job(*scaffold._fe_refs(APP, None))
     fe_paired = scaffold._frontend_job(*scaffold._fe_refs(APP, DEV))
     check("single-app uploads to the app itself", f"/apps/{APP}/frontend" in fe_single)
-    check("paired uploads to the resolved app",
-          "steps.target.outputs.app }}/frontend" in fe_paired)
+    # Resolved INLINE from github.ref_name, not from the deploy job's step
+    # output: step outputs do not cross job boundaries, and the frontend job is
+    # a separate job precisely so it does not wait on the image build.
+    check("paired uploads to the app resolved inline",
+          f"github.ref_name == 'dev' && '{DEV}' || '{APP}' }}}}/frontend" in fe_paired,
+          next((l.strip()[:90] for l in fe_paired.splitlines() if "/frontend" in l), ""))
+    check("and never via a cross-job step output",
+          "steps.target.outputs.app }}/frontend" not in fe_paired)
     check("paired picks the matching key", "PAAS_KEY_DEV" in fe_paired)
 
     print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))

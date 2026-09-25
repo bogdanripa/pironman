@@ -108,8 +108,6 @@ def _frontend_workflow(app_id: str, branches: list[str], build: bool,
     """
     job = (_frontend_job(*_fe_refs(app_id, dev_app)) if build
            else _frontend_job_no_build(*_fe_refs(app_id, dev_app)))
-    picker = (indent(_target_step_frontend(app_id, dev_app), "      ") + "\n"
-              if dev_app else "")
     head = dedent(f"""\
         name: deploy
 
@@ -133,45 +131,35 @@ def _frontend_workflow(app_id: str, branches: list[str], build: bool,
 
         jobs:
         """)
-    if not picker:
-        return head + job
-    # Paired mode needs the picker to run before the upload, inside the job.
-    lines = job.splitlines(keepends=True)
-    out = []
-    for line in lines:
-        out.append(line)
-        if line.strip() == "- uses: actions/checkout@v4":
-            out.append(picker)
-    return head + "".join(out)
-
-
-def _target_step_frontend(app_id: str, dev_app: str) -> str:
-    """The branch picker for a frontend-only paired repo. Only the app id is
-    resolved: there are no image tags to pick, because there is no image."""
-    return dedent(f"""\
-        # main -> {app_id}, dev -> {dev_app}. Separate apps, separate
-        # hostnames, separate deploy keys — one repository.
-        - name: Pick the target app
-          id: target
-          run: |
-            if [ "${{{{ github.ref_name }}}}" = "dev" ]; then
-              app={dev_app}
-            else
-              app={app_id}
-            fi
-            echo "app=$app" >> $GITHUB_OUTPUT
-            echo "branch ${{{{ github.ref_name }}}} -> app $app"
-        """)
+    # No picker step: _fe_refs resolves the app inline from github.ref_name, so
+    # the job needs nothing injected into it and the same job body works whether
+    # this file is the whole workflow or one job beside the backend's.
+    return head + job
 
 
 def _fe_refs(app_id: str, dev_app: str | None) -> tuple[str, str]:
-    """(app_ref, key_ref) for the frontend job — the same branch-keyed pair the
-    backend job uses, so a paired repo uploads its bundle to the app the push is
-    actually for. The frontend job runs in the same workflow and therefore sees
-    the same `steps.target` output."""
+    """(app_ref, key_ref) for a frontend job, both resolved INLINE from
+    `github.ref_name`.
+
+    Not from `steps.target.outputs.app`, which is what this used to do and which
+    cannot work: **step outputs are scoped to the job that produced them**. The
+    picker step lives in the `deploy` job, so a separate `frontend` job asking
+    for its output gets the empty string — and the upload then PUTs to
+    `/apps//frontend`, which is not this app's URL and fails. The backend half
+    succeeded in the same run, so the workflow looked half-working rather than
+    wrong. Reported from a real run on bogdanripa/ping-pong's dev branch,
+    2026-09-25.
+
+    The inline conditional needs no step, no `needs:` edge and no job output, so
+    it works in any job and keeps the two jobs independent — which is the point
+    of their being separate jobs at all: a frontend deploy must not wait on an
+    image build. It is also the form the deploy key has always used one line
+    below, so this makes the pair consistent rather than introducing a new
+    mechanism.
+    """
     if not dev_app:
         return app_id, "${{ secrets.PAAS_KEY }}"
-    return ("${{ steps.target.outputs.app }}",
+    return (f"${{{{ github.ref_name == 'dev' && '{dev_app}' || '{app_id}' }}}}",
             "${{ github.ref_name == 'dev' "
             "&& secrets.PAAS_KEY_DEV || secrets.PAAS_KEY }}")
 

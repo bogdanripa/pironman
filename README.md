@@ -888,7 +888,13 @@ static site handed the backend workflow fails at `docker build`, minutes into
 the first run, with an error naming a missing file rather than a wrong workflow
 — which is what happened on 2026-09-24 and needed a human to unpick.
 
-All three kinds work with a `dev_app` pair.
+All three kinds work with a `dev_app` pair. In a paired workflow the frontend
+job resolves its target **inline** — `${{ github.ref_name == 'dev' && 'app-dev'
+|| 'app' }}` — rather than from the deploy job's step output. GitHub scopes step
+outputs to the job that wrote them, so a cross-job reference is silently the
+empty string: the upload PUTs to `/apps//frontend` and only that half of the run
+fails. The inline form needs no step and no `needs:` edge, so the frontend
+deploy still does not wait on the image build.
 
 ## Reading an app's data without being able to change it
 
