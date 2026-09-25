@@ -138,6 +138,14 @@ def main():
     check("no pattern is left unquoted for the shell to expand", not pats,
           f"unquoted: {sorted(set(pats))}")
     check("it lists the bundle on every run", "unzip -l" in run)
+    # _root_backend_files rediscovers files the static list already names —
+    # package.json is both repo plumbing and a root .json no page references —
+    # and a pattern printed twice reads like a bug to whoever is looking for one.
+    _, dup = packaging_step(extra=("package.json", "server.js"))
+    quoted = re.findall(r"'([^']+)'", dup.split("-x", 1)[1])
+    check("no exclude pattern is repeated",
+          len(quoted) == len(set(quoted)),
+          str([p for p in set(quoted) if quoted.count(p) > 1]))
 
     if not (shutil.which("zip") and shutil.which("unzip")):
         print("\n  -- zip/unzip not available; skipping the packaging runs --")

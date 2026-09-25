@@ -152,7 +152,11 @@ def _frontend_job_no_build(app_ref: str, key_ref: str, publish_dir: str = ".",
     out from the repo at generation time rather than guessed from its name —
     `index.js` and `main.js` are as often a site's entry point as a server's.
     """
-    excludes = _NEVER_PUBLISH + tuple(extra_excludes)
+    # Deduplicated, order preserved. _root_backend_files legitimately rediscovers
+    # files the static list already names — `package.json` is both repo plumbing
+    # and a root .json no page references — and zip does not mind, but a reader
+    # who sees the same pattern twice has to work out whether it means something.
+    excludes = tuple(dict.fromkeys(_NEVER_PUBLISH + tuple(extra_excludes)))
     at_root = publish_dir in (".", "", None)
     where = ("the repo root, so the site shares a directory with everything else"
              if at_root else f"'{publish_dir}', which holds only the site")
