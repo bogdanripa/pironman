@@ -12,7 +12,9 @@ Three bits of noise control:
     outage;
   - apps enrolled in scale-to-zero are never reported down for having no
     container: being stopped while idle is the feature working. They stay covered
-    through their 5xx rate, which catches a failure to wake; and
+    two ways — their 5xx rate, which catches a failure to wake, and a check that
+    the container EXISTS at all, because a deleted one can never wake and no
+    amount of waiting fixes it; and
   - 5xx alerts fire on the *increase* in the day's 5xx count since the last check,
     thresholded, rather than on an absolute number.
 
@@ -53,6 +55,46 @@ def _docker_time(raw: str | None) -> datetime | None:
         return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+def missing_container_decision(
+    aid: str, exists: bool, prev: dict | None, sleeps: bool,
+) -> tuple[list[str], int, bool]:
+    """Should a scale-to-zero app's ABSENT container alert? -> (messages, count, latch)
+
+    Pure so it can be tested without Docker or a database: check_once supplies
+    `exists` from the container lifecycle and `prev` from alert_state.
+
+    Only for sleeping apps. A non-sleeping app with no container already reads as
+    "not running" and alerts as down; saying it twice trains people to skim.
+
+    This exists because the 5xx cover the scale-to-zero exemption relies on is
+    traffic-dependent, and a low-traffic app produces no traffic to go wrong.
+    smartbill-mcp sat with no container for ten hours across ten identical failed
+    repairs: no requests, so no 5xx, so no alert, and nothing said a word until
+    someone tried to use it. Absence is true whether or not anyone is looking.
+    """
+    missing_count = 0 if exists else ((prev.get("missing_count", 0) if prev else 0) + 1)
+    alerted_missing = bool(prev.get("alerted_missing")) if prev else False
+    messages: list[str] = []
+
+    if sleeps and prev is not None:
+        if not exists and missing_count >= DOWN_AFTER and not alerted_missing:
+            messages.append(
+                f"\U0001f6a8 <b>{aid}</b> has NO container — it is not asleep, "
+                f"it cannot wake, and every request to it fails. Needs a "
+                f"redeploy.\n{app_url(aid)}")
+            alerted_missing = True
+        elif exists and alerted_missing:
+            messages.append(
+                f"\U0001f7e2 <b>{aid}</b> has a container again\n{app_url(aid)}")
+            alerted_missing = False
+    elif not sleeps and alerted_missing:
+        # Stops a stale flag muting a later genuine recovery, the same way
+        # alerted_down is cleared when an app becomes sleeping.
+        alerted_missing = False
+
+    return messages, missing_count, alerted_missing
 
 
 async def check_once() -> dict:
@@ -103,18 +145,15 @@ async def check_once() -> dict:
             alerted_stuck = bool(prev.get("alerted_stuck")) if prev else False
             messages = []
 
-            if prev is not None and not sleeps:
-                if not running and fail_count == DOWN_AFTER and not alerted_down:
-                    messages.append(f"🔴 <b>{aid}</b> is down\n{app_url(aid)}")
-                    alerted_down = True
-                elif running and alerted_down:
-                    messages.append(f"🟢 <b>{aid}</b> recovered\n{app_url(aid)}")
-                    alerted_down = False
-            elif sleeps and alerted_down:
-                # It was alerted down before being enrolled; clear that state
-                # rather than leaving a stale "down" flag that suppresses a later
-                # genuine recovery message.
-                alerted_down = False
+            # lifecycle covers stopped containers too, which is the whole
+            # point: "stopped" and "deleted" look identical to every other check
+            # here and could not be further apart. Sablier discovers an instance
+            # through a label on the container, so a deleted one has no group to
+            # wake and answers 5xx for ever until a deploy recreates it.
+            container = next((n for n in lifecycle if uuid and uuid in n), None)
+            missing_msgs, missing_count, alerted_missing = missing_container_decision(
+                aid, container is not None, prev, sleeps)
+            messages.extend(missing_msgs)
 
             # The inverse of the exemption above. A scale-to-zero app whose
             # container is up long after anything last asked for it is not
@@ -141,9 +180,8 @@ async def check_once() -> dict:
             # sleep, not the lag. A container up for three minutes cannot have
             # been stuck awake for hours, whatever last_seen says.
             seen = last_seen.get(aid)
-            cname = next((n for n in lifecycle if uuid and uuid in n), None)
-            awake_since = _docker_time((lifecycle.get(cname) or {}).get("since")
-                                       if cname else None)
+            awake_since = _docker_time((lifecycle.get(container) or {}).get("since")
+                                       if container else None)
             base = max([t for t in (seen, awake_since) if t is not None],
                        default=None)
             idle = (now - base).total_seconds() if base else None
@@ -185,14 +223,17 @@ async def check_once() -> dict:
             await conn.execute(
                 "INSERT INTO alert_state "
                 "(app_id, fail_count, alerted_down, alerted_stuck, "
-                " err_day, err_server, updated_at) "
-                "VALUES ($1, $2, $3, $4, CURRENT_DATE, $5, now()) "
+                " missing_count, alerted_missing, err_day, err_server, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE, $7, now()) "
                 "ON CONFLICT (app_id) DO UPDATE SET "
                 "fail_count = EXCLUDED.fail_count, "
                 "alerted_down = EXCLUDED.alerted_down, "
                 "alerted_stuck = EXCLUDED.alerted_stuck, "
+                "missing_count = EXCLUDED.missing_count, "
+                "alerted_missing = EXCLUDED.alerted_missing, "
                 "err_day = EXCLUDED.err_day, err_server = EXCLUDED.err_server, "
                 "updated_at = now()",
-                aid, fail_count, alerted_down, alerted_stuck, err)
+                aid, fail_count, alerted_down, alerted_stuck,
+                missing_count, alerted_missing, err)
 
     return {"apps_checked": len(apps), "alerts_sent": sent}

@@ -135,6 +135,13 @@ CREATE TABLE IF NOT EXISTS alert_state (
 );
 ALTER TABLE IF EXISTS alert_state
     ADD COLUMN IF NOT EXISTS alerted_stuck boolean NOT NULL DEFAULT false;
+-- A scale-to-zero app whose container has been DELETED rather than stopped.
+-- Tracked separately from fail_count, which is pinned to 0 for such apps
+-- because being stopped is the feature working.
+ALTER TABLE IF EXISTS alert_state
+    ADD COLUMN IF NOT EXISTS missing_count int NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS alert_state
+    ADD COLUMN IF NOT EXISTS alerted_missing boolean NOT NULL DEFAULT false;
 
 -- Per-app/day request counts by raw user-agent string, so the actual agents
 -- (browsers, crawlers, scripts) can be listed, not just the humans/bots split.
