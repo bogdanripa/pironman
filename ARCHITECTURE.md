@@ -1131,9 +1131,30 @@ Two details are load-bearing:
   default): a caller whose network vanished is dropped here within ~40s and that
   close is relayed onward.
 
-Before this, an upgrade on a fronted app's hostname 404'd at the edge while the
-same request sent straight to the container upgraded fine — which is how it was
-found (Gepetel's paired-computer agent, GEP-30).
+Before this, an upgrade on a fronted app's hostname was answered **403 with no
+body** — uvicorn's answer to an ASGI app that closes a WebSocket before
+accepting, which is what Starlette does for a path with no WebSocket route. So
+no app behind the static host could hold a socket, and the symptom named nothing:
+the app's own log stayed empty, because the handshake never reached it. Found via
+Gepetel's paired-computer agent (GEP-30).
+
+> **Test an upgrade with `curl --http1.1`.** Over HTTP/2 — which curl and the
+> browser prefer, and which Cloudflare speaks to the edge — `Connection` and
+> `Upgrade` are not headers that exist, so the request is forwarded as a plain
+> GET and the answer is whatever the app says about that path. On this box that
+> was `404` from Gepetel's Express, which looks like a routing fault and is not
+> one. An earlier diagnosis in this session cited that 404; the real pre-change
+> answer is the 403 above, and the conclusion it supported was right for the
+> wrong reason.
+
+*Verified live 2026-10-12, two ways.* Through the public edge, an upgrade to
+`wss://gepetel.com/device/ws` with a bad bearer token now answers `401` — the
+device hub's own refusal, relayed with the static host's `cache-control` on it,
+where the same request answered a bodyless `403` before. And straight at the
+static host's container with `Host: gepetel.com`, the same `401`, with
+`"WebSocket /device/ws" 401` in its log (an unknown host logs `404`). A completed
+`101` with frames flowing is covered by `web/tests/test_server.py` against the
+fake-Traefik topology; in production it happens the first time a Mac pairs.
 
 **Redirects** (`apps.redirects`, `web/redirects.py`) are evaluated ahead of all
 of the above — ordered, first match wins, `*` → `:splat` and `:name` segment
