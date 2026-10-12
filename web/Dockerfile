@@ -9,7 +9,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir fastapi==0.115.6 "uvicorn[standard]==0.34.0" httpx==0.28.1
+# websockets is pinned even though uvicorn[standard] already pulls it in:
+# server.py now imports its *client* API directly (websockets.asyncio.client)
+# to proxy upgrades, so the version is a dependency of our own code and not
+# just of the server leg. Unpinned, a release that moves that API would break
+# the build at import time — which fails the healthcheck and rolls back, so
+# the old container keeps serving and the deploy looks like it worked.
+RUN pip install --no-cache-dir fastapi==0.115.6 "uvicorn[standard]==0.34.0" \
+    httpx==0.28.1 websockets==17.2
 
 WORKDIR /srv
 # Copy every module, not a hand-maintained list. server.py imports redirects.py,

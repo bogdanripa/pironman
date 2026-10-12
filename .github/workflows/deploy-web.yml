@@ -28,7 +28,8 @@ jobs:
   # here takes the whole box down rather than one app. The test stands up the
   # real server against a fake Traefik and a fake Sablier and drives the paths
   # that have actually broken: a woken backend, a dead one (which must 502, not
-  # quietly serve the homepage), SPA fallback, and SSE streaming.
+  # quietly serve the homepage), SPA fallback, SSE streaming, and a WebSocket
+  # upgrade (which must carry the real Host and relay a refusal as a status).
   test:
     runs-on: ubuntu-latest
     steps:
@@ -36,7 +37,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install fastapi==0.115.6 httpx==0.28.1 uvicorn==0.34.0
+      # websockets explicitly: plain `uvicorn` does not pull it in the way
+      # `uvicorn[standard]` does, and both server.py and the test now use it —
+      # so without it this job fails at import rather than on an assertion.
+      - run: pip install fastapi==0.115.6 httpx==0.28.1 uvicorn==0.34.0 websockets==17.2
       - run: python web/tests/test_server.py
 
   deploy:

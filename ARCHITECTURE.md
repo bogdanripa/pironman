@@ -1105,6 +1105,36 @@ left and it is bounded: it can only act on a request the backend has already
 rejected, so `fetch`/XHR keeps the backend's real 404 instead of being handed
 HTML. Cost: one round trip before a client-side deep link falls back.
 
+**WebSocket upgrades reach the backend too** (added 2026-10-12). An upgrade is a
+GET no bundle can answer, so it skips rules 2-5 entirely and is either forwarded
+to the backend as an upgrade or refused with a status. It cannot go through the
+same code as everything else: `httpx` speaks HTTP, and an upgraded connection
+stops being HTTP once the handshake completes. So `web/server.py` runs a second
+client (`websockets`) on its own path through the file, keeping the three
+properties the HTTP path has — the caller's **real Host** in the handshake (which
+is what Traefik's backend router matches), the **marker header**, and a
+**Sablier wake** with the same budgets when the app turns out to be asleep.
+
+Two details are load-bearing:
+
+* **A refused handshake comes back as the backend's own HTTP status, never as a
+  close.** `401` tells a paired client its credential is gone; a close tells it
+  to reconnect, which it then does for ever. ASGI calls this a denial response;
+  it is the reason the proxy is pure ASGI middleware in front of the router
+  rather than a route on it, since Starlette's `WebSocket` permits only an accept
+  or a close before the handshake.
+* **It is a frame relay, not a byte tunnel** — ASGI hands over a decoded
+  WebSocket, not the socket under it — so **ping/pong does not reach end to
+  end**: each leg's library answers the other's pings itself. An application
+  heartbeat across this hop proves the static host is alive and nothing more.
+  What covers the gap is uvicorn's own keepalive on the caller's leg (20s/20s by
+  default): a caller whose network vanished is dropped here within ~40s and that
+  close is relayed onward.
+
+Before this, an upgrade on a fronted app's hostname 404'd at the edge while the
+same request sent straight to the container upgraded fine — which is how it was
+found (Gepetel's paired-computer agent, GEP-30).
+
 **Redirects** (`apps.redirects`, `web/redirects.py`) are evaluated ahead of all
 of the above — ordered, first match wins, `*` → `:splat` and `:name` segment
 placeholders, 301/302/307/308, query string preserved, path or absolute-URL

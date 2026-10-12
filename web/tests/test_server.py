@@ -1,6 +1,7 @@
 """End-to-end exercise of server.py against a fake Traefik + fake Sablier.
 
-Run it directly: `python web/tests/test_server.py` (needs fastapi, httpx, uvicorn).
+Run it directly: `python web/tests/test_server.py`
+(needs fastapi, httpx, uvicorn, websockets).
 
 Simulates the real topology:
 
@@ -67,10 +68,16 @@ server.GATEWAY_RETRY_BUDGET = 1.0
 import httpx, uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
+from websockets.asyncio.client import connect as ws_connect  # noqa: E402
+from websockets.exceptions import ConnectionClosed, InvalidStatus  # noqa: E402
 
 STATE = {"up": False, "wakes": 0, "sablier_ok": True, "seen_host": None,
          "seen_xfh": None, "asked_by": None, "gateway": 0,
-         "transient500": 0, "rogue": 0, "seen_raw": None, "seen_query": None}
+         "transient500": 0, "rogue": 0, "seen_raw": None, "seen_query": None,
+         # the upgrade the backend last saw, and the handshake it arrived in
+         "ws_host": None, "ws_auth": None, "ws_ua": None, "ws_raw": None,
+         "ws_query": None, "ws_dupes": None, "ws_disconnect": None,
+         "ws_gateway": 0}
 
 proxy = FastAPI()
 
@@ -165,6 +172,90 @@ async def route(request: Request, p: str = ""):
     return out
 
 
+class ProxyWs:
+    """The same two routers, for an upgrade.
+
+    Written as pure ASGI rather than with FastAPI's @websocket, because a
+    refused handshake has to carry a real HTTP status — which is the whole
+    behaviour under test, and which Starlette's WebSocket cannot send. Three
+    cases, in the order real Traefik would decide them:
+
+      - marker + container running -> the backend itself;
+      - marker + container stopped -> the FRONTEND router matched, so the static
+        host received its own forward back and answered 503 + the down header.
+        Traefik relays that denial to the forwarding side, which is what this
+        returns. (Simulated rather than proxied back into the static host: a
+        double that re-implemented upgrade proxying to test upgrade proxying
+        would be testing itself.)
+      - no marker -> nothing on this box would do that. The static host always
+        stamps the marker, so an unmarked upgrade here is a bug in it, and 400
+        makes that visible instead of quietly working.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "websocket":
+            await self.app(scope, receive, send)
+            return
+        await receive()
+        names = [k.decode().lower() for k, _ in scope["headers"]]
+        hdrs = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        marker = hdrs.get(server.BACKEND_HEADER) == server.BACKEND_TOKEN
+        if not marker:
+            await deny(send, 400, [], b"unmarked upgrade")
+            return
+        if not STATE["up"]:
+            await deny(send, 503, [(server.DOWN_HEADER, "1")],
+                       b'{"error": "backend has no route"}')
+            return
+        if STATE["ws_gateway"] > 0:
+            STATE["ws_gateway"] -= 1
+            await deny(send, 502, [], b"Bad Gateway")
+            return
+        STATE["ws_host"] = hdrs.get("host")
+        STATE["ws_auth"] = hdrs.get("authorization")
+        STATE["ws_ua"] = hdrs.get("user-agent")
+        STATE["ws_raw"] = scope.get("raw_path")
+        STATE["ws_query"] = (scope.get("query_string") or b"").decode()
+        # A handshake carrying two of any of these is one the backend's own
+        # library would reject: the static host must strip the caller's and let
+        # its client write them.
+        STATE["ws_dupes"] = sorted(n for n in set(names) if names.count(n) > 1)
+        if hdrs.get("authorization") != "Bearer good":
+            # Exactly the Gepetel device case: an unknown token is refused at
+            # the handshake, and the agent is meant to read the 401.
+            await deny(send, 401, [("www-authenticate", "Bearer")],
+                       b'{"error": "unauthorized"}')
+            return
+        await send({"type": "websocket.accept",
+                    "subprotocol": (scope["subprotocols"] or [None])[0],
+                    "headers": [(b"set-cookie", b"ws=1; Path=/")]})
+        while True:
+            m = await receive()
+            if m["type"] == "websocket.disconnect":
+                STATE["ws_disconnect"] = m.get("code")
+                return
+            if m.get("text") is not None:
+                if m["text"] == "bye":
+                    await send({"type": "websocket.close", "code": 4001,
+                                "reason": "told to"})
+                    return
+                await send({"type": "websocket.send", "text": "t:" + m["text"]})
+            else:
+                await send({"type": "websocket.send", "bytes": b"b:" + m["bytes"]})
+
+
+async def deny(send, status, headers, body):
+    await send({"type": "websocket.http.response.start", "status": status,
+                "headers": [(k.encode(), v.encode()) for k, v in headers]})
+    await send({"type": "websocket.http.response.body", "body": body})
+
+
+proxy.add_middleware(ProxyWs)
+
+
 sablier = FastAPI()
 
 
@@ -203,6 +294,19 @@ async def rogue_route(p: str = ""):
 
 
 serve(rogue, ROGUE_PORT)
+
+
+def ws_dial(path, host="demo-test.local", **kw):
+    """An upgrade at the static host, with the app's hostname in the handshake.
+
+    The Host must come from the URI — a client library writes its own, and two
+    Host headers is not a handshake any server accepts — so the TCP connection
+    is made here by hand and handed over, which is the same thing server.py does
+    on its own leg.
+    """
+    s = socket.create_connection(("127.0.0.1", WEB_PORT))
+    return ws_connect(f"ws://{host}{path}", sock=s, open_timeout=20,
+                      ping_interval=None, max_size=None, proxy=None, **kw)
 
 
 async def main():
@@ -459,6 +563,149 @@ async def main():
         r = await c.get(base + "/", headers=C)
         check("removing the domain stops it resolving, with no restart",
               r.status_code == 404, r.status_code)
+
+        print("\n[websocket: an upgrade reaches the backend]")
+        # Straight at the static host, like the SSE case: the hop in front of it
+        # is real Traefik's to make, and it proxies upgrades natively.
+        STATE["up"] = True
+        async with ws_dial("/device/ws?v=1", subprotocols=["mcp"],
+                           additional_headers={"Authorization": "Bearer good",
+                                               "User-Agent": "gepetel-agent/0.1"}) as c:
+            check("the backend sees the REAL public host",
+                  STATE["ws_host"] == "demo-test.local", STATE["ws_host"])
+            check("the Authorization header survives the hop",
+                  STATE["ws_auth"] == "Bearer good", STATE["ws_auth"])
+            check("the caller's user-agent is relayed, not the proxy's own",
+                  STATE["ws_ua"] == "gepetel-agent/0.1", STATE["ws_ua"])
+            check("path and query arrive as sent",
+                  STATE["ws_raw"] == b"/device/ws" and STATE["ws_query"] == "v=1",
+                  f"{STATE['ws_raw']!r} query={STATE['ws_query']!r}")
+            # Relaying the caller's own handshake headers would put two of each
+            # in the backend's handshake, and its library would reject it.
+            check("no handshake header is duplicated", STATE["ws_dupes"] == [],
+                  STATE["ws_dupes"])
+            check("the subprotocol is negotiated end to end",
+                  c.subprotocol == "mcp", c.subprotocol)
+            check("a header the backend set on its 101 reaches the caller",
+                  c.response.headers.get("set-cookie") == "ws=1; Path=/",
+                  dict(c.response.headers).get("set-cookie"))
+            await c.send("hi")
+            check("a text frame round-trips", await c.recv() == "t:hi")
+            await c.send(b"\x00\xffbin")
+            check("a binary frame round-trips", await c.recv() == b"b:\x00\xffbin")
+
+        print("\n[websocket: a refused handshake is a status, not a close]")
+        # The difference this makes: an agent told 401 re-pairs, an agent told
+        # "closed" reconnects for ever against a token that will never work.
+        STATE["up"] = True
+        try:
+            async with ws_dial("/device/ws",
+                               additional_headers={"Authorization": "Bearer wrong"}):
+                check("a bad token is refused", False, "connected anyway")
+        except InvalidStatus as e:
+            r = e.response
+            check("a bad token comes back as the backend's own 401",
+                  r.status_code == 401, r.status_code)
+            check("its headers and body come with it",
+                  r.headers.get("www-authenticate") == "Bearer"
+                  and b"unauthorized" in bytes(r.body or b""),
+                  f"{dict(r.headers)} {bytes(r.body or b'')[:40]}")
+
+        print("\n[websocket: a sleeping backend is woken]")
+        STATE["up"] = False; STATE["wakes"] = 0
+        async with ws_dial("/device/ws",
+                           additional_headers={"Authorization": "Bearer good"}) as c:
+            await c.send("hi")
+            check("the upgrade succeeds after a wake", await c.recv() == "t:hi")
+        check("Sablier was called exactly once", STATE["wakes"] == 1, STATE["wakes"])
+
+        print("\n[websocket: a transient gateway 502 is retried]")
+        STATE["up"] = True; STATE["ws_gateway"] = 2
+        async with ws_dial("/device/ws",
+                           additional_headers={"Authorization": "Bearer good"}) as c:
+            await c.send("hi")
+            check("a 502 from the proxy is retried, not handed to the caller",
+                  await c.recv() == "t:hi")
+        STATE["ws_gateway"] = 0
+
+        print("\n[websocket: close code and reason are relayed]")
+        STATE["up"] = True
+        async with ws_dial("/device/ws",
+                           additional_headers={"Authorization": "Bearer good"}) as c:
+            await c.send("bye")
+            try:
+                await c.recv()
+                check("the backend's close reaches the caller", False, "no close")
+            except ConnectionClosed:
+                check("the backend's own close code arrives",
+                      c.close_code == 4001, c.close_code)
+                check("and its reason with it",
+                      c.close_reason == "told to", repr(c.close_reason))
+
+        print("\n[websocket: the caller going away closes the backend leg]")
+        STATE["up"] = True; STATE["ws_disconnect"] = None
+        c = await ws_dial("/device/ws",
+                          additional_headers={"Authorization": "Bearer good"})
+        await c.send("hi"); await c.recv()
+        await c.close(code=4002)
+        for _ in range(40):
+            if STATE["ws_disconnect"] is not None:
+                break
+            await asyncio.sleep(0.05)
+        check("the backend is told the caller is gone, not left holding a socket",
+              STATE["ws_disconnect"] is not None, STATE["ws_disconnect"])
+
+        print("\n[websocket: an upgrade carrying our own marker]")
+        # The loop guard, on the upgrade path. Traefik had no backend router, so
+        # the forward came back here — and the forwarding side has to be able to
+        # tell that from the backend's own answer, which is what the header does.
+        try:
+            async with ws_dial("/device/ws", additional_headers={
+                    server.BACKEND_HEADER: server.BACKEND_TOKEN}):
+                check("our own forward is refused", False, "connected anyway")
+        except InvalidStatus as e:
+            check("it is 503 with the down marker, not a served file",
+                  e.response.status_code == 503
+                  and e.response.headers.get(server.DOWN_HEADER) == "1",
+                  f"{e.response.status_code} {dict(e.response.headers)}")
+
+        print("\n[websocket: nothing to upgrade to]")
+        for host, label in (("static-only-test.local", "a frontend-only app"),
+                            ("web-test.local", "the static host's own hostname"),
+                            ("notmine.example.com", "a host in nobody's map")):
+            try:
+                async with ws_dial("/device/ws", host=host):
+                    check(f"{label} refuses the upgrade", False, "connected anyway")
+            except InvalidStatus as e:
+                check(f"{label} refuses the upgrade with a 404",
+                      e.response.status_code == 404
+                      and b"<h1>" not in bytes(e.response.body or b""),
+                      f"{e.response.status_code} {bytes(e.response.body or b'')[:40]}")
+
+        print("\n[websocket: the wake fails]")
+        STATE["up"] = False; STATE["sablier_ok"] = False
+        try:
+            async with ws_dial("/device/ws",
+                               additional_headers={"Authorization": "Bearer good"}):
+                check("a dead backend refuses the upgrade", False, "connected anyway")
+        except InvalidStatus as e:
+            check("a backend that cannot be started is a 502",
+                  e.response.status_code == 502, e.response.status_code)
+        STATE["sablier_ok"] = True
+
+        print("\n[websocket: a custom domain]")
+        (ROOT / ".pironman-domains.json").write_text(
+            json.dumps({"shop.example.com": "demo"}))
+        os.utime(ROOT / ".pironman-domains.json", (2, 2))
+        STATE["up"] = True
+        async with ws_dial("/device/ws", host="shop.example.com",
+                           additional_headers={"Authorization": "Bearer good"}) as c:
+            await c.send("hi")
+            check("a custom domain can hold a socket", await c.recv() == "t:hi")
+            check("and the backend sees the custom host",
+                  STATE["ws_host"] == "shop.example.com", STATE["ws_host"])
+        (ROOT / ".pironman-domains.json").write_text("{}")
+        os.utime(ROOT / ".pironman-domains.json", (1, 1))
 
     print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
     return 1 if fails else 0

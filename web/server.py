@@ -32,6 +32,13 @@ backend has already rejected is reconsidered, and only a caller rendering a page
 can be given one. Anything that wanted data keeps the backend's real 404 rather
 than being handed HTML.
 
+**An upgrade is always the backend's.** A WebSocket handshake is a GET that no
+bundle can answer, so it never touches rules 2-5: it is forwarded to the backend
+as an upgrade, or refused with a status. It cannot go through the same code as
+everything else — httpx speaks HTTP and an upgraded connection stops being HTTP
+once the handshake completes — so it has its own path through this file, from
+_ws_proxy downwards, with the same Host, marker-header and wake behaviour.
+
 Backend proxying goes back through Traefik rather than straight to the container,
 so service discovery keeps working across redeploys (container names carry a
 per-deploy timestamp). The request keeps its **real Host**: an app must not be
@@ -49,10 +56,12 @@ marker, wakes the app through Sablier's API and retries. The caller waits a few
 seconds; nothing shows an interstitial.
 """
 import asyncio
+import http
 import json
 import logging
 import os
 import re
+import socket
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -61,6 +70,10 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
                                Response, StreamingResponse)
+from starlette.datastructures import Headers
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import (ConnectionClosed, InvalidStatus,
+                                   WebSocketException)
 
 import redirects as redirect_rules
 
@@ -511,6 +524,412 @@ async def _proxy(request: Request, aid: str) -> Response:
                  sablier, tries)
     return JSONResponse({"error": "backend unreachable", "app": aid},
                         status_code=502)
+
+
+# ---------------------------------------------------------------------------
+# WebSockets
+#
+# The hop httpx cannot make. Everything above forwards a request and streams a
+# reply; an upgrade forwards a request and then stops speaking HTTP, so there is
+# a second client here — the `websockets` library — and a second dial.
+#
+# Three things have to be true for a fronted app to be able to hold sockets at
+# all, and each of them is a rule the HTTP path already follows:
+#
+#  - the handshake carries the caller's **real Host**, so Traefik's backend
+#    router matches and the app sees the hostname the caller used;
+#  - a refused handshake comes back as the backend's own **HTTP status**, not as
+#    a close — `401` tells an agent to re-pair, a close tells it to retry
+#    forever;
+#  - a **sleeping** app is woken and the handshake retried, rather than failing
+#    the caller on a container that was merely stopped.
+#
+# What is NOT the same as the HTTP path: this is a frame-level relay, two
+# WebSocket connections with payloads copied between them, because ASGI gives no
+# access to the socket. See _ws_pump for what that costs.
+WS_OPEN_TIMEOUT = float(os.environ.get("WS_OPEN_TIMEOUT_SECONDS", "10"))
+
+# Headers the backend leg must not be given from the caller, because the client
+# library writes its own and a handshake carrying two of each is rejected. Host
+# and User-Agent ARE relayed — through the one mechanism each that cannot
+# duplicate them: the dial URI carries the Host (see _ws_target), and
+# `user_agent_header=None` stops the library adding a second UA.
+_WS_REQUEST_DROP = frozenset({
+    "host", "connection", "upgrade", "keep-alive", "te", "trailer",
+    "transfer-encoding", "content-length", "sec-websocket-key",
+    "sec-websocket-version", "sec-websocket-extensions",
+    "sec-websocket-protocol",
+})
+
+# The mirror image coming back. A handshake's own headers describe the leg that
+# negotiated it, and the caller's leg is a different handshake with a different
+# key, extensions and (possibly) subprotocol — relaying them would describe this
+# hop's connection to a client that is not on it.
+_WS_RESPONSE_DROP = frozenset({
+    "connection", "upgrade", "keep-alive", "transfer-encoding",
+    "content-length", "sec-websocket-accept", "sec-websocket-extensions",
+    "sec-websocket-protocol", "date", "server",
+})
+
+
+class _CallerGone(Exception):
+    """The caller's leg closed, so there is nothing left to send back to it."""
+
+
+def _ws_target(scope) -> str:
+    """The dial URI: the caller's own Host and request target, over `ws://`.
+
+    The Host is in the URI rather than in a header for two reasons at once. It
+    is the only way to set it without the client library adding a second one,
+    and it keeps the rule the HTTP path has: Traefik routes on it, and the app
+    must see the hostname the caller used. Nothing resolves this hostname — the
+    TCP connection is made to the proxy by _dial_backend — so naming the app's
+    public host here costs no lookup and bypasses no routing.
+
+    Built from `raw_path` for the same reason _upstream_url is: ASGI hands the
+    path over percent-decoded, and a decoded path cannot be safely re-composed.
+    """
+    raw = scope.get("raw_path") or b""
+    if not raw.startswith(b"/"):
+        raw = quote(scope.get("path") or "/").encode()
+    raw = raw.split(b"?", 1)[0]
+    query = scope.get("query_string") or b""
+    target = (raw + (b"?" + query if query else b"")).decode("latin-1")
+    return f"ws://{Headers(scope=scope).get('host', '')}{target}"
+
+
+async def _dial_backend() -> socket.socket:
+    """A TCP connection to Traefik, for a dial whose URI names the app's host.
+
+    Resolved and connected here rather than by the client library, which would
+    use the URI's hostname — the app's public one, which from inside the box
+    either does not resolve or resolves to the public edge and loops back in
+    through Cloudflare. Every address the proxy's name resolves to is tried, so
+    a v6-first DNS answer does not decide it.
+    """
+    loop = asyncio.get_running_loop()
+    host, port = _proxy_address()
+    last: OSError | None = None
+    for family, kind, proto, _canon, addr in await loop.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM):
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.setblocking(False)
+            await asyncio.wait_for(loop.sock_connect(sock, addr),
+                                   WS_OPEN_TIMEOUT)
+            return sock
+        except (OSError, asyncio.TimeoutError) as e:
+            sock.close()
+            last = e if isinstance(e, OSError) else OSError(str(e))
+    raise last or OSError(f"no address for {host}:{port}")
+
+
+def _proxy_address() -> tuple[str, int]:
+    """Host and port of the proxy, from the same TRAEFIK_URL the HTTP path uses."""
+    url = httpx.URL(PROXY)
+    return url.host, url.port or (443 if url.scheme == "https" else 80)
+
+
+async def _ws_dial(scope):
+    """One upgrade attempt at the backend, through Traefik.
+
+    Returns `(connection, None)` when the handshake succeeded, `(None, refusal)`
+    when the backend answered it with a status, and `(None, None)` when the
+    connection itself failed — the same three outcomes _send distinguishes, and
+    for the same reason: only the middle one is an answer that may stand.
+    """
+    headers = Headers(scope=scope)
+    forward = [(k, v) for k, v in headers.items()
+               if k.lower() not in _WS_REQUEST_DROP]
+    forward.append((BACKEND_HEADER, BACKEND_TOKEN))
+    offered = [p.strip() for p in
+               headers.get("sec-websocket-protocol", "").split(",") if p.strip()]
+    # Mirror the caller: asking the backend for compression the caller did not
+    # offer would have us inflating frames only to send them out uncompressed.
+    deflate = "permessage-deflate" in headers.get("sec-websocket-extensions", "")
+
+    sock = None
+    try:
+        sock = await _dial_backend()
+        conn = await ws_connect(
+            _ws_target(scope), sock=sock, additional_headers=forward,
+            subprotocols=offered or None,
+            compression="deflate" if deflate else None,
+            user_agent_header=None, proxy=None, open_timeout=WS_OPEN_TIMEOUT,
+            # No keepalive of our own on this leg: uvicorn already pings the
+            # caller's leg, and a second timer here would only decide that a
+            # busy backend is dead. max_size=None because a frame the app is
+            # willing to send is not ours to cap.
+            ping_interval=None, max_size=None)
+        return conn, None
+    except InvalidStatus as e:
+        r = e.response
+        return None, (r.status_code,
+                      [(k, v) for k, v in r.headers.raw_items()
+                       if k.lower() not in _WS_RESPONSE_DROP],
+                      bytes(r.body or b""))
+    except (OSError, asyncio.TimeoutError, WebSocketException, ValueError) as e:
+        # ValueError covers a Host the URI parser rejects — it is a header, so
+        # the caller chooses it, and an exception here would close the socket
+        # with no explanation.
+        if sock is not None:
+            sock.close()
+        _log.info("ws dial %s failed: %s: %s",
+                  Headers(scope=scope).get("host", "?"), type(e).__name__, e)
+        return None, None
+
+
+def _ws_is_down(refusal) -> bool:
+    """Our own loop-guard answer, relayed back by Traefik: the backend has no
+    router, which means its container is not running."""
+    return bool(refusal) and refusal[0] == 503 and any(
+        k.lower() == DOWN_HEADER for k, _ in refusal[1])
+
+
+def _ws_is_gateway_error(refusal) -> bool:
+    """The proxy, not the app, reporting it could not reach the backend."""
+    return bool(refusal) and refusal[0] in _GATEWAY_ERRORS and not _ws_is_down(refusal)
+
+
+async def _ws_open(scope, aid: str):
+    """Open the backend leg, waking the app first if it turns out to be asleep.
+
+    The shape of _proxy, with the same budgets: a refusal that is the app's own
+    stands immediately, and only the two that mean "not running" buy a wake and
+    a retry.
+    """
+    t0 = time.monotonic()
+    conn, refusal = await _ws_dial(scope)
+    if conn is not None:
+        return conn, None
+    if refusal is not None and not _ws_is_down(refusal) \
+            and not _ws_is_gateway_error(refusal):
+        return None, refusal           # the backend answered; its answer stands
+
+    budget = WAKE_RETRY_BUDGET if _ws_is_down(refusal) else GATEWAY_RETRY_BUDGET
+    if refusal is not None:
+        if not await _wake(aid):
+            _log.warning("ws wake %s: FAILED after %.2fs", aid,
+                         time.monotonic() - t0)
+            return None, None
+    deadline = time.monotonic() + budget
+    tries = 0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(WAKE_RETRY_DELAY)
+        tries += 1
+        conn, refusal = await _ws_dial(scope)
+        if conn is not None:
+            _log.info("ws wake %s: upgraded in %.2fs after %d retr%s", aid,
+                      time.monotonic() - t0, tries, "y" if tries == 1 else "ies")
+            return conn, None
+        if refusal is not None and not _ws_is_down(refusal) \
+                and not _ws_is_gateway_error(refusal) \
+                and refusal[0] not in _WAKE_TRANSIENT:
+            return None, refusal
+    _log.warning("ws wake %s: still refusing after %.2fs and %d retries", aid,
+                 time.monotonic() - t0, tries)
+    return None, refusal
+
+
+async def _ws_refuse(scope, send, status: int, headers, body: bytes) -> None:
+    """Answer an upgrade with an HTTP response instead of accepting it.
+
+    A refused upgrade must come back as a **status**, because that is the
+    difference between a client that knows what happened and one that does not:
+    401 tells a paired agent its token is gone and to pair again, while a close
+    tells it to reconnect, which it will then do for ever. ASGI calls this a
+    denial response; it needs the `websocket.http.response` extension, which
+    uvicorn has, and where it is missing a close is all there is to send.
+    """
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await _ws_close_caller(send, 1011, "")
+        return
+    try:
+        # uvicorn looks the status up in http.HTTPStatus, so a non-standard one
+        # (a CDN's 520, say) would raise mid-handshake and drop the connection
+        # with no answer at all. Report the hop's own failure instead of
+        # inventing a code the caller would read as the app's.
+        http.HTTPStatus(status)
+    except ValueError:
+        _log.warning("ws refusal: backend answered %s, which cannot be relayed",
+                     status)
+        status, headers, body = 502, [], b'{"error": "backend refused the upgrade"}'
+    await send({
+        "type": "websocket.http.response.start", "status": status,
+        "headers": [(k.encode("latin-1"), v.encode("latin-1"))
+                    for k, v in headers]
+                   + [(b"cache-control", NO_STORE.encode("latin-1"))],
+    })
+    await send({"type": "websocket.http.response.body", "body": body})
+
+
+def _ws_close_code(code: int | None) -> int:
+    """A close code that can actually be put on the wire.
+
+    1005 ("no status received") and 1006 ("abnormal closure") are states rather
+    than codes — no peer ever sends them, so neither can we. 1005 means the
+    backend closed cleanly without a code, which is what 1000 says; 1006 means
+    the leg died, which is this hop failing, so 1011.
+    """
+    if code is None or code == 1005:
+        return 1000
+    return 1011 if code == 1006 else code
+
+
+def _ws_reason(reason: str | None) -> str:
+    """A close reason is capped at 123 bytes by the protocol, and the cut has to
+    be made in bytes rather than characters or a multi-byte one splits."""
+    return (reason or "").encode()[:123].decode(errors="ignore")
+
+
+async def _ws_close_caller(send, code: int, reason: str) -> None:
+    """Close the caller's leg, tolerating a caller that has already gone — which
+    is the common case, since that is usually why we are closing."""
+    try:
+        await send({"type": "websocket.close", "code": code, "reason": reason})
+    except (RuntimeError, OSError):
+        pass
+
+
+async def _ws_pump(conn, receive, send) -> None:
+    """Relay frames until one side closes, then tell the other side why.
+
+    This is a frame-level relay rather than a byte-level tunnel, because ASGI
+    hands us a decoded WebSocket and not the socket under it. One consequence is
+    worth stating plainly: **ping/pong does not reach end to end.** Each leg's
+    library answers the other's pings itself, so an application heartbeat across
+    this hop proves the static host is alive and nothing more.
+
+    What covers the gap is uvicorn's own keepalive on the caller's leg (20s
+    interval, 20s timeout by default): a caller whose network vanished is
+    dropped here within about forty seconds, and that close is relayed onwards —
+    so a peer that disappears is still noticed, just by this server rather than
+    by the app.
+    """
+    async def to_backend() -> None:
+        while True:
+            msg = await receive()
+            kind = msg.get("type")
+            if kind == "websocket.disconnect":
+                raise _CallerGone(msg.get("code"))
+            if kind != "websocket.receive":
+                continue
+            data = msg.get("bytes") if msg.get("text") is None else msg["text"]
+            if data is not None:
+                await conn.send(data)
+
+    async def to_caller() -> None:
+        try:
+            async for frame in conn:
+                if isinstance(frame, str):
+                    await send({"type": "websocket.send", "text": frame})
+                else:
+                    await send({"type": "websocket.send", "bytes": frame})
+        except ConnectionClosed:
+            return          # why it closed is on the connection, read below
+
+    legs = [asyncio.create_task(to_backend()), asyncio.create_task(to_caller())]
+    done, pending = await asyncio.wait(legs, return_when=asyncio.FIRST_COMPLETED)
+    for leg in pending:
+        leg.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    for leg in done:
+        exc = leg.exception()
+        if isinstance(exc, _CallerGone):
+            return      # the caller is gone; closing the backend is all that is left
+        if exc is not None and not isinstance(exc, ConnectionClosed):
+            _log.warning("ws relay failed: %s: %s", type(exc).__name__, exc)
+            await _ws_close_caller(send, 1011, "relay failed")
+            return
+    # The backend closed, or a send into it failed because it had. Relay its own
+    # code and reason: a client that was told 4001 "unpaired" can act on it,
+    # where a bare drop only tells it to try again.
+    await _ws_close_caller(send, _ws_close_code(conn.close_code),
+                           _ws_reason(conn.close_reason))
+
+
+async def _ws_proxy(scope, receive, send) -> None:
+    """A WebSocket upgrade on a fronted app's hostname.
+
+    The refusals come first and they are the same three the HTTP path has, in the
+    same order: our own marker coming back (the backend is not running), a host
+    that is nobody's app, and an app with no backend to upgrade to. Only then is
+    anything dialled.
+    """
+    headers = Headers(scope=scope)
+    # The connect event has to be taken before anything is sent back.
+    if (await receive()).get("type") != "websocket.connect":
+        return
+
+    if headers.get(BACKEND_HEADER) == BACKEND_TOKEN:
+        await _ws_refuse(scope, send, 503, [(DOWN_HEADER, "1"),
+                                            ("content-type", "application/json")],
+                         b'{"error": "backend has no route"}')
+        return
+
+    aid = _app_id(headers.get("host", ""))
+    if not aid or aid == SELF_APP_ID or not (ROOT / aid).is_dir():
+        await _ws_refuse(scope, send, 404,
+                         [("content-type", "application/json")],
+                         b'{"error": "no frontend for this host"}')
+        return
+    if not _manifest(aid).get("has_backend"):
+        # A bundle cannot answer an upgrade, and index.html would be a worse
+        # answer than none: the client would read a 200 as a working socket.
+        await _ws_refuse(scope, send, 404,
+                         [("content-type", "application/json")],
+                         b'{"error": "no backend"}')
+        return
+
+    conn, refusal = await _ws_open(scope, aid)
+    if conn is None:
+        if refusal is None:
+            await _ws_refuse(scope, send, 502,
+                             [("content-type", "application/json")],
+                             b'{"error": "backend unreachable"}')
+        else:
+            await _ws_refuse(scope, send, *refusal)
+        return
+
+    await send({
+        "type": "websocket.accept",
+        "subprotocol": conn.subprotocol,
+        # Whatever else the backend put on its 101 — a Set-Cookie, an app's own
+        # header — belongs to the caller as much as it would on any other
+        # response. Only the handshake's own headers are held back.
+        "headers": [(k.encode("latin-1"), v.encode("latin-1"))
+                    for k, v in conn.response.headers.raw_items()
+                    if k.lower() not in _WS_RESPONSE_DROP],
+    })
+    try:
+        await _ws_pump(conn, receive, send)
+    finally:
+        await conn.close()
+
+
+class WebSocketProxy:
+    """Pure ASGI, and in front of the router rather than a route on it.
+
+    Both halves of that are deliberate. A refused upgrade has to come back as an
+    HTTP status (see _ws_refuse), and Starlette's WebSocket wrapper cannot send
+    one: before the handshake it permits an accept or a close and nothing else,
+    so the backend's 401 would reach the caller as a 403 close with no body.
+    And sitting in front of the router keeps an upgrade away from the catch-all
+    HTTP route, which claims every path and would answer it as a GET.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "websocket":
+            await _ws_proxy(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(WebSocketProxy)
 
 
 def _serve(f: Path, url_path: str) -> FileResponse:
