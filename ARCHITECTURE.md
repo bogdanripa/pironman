@@ -851,6 +851,65 @@ Before this, the only thing that repaired it was the hourly route sweep — so t
 exposure was up to an hour of a production app serving the wrong content, with
 nothing anywhere reporting a fault.
 
+### Ask the user's question, not the platform's
+
+Two multi-hour outages, both found by a person rather than an alert:
+
+* **2026-09-28** — a false-negative healthcheck rollback deleted smartbill-mcp's
+  container, ten times across ten hours. The app is scale-to-zero, so "no
+  container" read as "asleep"; it is low-traffic, so there were no 5xx. Silence.
+* **2026-11-02** — the box rebooted, Traefik started before the network was
+  ready, failed to download its Sablier plugin, and carried on without it. Every
+  router referencing `plugin.sablier` was rejected as an invalid middleware, so
+  every scale-to-zero app was unreachable. Containers: up, healthy, correct
+  labels, Sablier running. Silence again.
+
+The second is the one that matters, because the fix written for the first — does
+a container exist? — **passed cleanly throughout it.** Every internal signal was
+green while nothing served. Fixing the specific cause twice would have left a
+third shape to be found by a person.
+
+The common property is that no check asked the user's question: *does a request
+to the public URL come back?* The 5xx rate was supposed to cover it and
+structurally cannot — 5xx only exist if somebody is making requests, so a quiet
+app with a dead route emits no evidence at all. The quieter the app, the longer
+it stays broken, which is exactly backwards.
+
+`app/probe.py` adds two checks of deliberately different kinds:
+
+**Router health**, every tick, reading Traefik's own `/api/http/routers`. A
+router Traefik will not serve is reported with its reason. Wakes nothing, costs
+nothing, and catches a family — bad middleware, missing service, a plugin that
+did not load — within minutes. Read from Traefik rather than scraped from its
+logs: it is Traefik's own account of what it will serve, and it does not change
+wording between versions. An unreadable API returns `None` and is reported as
+`unreadable`, never as healthy.
+
+**A synthetic fetch of the public URL**, once a day per app. The only
+*cause-independent* check here: it cannot say why, only that a real request did
+not come back — the one thing both outages had in common and the one thing
+nothing measured. Any HTTP response means the edge reached the app, so 401/403/
+404 pass; only 502/503/504 and transport failures count as unreachable, which is
+precisely what both produced (pironman-web's "backend has no route" is a 503).
+
+Three details that are load-bearing:
+
+* **The probe hour is a hash of the app id**, not a per-tick dice roll. Rolling
+  `rand(24) == hour` gives roughly-daily with skipped days and occasional
+  doubles, and a skipped day is a day of blindness. A hash gives each app exactly
+  one slot and keeps it, spread across the estate so the whole box is not woken
+  at once.
+* **Two attempts before alerting.** A once-a-day check that pages on a single
+  dropped connection is a check people learn to ignore.
+* **The probe is skipped only when Traefik is KNOWN broken**, never when its API
+  is merely unreadable. Gating the independent check on an internal one being
+  readable would recreate the blind spot it exists to fill — which it did, in a
+  first draft of this code.
+
+The probe costs one wake per app per day. That is the price of the check being
+real, and it is the trade this platform chose after two outages where the cheap
+checks all passed.
+
 ### Build natively on arm64 — never emulate it
 
 The box is arm64, and these workflows used to build `linux/arm64` on an x86

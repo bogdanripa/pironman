@@ -18,13 +18,20 @@ Three bits of noise control:
   - 5xx alerts fire on the *increase* in the day's 5xx count since the last check,
     thresholded, rather than on an absolute number.
 
+Everything above reads the platform's own view of itself, and twice that view
+was entirely green while the apps were unreachable. So two checks in probe.py
+ask the user's question instead — does a request to the public URL come back —
+and their results are alerted here: Traefik's router table every tick, and a
+synthetic fetch once a day per app, in an hour derived from the app's id.
+
 Unconfigured (no Telegram token/chat), check_once returns immediately.
 """
 import re
 from datetime import date, datetime, timezone
 
-from . import notify, stats
-from .config import ALERT_5XX_THRESHOLD, app_url, sablier_session_seconds
+from . import notify, probe, stats
+from .config import (ALERT_5XX_THRESHOLD, TRAEFIK_API_URL, app_url,
+                      sablier_session_seconds)
 from .db import pool
 
 DOWN_AFTER = 2  # consecutive missed checks before an app counts as down
@@ -119,6 +126,41 @@ async def check_once() -> dict:
         last_seen = {r["app_id"]: r["last_seen"] for r in await conn.fetch(
             "SELECT app_id, last_seen FROM analytics_last_seen")}
         now = datetime.now(timezone.utc)
+        messages_global: list[str] = []
+
+        # Traefik's own account of which routers it will serve. None means the
+        # API could not be read — reported as "cannot tell" rather than silently
+        # passing, because a check that quietly stops checking is how both of
+        # the outages this guards against lasted as long as they did.
+        routers = await probe.fetch_routers(TRAEFIK_API_URL) if TRAEFIK_API_URL else None
+        broken_routers = probe.router_problems(routers) if routers is not None else {}
+        prev_traefik = state.get("__traefik__") or {}
+        traefik_alerted = bool(prev_traefik.get("alerted_unreachable"))
+        if broken_routers and not traefik_alerted:
+            # One message for the lot. These fail in groups — a plugin that did
+            # not load takes out every router using it — so a line per app would
+            # be a dozen notifications for a single fault.
+            detail = "\n".join(f"• {n}: {why}"
+                                for n, why in sorted(broken_routers.items())[:8])
+            more = len(broken_routers) - 8
+            if more > 0:
+                detail += f"\n• …and {more} more"
+            messages_global.append(
+                f"\U0001f6a8 Traefik has {len(broken_routers)} router(s) it will "
+                f"not serve — the apps behind them are unreachable however "
+                f"healthy their containers look:\n{detail}")
+            traefik_alerted = True
+        elif routers is not None and not broken_routers and traefik_alerted:
+            messages_global.append("\U0001f7e2 Traefik is serving every router again")
+            traefik_alerted = False
+
+        # Skip the day's probes only when Traefik is KNOWN to be broken — the
+        # answer is a foregone conclusion and waking every app to confirm it
+        # turns one fault into a dozen notifications. An unreadable API is "do
+        # not know", which must NOT suppress probing: the probe is the check
+        # that does not depend on anything internal being readable, and making
+        # it conditional on one would recreate the blind spot it exists to fill.
+        traefik_known_broken = bool(broken_routers)
 
         running_names = list((await stats._container_stats()).keys())
         # state + since (StartedAt while running) for every container, needed to
@@ -201,6 +243,23 @@ async def check_once() -> dict:
                 # both.
                 alerted_stuck = False
 
+            # Once a day, in this app's own hour, actually fetch its public
+            # URL. The only cause-independent check here: it cannot say why, only
+            # that a real request did not come back — which is precisely what
+            # both outages did, while every internal signal stayed green. Skipped
+            # when Traefik is already known to be broken, because the answer is
+            # a foregone conclusion and waking every app to confirm it would turn
+            # one fault into a dozen notifications.
+            probed_on = prev.get("probed_on") if prev else None
+            alerted_unreachable = bool(prev.get("alerted_unreachable")) if prev else False
+            if (prev is not None and not traefik_known_broken
+                    and probe.due_for_probe(aid, now, probed_on)):
+                serving, status = await probe.probe(app_url(aid))
+                probe_msgs, alerted_unreachable = probe.reachability_decision(
+                    aid, serving, status, app_url(aid), prev)
+                messages.extend(probe_msgs)
+                probed_on = now.date()
+
             # 5xx: baseline is the prior count only within the same day (the
             # counter resets each day, so a day rollover baselines from 0). This
             # runs for EVERY app, and must: it is the only cover a sleeping app
@@ -223,17 +282,35 @@ async def check_once() -> dict:
             await conn.execute(
                 "INSERT INTO alert_state "
                 "(app_id, fail_count, alerted_down, alerted_stuck, "
-                " missing_count, alerted_missing, err_day, err_server, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE, $7, now()) "
+                " missing_count, alerted_missing, probed_on, alerted_unreachable, "
+                " err_day, err_server, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_DATE, $9, now()) "
                 "ON CONFLICT (app_id) DO UPDATE SET "
                 "fail_count = EXCLUDED.fail_count, "
                 "alerted_down = EXCLUDED.alerted_down, "
                 "alerted_stuck = EXCLUDED.alerted_stuck, "
                 "missing_count = EXCLUDED.missing_count, "
                 "alerted_missing = EXCLUDED.alerted_missing, "
+                "probed_on = EXCLUDED.probed_on, "
+                "alerted_unreachable = EXCLUDED.alerted_unreachable, "
                 "err_day = EXCLUDED.err_day, err_server = EXCLUDED.err_server, "
                 "updated_at = now()",
                 aid, fail_count, alerted_down, alerted_stuck,
-                missing_count, alerted_missing, err)
+                missing_count, alerted_missing, probed_on, alerted_unreachable, err)
 
-    return {"apps_checked": len(apps), "alerts_sent": sent}
+        for m in messages_global:
+            if await notify.send(m):
+                sent += 1
+        # The traefik latch rides in alert_state under a reserved key rather than
+        # a table of its own: same latch semantics, same place to look.
+        await conn.execute(
+            "INSERT INTO alert_state (app_id, alerted_unreachable, updated_at) "
+            "VALUES ('__traefik__', $1, now()) "
+            "ON CONFLICT (app_id) DO UPDATE SET "
+            "alerted_unreachable = EXCLUDED.alerted_unreachable, updated_at = now()",
+            traefik_alerted)
+
+    return {"apps_checked": len(apps), "alerts_sent": sent,
+            # "cannot tell" is reported, never mistaken for health.
+            "traefik": "unreadable" if routers is None else
+                       (f"{len(broken_routers)} broken router(s)" if broken_routers else "ok")}

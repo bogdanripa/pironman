@@ -142,6 +142,13 @@ ALTER TABLE IF EXISTS alert_state
     ADD COLUMN IF NOT EXISTS missing_count int NOT NULL DEFAULT 0;
 ALTER TABLE IF EXISTS alert_state
     ADD COLUMN IF NOT EXISTS alerted_missing boolean NOT NULL DEFAULT false;
+-- Daily synthetic reachability probe: did a request to the app's PUBLIC url
+-- come back? probed_on is the date of the last attempt, so an app is probed
+-- once in its own hour and not again that day.
+ALTER TABLE IF EXISTS alert_state
+    ADD COLUMN IF NOT EXISTS probed_on date;
+ALTER TABLE IF EXISTS alert_state
+    ADD COLUMN IF NOT EXISTS alerted_unreachable boolean NOT NULL DEFAULT false;
 
 -- Per-app/day request counts by raw user-agent string, so the actual agents
 -- (browsers, crawlers, scripts) can be listed, not just the humans/bots split.

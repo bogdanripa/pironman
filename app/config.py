@@ -21,6 +21,12 @@ DOMAIN_SUFFIX = os.environ.get("DOMAIN_SUFFIX", "-coolify.bogdanripa.com")
 # name of the edge proxy whose logs are read; ANALYTICS_SALT keys the cookieless
 # visitor hash (change it and past visitors count as new — treat it as stable).
 ANALYTICS_PROXY = os.environ.get("ANALYTICS_PROXY", "coolify-proxy")
+
+# Traefik's API, for reading its own router table. Empty disables that check.
+# Reachable only once the proxy is started with --api.insecure=true, which binds
+# it to the container's network interfaces and NOT to a published port, so it is
+# reachable from the docker network and not from the internet.
+TRAEFIK_API_URL = os.environ.get("TRAEFIK_API_URL", "http://coolify-proxy:8080")
 ANALYTICS_SALT  = os.environ.get("ANALYTICS_SALT", "pironman-analytics-v1")
 
 # Telegram alerting (app/alerts.py). Both must be set for alerts to fire; unset,
