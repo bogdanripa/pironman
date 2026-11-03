@@ -148,6 +148,35 @@ def main() -> None:
     check("a non-200 API returns None",
           asyncio.run(probe.fetch_routers("http://nope", NotJson())), None)
 
+    print("\nthe Sablier plugin, and healing it")
+
+    class Docker:
+        """Stands in for autoupdate._docker."""
+        def __init__(self, code, out): self.code, self.out = code, out
+        async def __call__(self, *a, **kw): return self.code, self.out
+
+    check("populated sources -> loaded",
+          asyncio.run(probe.plugin_loaded(Docker(0, "gop-1197303199\n"))), True)
+    check("EMPTY sources -> not loaded (the 2026-11-02 state)",
+          asyncio.run(probe.plugin_loaded(Docker(0, "\n"))), False)
+    check("docker failure -> cannot tell, NOT 'fine'",
+          asyncio.run(probe.plugin_loaded(Docker(1, "no such container"))), None)
+
+    # Heal only on a definite failure. "Cannot tell" must never restart the
+    # proxy, and "loaded" obviously must not.
+    check("heal when definitely missing", probe.should_heal_plugin(False, 1000.0, None), True)
+    check("never heal when loaded", probe.should_heal_plugin(True, 1000.0, None), False)
+    check("never heal on 'cannot tell'", probe.should_heal_plugin(None, 1000.0, None), False)
+
+    # Rate limit: a proxy that comes back still broken must not be restarted
+    # every tick.
+    just_now = 1000.0
+    check("no second restart inside the cooldown",
+          probe.should_heal_plugin(False, just_now + 60, just_now), False)
+    check("restart again after the cooldown",
+          probe.should_heal_plugin(False, just_now + probe.PLUGIN_HEAL_COOLDOWN_S + 1, just_now),
+          True)
+
     print()
     if FAILURES:
         print(f"FAILURES: {FAILURES}")

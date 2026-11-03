@@ -29,7 +29,7 @@ Unconfigured (no Telegram token/chat), check_once returns immediately.
 import re
 from datetime import date, datetime, timezone
 
-from . import notify, probe, stats
+from . import autoupdate, notify, probe, stats
 from .config import (ALERT_5XX_THRESHOLD, TRAEFIK_API_URL, app_url,
                       sablier_session_seconds)
 from .db import pool
@@ -161,6 +161,33 @@ async def check_once() -> dict:
         # that does not depend on anything internal being readable, and making
         # it conditional on one would recreate the blind spot it exists to fill.
         traefik_known_broken = bool(broken_routers)
+
+        # The Sablier plugin, and healing it. Checked directly rather than
+        # through the router API, because the API needs a proxy config change
+        # that Coolify reverts — and because an empty plugin source directory is
+        # a fact, with no log wording or API shape to track.
+        plugin = await probe.plugin_loaded(autoupdate._docker)
+        if plugin is False:
+            traefik_known_broken = True          # every sablier router is dead
+            last_heal = prev_traefik.get("healed_at")
+            if probe.should_heal_plugin(plugin, now.timestamp(), last_heal):
+                code, _ = await autoupdate._docker("restart", "coolify-proxy", timeout=90)
+                healed = code == 0
+                messages_global.append(
+                    f"\U0001f6a8 Traefik started without its Sablier plugin, so "
+                    f"every scale-to-zero app was unreachable. "
+                    + ("Restarted the proxy to reload it — verifying on the next "
+                       "check." if healed else
+                       "The automatic restart FAILED and this needs hands."))
+                heal_ts = now.timestamp()
+            else:
+                heal_ts = last_heal
+        else:
+            heal_ts = None
+            if plugin is None:
+                # Cannot tell. Reported, never assumed well.
+                pass
+
 
         running_names = list((await stats._container_stats()).keys())
         # state + since (StartedAt while running) for every container, needed to
@@ -304,13 +331,16 @@ async def check_once() -> dict:
         # The traefik latch rides in alert_state under a reserved key rather than
         # a table of its own: same latch semantics, same place to look.
         await conn.execute(
-            "INSERT INTO alert_state (app_id, alerted_unreachable, updated_at) "
-            "VALUES ('__traefik__', $1, now()) "
+            "INSERT INTO alert_state (app_id, alerted_unreachable, healed_at, updated_at) "
+            "VALUES ('__traefik__', $1, $2, now()) "
             "ON CONFLICT (app_id) DO UPDATE SET "
-            "alerted_unreachable = EXCLUDED.alerted_unreachable, updated_at = now()",
-            traefik_alerted)
+            "alerted_unreachable = EXCLUDED.alerted_unreachable, "
+            "healed_at = EXCLUDED.healed_at, updated_at = now()",
+            traefik_alerted, heal_ts)
 
     return {"apps_checked": len(apps), "alerts_sent": sent,
             # "cannot tell" is reported, never mistaken for health.
             "traefik": "unreadable" if routers is None else
-                       (f"{len(broken_routers)} broken router(s)" if broken_routers else "ok")}
+                       (f"{len(broken_routers)} broken router(s)" if broken_routers else "ok"),
+            "sablier_plugin": {True: "loaded", False: "MISSING",
+                               None: "unknown"}[plugin]}

@@ -168,3 +168,52 @@ async def fetch_routers(api_url: str, client: httpx.AsyncClient | None = None) -
     finally:
         if own:
             await client.aclose()
+
+
+# ---- the Sablier plugin, and healing it -----------------------------------
+#
+# Traefik downloads its plugins at startup. On a reboot it can win the race
+# against the network coming up, fail the download, and carry on without the
+# plugin — permanently, because nothing retries. Every router referencing
+# plugin.sablier is then rejected and every scale-to-zero app is unreachable,
+# while its container sits there healthy. That is the 2026-11-02 outage.
+#
+# The obvious prevention — persist /plugins-storage on a volume — does not
+# survive: Coolify owns the proxy's compose file and regenerates it from its own
+# database, reverting the edit. So detect and heal instead of prevent.
+#
+# The signal is exact and needs no API: Traefik populates /plugins-storage/sources
+# when a plugin loads, and leaves it empty when it could not. No log wording to
+# track, no version to keep up with.
+
+PLUGIN_SOURCES = "/plugins-storage/sources"
+
+# A proxy restart is platform-wide, so it is rate-limited. The condition it acts
+# on is unambiguous and total — every scale-to-zero app is already failing every
+# request — so the restart costs nothing that is not already lost.
+PLUGIN_HEAL_COOLDOWN_S = 30 * 60
+
+
+async def plugin_loaded(docker, proxy: str = "coolify-proxy") -> bool | None:
+    """Did Traefik's plugin actually load? None if it could not be determined.
+
+    None is "cannot tell" and must not be treated as either answer: healing on
+    it would restart the proxy over a transient docker hiccup, and passing on it
+    would reinstate the silence this exists to end.
+    """
+    try:
+        code, out = await docker("exec", proxy, "ls", "-A", PLUGIN_SOURCES, timeout=20)
+    except Exception:
+        return None
+    if code != 0:
+        return None
+    return bool(out.strip())
+
+
+def should_heal_plugin(loaded: bool | None, now: float, last_heal: float | None) -> bool:
+    """Restart the proxy? Only on a definite failure, and not in a loop."""
+    if loaded is not False:          # True = fine, None = cannot tell
+        return False
+    if last_heal is None:
+        return True
+    return (now - last_heal) >= PLUGIN_HEAL_COOLDOWN_S

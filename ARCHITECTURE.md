@@ -906,6 +906,27 @@ Three details that are load-bearing:
   readable would recreate the blind spot it exists to fill — which it did, in a
   first draft of this code.
 
+**Healing the plugin, since preventing it is not available.** Traefik fetches
+its plugins at startup, and on a reboot it can beat the network and fail the
+download — then run on without the plugin for ever, because nothing retries.
+The obvious prevention is to persist `/plugins-storage` on a volume. That does
+not survive: Coolify owns the proxy's compose file and regenerates it from
+`servers.proxy->last_saved_proxy_configuration` in its own database, reverting
+the edit within seconds. Editing that column instead is surgery on Coolify's
+internals, and a mistake there takes down every route on the box.
+
+So the platform detects and heals rather than prevents. `/plugins-storage/sources`
+is populated exactly when a plugin loaded and empty when it did not — a fact,
+with no log wording or API shape to track, and needing no proxy change at all.
+On a definite "empty", the proxy is restarted automatically and a message sent.
+The restart is safe precisely because the condition is total: every scale-to-zero
+app is already failing every request, so there is nothing left to interrupt. It
+is rate-limited to once every 30 minutes so a proxy that returns still broken is
+not restarted in a loop, and it acts ONLY on a definite failure — "cannot tell"
+(docker unreachable) neither heals nor passes, because healing on it would
+restart the proxy over a transient hiccup and passing on it would restore the
+silence this exists to end.
+
 The probe costs one wake per app per day. That is the price of the check being
 real, and it is the trade this platform chose after two outages where the cheap
 checks all passed.

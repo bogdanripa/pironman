@@ -149,6 +149,11 @@ ALTER TABLE IF EXISTS alert_state
     ADD COLUMN IF NOT EXISTS probed_on date;
 ALTER TABLE IF EXISTS alert_state
     ADD COLUMN IF NOT EXISTS alerted_unreachable boolean NOT NULL DEFAULT false;
+-- Epoch seconds of the last automatic proxy restart, on the reserved
+-- '__traefik__' row. Rate-limits the self-heal so a proxy that comes back
+-- without its plugin is not restarted in a loop.
+ALTER TABLE IF EXISTS alert_state
+    ADD COLUMN IF NOT EXISTS healed_at double precision;
 
 -- Per-app/day request counts by raw user-agent string, so the actual agents
 -- (browsers, crawlers, scripts) can be listed, not just the humans/bots split.
