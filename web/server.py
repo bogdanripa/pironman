@@ -512,9 +512,17 @@ async def _proxy(request: Request, aid: str) -> Response:
     """
     t0 = time.monotonic()
     sent = await _send(request, aid)
-    if sent and not _is_down(sent[1]) and not _is_gateway_error(sent[1]) \
-            and not _is_wake_transient(aid, sent[1].status_code):
+    real = not sent or _is_down(sent[1]) or _is_gateway_error(sent[1])
+    if not real and not _is_wake_transient(aid, sent[1].status_code):
         return _stream(*sent)          # fast path: awake, nothing logged
+    if not real:
+        # Only the window brought us here: the app answered, so it is up and
+        # there is nothing to ask Sablier. Retry, but do NOT open or extend the
+        # window — a request that took this path because of the window must not
+        # be what keeps it open, or one real wake would let an app that keeps
+        # answering 500 have every one of them re-sent for the whole budget,
+        # forever (PIR-56 review).
+        return await _proxy_wake(request, aid, t0, sent, wake=False)
     _wake_begin(aid)
     try:
         return await _proxy_wake(request, aid, t0, sent)
@@ -522,8 +530,11 @@ async def _proxy(request: Request, aid: str) -> Response:
         _wake_end(aid)
 
 
-async def _proxy_wake(request: Request, aid: str, t0: float, sent) -> Response:
-    """_proxy's slow path, run with the app's wake window open."""
+async def _proxy_wake(request: Request, aid: str, t0: float, sent,
+                      wake: bool = True) -> Response:
+    """_proxy's slow path. With `wake`, the app's window is open and Sablier is
+    asked to start it; without, the probe was only the wake transient on an app
+    that is already up, so it is retried and nothing is started."""
     probe = time.monotonic() - t0
     # A bare gateway error might be a sleeping app OR an app that is genuinely
     # answering 502, and we cannot tell the two apart from the response. So give
@@ -537,6 +548,7 @@ async def _proxy_wake(request: Request, aid: str, t0: float, sent) -> Response:
     if sent:
         await sent[1].aclose()
         await sent[0].aclose()
+    if sent and wake:
         t_wake = time.monotonic()
         woke = await _wake(aid)
         sablier = time.monotonic() - t_wake
@@ -763,10 +775,14 @@ async def _ws_open(scope, aid: str):
     conn, refusal = await _ws_dial(scope)
     if conn is not None:
         return conn, None
-    if refusal is not None and not _ws_is_down(refusal) \
-            and not _ws_is_gateway_error(refusal) \
-            and not _is_wake_transient(aid, refusal[0]):
+    real = refusal is None or _ws_is_down(refusal) \
+        or _ws_is_gateway_error(refusal)
+    if not real and not _is_wake_transient(aid, refusal[0]):
         return None, refusal           # the backend answered; its answer stands
+    if not real:
+        # As in _proxy: the window got us here, so retry without asking Sablier
+        # and without opening or extending the window.
+        return await _ws_open_wake(scope, aid, t0, refusal, wake=False)
     _wake_begin(aid)
     try:
         return await _ws_open_wake(scope, aid, t0, refusal)
@@ -774,10 +790,10 @@ async def _ws_open(scope, aid: str):
         _wake_end(aid)
 
 
-async def _ws_open_wake(scope, aid: str, t0: float, refusal):
-    """_ws_open's slow path, run with the app's wake window open."""
+async def _ws_open_wake(scope, aid: str, t0: float, refusal, wake: bool = True):
+    """_ws_open's slow path; `wake` as in _proxy_wake."""
     budget = WAKE_RETRY_BUDGET if _ws_is_down(refusal) else GATEWAY_RETRY_BUDGET
-    if refusal is not None:
+    if refusal is not None and wake:
         if not await _wake(aid):
             _log.warning("ws wake %s: FAILED after %.2fs", aid,
                          time.monotonic() - t0)

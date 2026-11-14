@@ -461,6 +461,8 @@ async def main():
               f"{r.status_code} {r.text[:60]}")
         check("and the transient was actually hit", STATE["transient500"] == 0,
               STATE["transient500"])
+        check("and Sablier was not asked: the app answered, so it is up",
+              STATE["wakes"] == 0, STATE["wakes"])
 
         print("\n[a first-probe 500 while a wake is still in flight]")
         server._waking.clear()
@@ -489,6 +491,39 @@ async def main():
         check("it was passed through on the first attempt",
               STATE["transient500"] == 98, 99 - STATE["transient500"])
         STATE["transient500"] = 0
+
+        print("\n[a real 500 inside the window does not keep the window open]")
+        # PIR-56 review: a request that took the slow path only BECAUSE of the
+        # window used to open and re-close it itself, pushing it WAKE_GRACE past
+        # its own end. An app answering 500 to a request every few seconds then
+        # never left the window, and every real 500 was re-sent for the whole
+        # budget. Only a real wake may open or extend it.
+        grace = server.WAKE_GRACE
+        server.WAKE_GRACE = 0.5             # shorter than the 1s retry budget
+        try:
+            server._waking.clear()
+            STATE["up"] = False; STATE["transient500"] = 0; STATE["wakes"] = 0
+            r = await c.get(base + "/api/thing", headers=H)   # one real wake
+            check("a real wake opens the window",
+                  r.status_code == 200 and STATE["wakes"] == 1
+                  and server._wake_window("demo"), STATE["wakes"])
+            STATE["transient500"] = 999; STATE["wakes"] = 0
+            r = await c.get(base + "/api/thing", headers=H)   # real 500, in window
+            check("a real 500 in the window is still the caller's in the end",
+                  r.status_code == 500, r.status_code)
+            check("and it did not ask Sablier", STATE["wakes"] == 0, STATE["wakes"])
+            check("and the window closed on the real wake's schedule, not its own",
+                  not server._wake_window("demo"), dict(server._waking))
+            before = STATE["transient500"]
+            r = await c.get(base + "/api/thing", headers=H)   # real 500, after
+            check("the next real 500 goes through on the first attempt",
+                  r.status_code == 500 and before - STATE["transient500"] == 1,
+                  f"{r.status_code}, {before - STATE['transient500']} sends")
+            check("with no wake", STATE["wakes"] == 0, STATE["wakes"])
+        finally:
+            server.WAKE_GRACE = grace
+            server._waking.clear()
+            STATE["transient500"] = 0; STATE["wakes"] = 0
 
         print("\n[wake fails]")
         STATE["up"] = False; STATE["sablier_ok"] = False; STATE["wakes"] = 0

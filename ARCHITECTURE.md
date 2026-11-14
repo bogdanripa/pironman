@@ -2244,6 +2244,12 @@ symptom and the platform's own status agreed with it.
   while a wake is in flight and for `WAKE_GRACE` (10s) after — and only inside it
   is a first-probe `500` treated as not-ready, on the short gateway budget, for
   HTTP and WebSocket alike. Outside it a `500` still passes through untouched.
+  Only a **real** wake reason (no connection, the down marker, a gateway error)
+  opens or extends the window; a request that is in the slow path *because of*
+  the window is retried without calling Sablier and without touching it. Without
+  that rule the window keeps itself open: an app answering real `500`s every few
+  seconds never leaves it after one wake, and every `500` is re-sent for the
+  whole budget, `POST`s included.
 - **Stopped and deleted are different states, and the platform must never conflate
   them** — a slept container wakes, a deleted one can only be redeployed. Anything
   that answers "is this app OK" by looking at `docker ps` sees the same thing for
