@@ -59,6 +59,7 @@ import asyncio
 import http
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -442,6 +443,56 @@ def _is_gateway_error(r: httpx.Response) -> bool:
 # 200 in 5.26s. Roughly one wake in ten, always the first after a long idle.
 _WAKE_TRANSIENT = frozenset({500})
 
+# The same transient, reached from the other side. A wake is per APP, not per
+# request: while one request is waking an app, a second request for it can
+# arrive, and ITS first probe can land in the moment Traefik re-creates the
+# service. That probe then gets the 1ms 500 and — being a first probe — used to
+# be passed straight to the caller. Observed 2026-11-13T14:31:47Z on bt-gateway:
+# `fe-bt-gateway` 500 in ~20ms with OriginStatus 0, no `wake` line for it, and
+# a concurrent `served in` for the same app a second later.
+#
+# So a first-probe 500 counts as not-ready only while a wake for that app is in
+# flight, or within WAKE_GRACE of one finishing. Outside that window a 500 is
+# the app's and passes through untouched, which is the rule _WAKE_TRANSIENT
+# exists to keep. Inside it a real app 500 is retried on the short budget and
+# still reaches the caller once that is spent — the cost of the window.
+WAKE_GRACE = float(os.environ.get("WAKE_GRACE_SECONDS", "10"))
+# app id -> monotonic time the window closes; math.inf while a wake is open.
+_waking: dict[str, float] = {}
+# app id -> wakes currently open, so the first of two concurrent wakes to finish
+# does not close the window under the other.
+_wakes_open: dict[str, int] = {}
+
+
+def _wake_begin(aid: str) -> None:
+    _wakes_open[aid] = _wakes_open.get(aid, 0) + 1
+    _waking[aid] = math.inf
+
+
+def _wake_end(aid: str) -> None:
+    n = _wakes_open.get(aid, 1) - 1
+    if n > 0:
+        _wakes_open[aid] = n
+        return
+    _wakes_open.pop(aid, None)
+    _waking[aid] = time.monotonic() + WAKE_GRACE
+
+
+def _wake_window(aid: str) -> bool:
+    """True while a wake for this app is in flight or has just finished."""
+    until = _waking.get(aid)
+    if until is None:
+        return False
+    if time.monotonic() < until:
+        return True
+    _waking.pop(aid, None)
+    return False
+
+
+def _is_wake_transient(aid: str, status: int) -> bool:
+    """A first-probe answer that is Traefik's re-create blip, not the app's."""
+    return status in _WAKE_TRANSIENT and _wake_window(aid)
+
 
 async def _proxy(request: Request, aid: str) -> Response:
     """Forward to the app's backend, waking it first if it turns out to be asleep.
@@ -461,8 +512,29 @@ async def _proxy(request: Request, aid: str) -> Response:
     """
     t0 = time.monotonic()
     sent = await _send(request, aid)
-    if sent and not _is_down(sent[1]) and not _is_gateway_error(sent[1]):
+    real = not sent or _is_down(sent[1]) or _is_gateway_error(sent[1])
+    if not real and not _is_wake_transient(aid, sent[1].status_code):
         return _stream(*sent)          # fast path: awake, nothing logged
+    if not real:
+        # Only the window brought us here: the app answered, so it is up and
+        # there is nothing to ask Sablier. Retry, but do NOT open or extend the
+        # window — a request that took this path because of the window must not
+        # be what keeps it open, or one real wake would let an app that keeps
+        # answering 500 have every one of them re-sent for the whole budget,
+        # forever (PIR-56 review).
+        return await _proxy_wake(request, aid, t0, sent, wake=False)
+    _wake_begin(aid)
+    try:
+        return await _proxy_wake(request, aid, t0, sent)
+    finally:
+        _wake_end(aid)
+
+
+async def _proxy_wake(request: Request, aid: str, t0: float, sent,
+                      wake: bool = True) -> Response:
+    """_proxy's slow path. With `wake`, the app's window is open and Sablier is
+    asked to start it; without, the probe was only the wake transient on an app
+    that is already up, so it is retried and nothing is started."""
     probe = time.monotonic() - t0
     # A bare gateway error might be a sleeping app OR an app that is genuinely
     # answering 502, and we cannot tell the two apart from the response. So give
@@ -476,6 +548,7 @@ async def _proxy(request: Request, aid: str) -> Response:
     if sent:
         await sent[1].aclose()
         await sent[0].aclose()
+    if sent and wake:
         t_wake = time.monotonic()
         woke = await _wake(aid)
         sablier = time.monotonic() - t_wake
@@ -702,12 +775,25 @@ async def _ws_open(scope, aid: str):
     conn, refusal = await _ws_dial(scope)
     if conn is not None:
         return conn, None
-    if refusal is not None and not _ws_is_down(refusal) \
-            and not _ws_is_gateway_error(refusal):
+    real = refusal is None or _ws_is_down(refusal) \
+        or _ws_is_gateway_error(refusal)
+    if not real and not _is_wake_transient(aid, refusal[0]):
         return None, refusal           # the backend answered; its answer stands
+    if not real:
+        # As in _proxy: the window got us here, so retry without asking Sablier
+        # and without opening or extending the window.
+        return await _ws_open_wake(scope, aid, t0, refusal, wake=False)
+    _wake_begin(aid)
+    try:
+        return await _ws_open_wake(scope, aid, t0, refusal)
+    finally:
+        _wake_end(aid)
 
+
+async def _ws_open_wake(scope, aid: str, t0: float, refusal, wake: bool = True):
+    """_ws_open's slow path; `wake` as in _proxy_wake."""
     budget = WAKE_RETRY_BUDGET if _ws_is_down(refusal) else GATEWAY_RETRY_BUDGET
-    if refusal is not None:
+    if refusal is not None and wake:
         if not await _wake(aid):
             _log.warning("ws wake %s: FAILED after %.2fs", aid,
                          time.monotonic() - t0)

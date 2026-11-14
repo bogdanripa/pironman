@@ -447,15 +447,83 @@ async def main():
         check("a transient 500 after the wake is retried, not passed on",
               r.status_code == 200 and r.json().get("backend"), r.text[:80])
 
+        print("\n[a second request's first probe gets the 500 during a wake]")
+        # 2026-11-13 on bt-gateway: one request woke the app, and a second one
+        # arriving in that window hit Traefik's re-create 500 on its FIRST probe,
+        # which used to be passed straight through. A wake has just been served
+        # above, so this app's wake window is open.
+        STATE["up"] = True; STATE["transient500"] = 1; STATE["wakes"] = 0
+        check("the wake window is open after a wake",
+              server._wake_window("demo"), dict(server._waking))
+        r = await c.get(base + "/api/thing", headers=H)
+        check("a first-probe 500 during a wake is retried and served",
+              r.status_code == 200 and r.json().get("backend"),
+              f"{r.status_code} {r.text[:60]}")
+        check("and the transient was actually hit", STATE["transient500"] == 0,
+              STATE["transient500"])
+        check("and Sablier was not asked: the app answered, so it is up",
+              STATE["wakes"] == 0, STATE["wakes"])
+
+        print("\n[a first-probe 500 while a wake is still in flight]")
+        server._waking.clear()
+        server._wake_begin("demo")          # another request is mid-wake
+        try:
+            STATE["up"] = True; STATE["transient500"] = 1; STATE["wakes"] = 0
+            r = await c.get(base + "/api/thing", headers=H)
+            check("a first-probe 500 with a wake open is retried and served",
+                  r.status_code == 200 and r.json().get("backend"),
+                  f"{r.status_code} {r.text[:60]}")
+        finally:
+            server._wake_end("demo")
+        check("the window stays open for the grace period after",
+              server._wake_window("demo"), dict(server._waking))
+
         print("\n[an awake app's own 500 is NOT retried]")
         # The backend is up, so the first probe reaches it and its 500 is the
         # real answer. Retrying here would bury a genuine application failure.
+        # No wake in flight: close the window the cases above left open.
+        server._waking.clear()
         STATE["up"] = True; STATE["transient500"] = 99; STATE["wakes"] = 0
         r = await c.get(base + "/api/thing", headers=H)
         check("an awake app's 500 goes straight to the caller",
               r.status_code == 500, r.status_code)
         check("and no wake was attempted for it", STATE["wakes"] == 0, STATE["wakes"])
+        check("it was passed through on the first attempt",
+              STATE["transient500"] == 98, 99 - STATE["transient500"])
         STATE["transient500"] = 0
+
+        print("\n[a real 500 inside the window does not keep the window open]")
+        # PIR-56 review: a request that took the slow path only BECAUSE of the
+        # window used to open and re-close it itself, pushing it WAKE_GRACE past
+        # its own end. An app answering 500 to a request every few seconds then
+        # never left the window, and every real 500 was re-sent for the whole
+        # budget. Only a real wake may open or extend it.
+        grace = server.WAKE_GRACE
+        server.WAKE_GRACE = 0.5             # shorter than the 1s retry budget
+        try:
+            server._waking.clear()
+            STATE["up"] = False; STATE["transient500"] = 0; STATE["wakes"] = 0
+            r = await c.get(base + "/api/thing", headers=H)   # one real wake
+            check("a real wake opens the window",
+                  r.status_code == 200 and STATE["wakes"] == 1
+                  and server._wake_window("demo"), STATE["wakes"])
+            STATE["transient500"] = 999; STATE["wakes"] = 0
+            r = await c.get(base + "/api/thing", headers=H)   # real 500, in window
+            check("a real 500 in the window is still the caller's in the end",
+                  r.status_code == 500, r.status_code)
+            check("and it did not ask Sablier", STATE["wakes"] == 0, STATE["wakes"])
+            check("and the window closed on the real wake's schedule, not its own",
+                  not server._wake_window("demo"), dict(server._waking))
+            before = STATE["transient500"]
+            r = await c.get(base + "/api/thing", headers=H)   # real 500, after
+            check("the next real 500 goes through on the first attempt",
+                  r.status_code == 500 and before - STATE["transient500"] == 1,
+                  f"{r.status_code}, {before - STATE['transient500']} sends")
+            check("with no wake", STATE["wakes"] == 0, STATE["wakes"])
+        finally:
+            server.WAKE_GRACE = grace
+            server._waking.clear()
+            STATE["transient500"] = 0; STATE["wakes"] = 0
 
         print("\n[wake fails]")
         STATE["up"] = False; STATE["sablier_ok"] = False; STATE["wakes"] = 0
