@@ -447,14 +447,47 @@ async def main():
         check("a transient 500 after the wake is retried, not passed on",
               r.status_code == 200 and r.json().get("backend"), r.text[:80])
 
+        print("\n[a second request's first probe gets the 500 during a wake]")
+        # 2026-11-13 on bt-gateway: one request woke the app, and a second one
+        # arriving in that window hit Traefik's re-create 500 on its FIRST probe,
+        # which used to be passed straight through. A wake has just been served
+        # above, so this app's wake window is open.
+        STATE["up"] = True; STATE["transient500"] = 1; STATE["wakes"] = 0
+        check("the wake window is open after a wake",
+              server._wake_window("demo"), dict(server._waking))
+        r = await c.get(base + "/api/thing", headers=H)
+        check("a first-probe 500 during a wake is retried and served",
+              r.status_code == 200 and r.json().get("backend"),
+              f"{r.status_code} {r.text[:60]}")
+        check("and the transient was actually hit", STATE["transient500"] == 0,
+              STATE["transient500"])
+
+        print("\n[a first-probe 500 while a wake is still in flight]")
+        server._waking.clear()
+        server._wake_begin("demo")          # another request is mid-wake
+        try:
+            STATE["up"] = True; STATE["transient500"] = 1; STATE["wakes"] = 0
+            r = await c.get(base + "/api/thing", headers=H)
+            check("a first-probe 500 with a wake open is retried and served",
+                  r.status_code == 200 and r.json().get("backend"),
+                  f"{r.status_code} {r.text[:60]}")
+        finally:
+            server._wake_end("demo")
+        check("the window stays open for the grace period after",
+              server._wake_window("demo"), dict(server._waking))
+
         print("\n[an awake app's own 500 is NOT retried]")
         # The backend is up, so the first probe reaches it and its 500 is the
         # real answer. Retrying here would bury a genuine application failure.
+        # No wake in flight: close the window the cases above left open.
+        server._waking.clear()
         STATE["up"] = True; STATE["transient500"] = 99; STATE["wakes"] = 0
         r = await c.get(base + "/api/thing", headers=H)
         check("an awake app's 500 goes straight to the caller",
               r.status_code == 500, r.status_code)
         check("and no wake was attempted for it", STATE["wakes"] == 0, STATE["wakes"])
+        check("it was passed through on the first attempt",
+              STATE["transient500"] == 98, 99 - STATE["transient500"])
         STATE["transient500"] = 0
 
         print("\n[wake fails]")

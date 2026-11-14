@@ -2232,6 +2232,18 @@ symptom and the platform's own status agreed with it.
 - **Traefik's Docker provider only sees running containers** — a stopped app has
   no router, so anything that must survive the app being stopped (a wake path
   above all) has to live on a container that stays up.
+- **Traefik's wake-window `500` belongs to the app, not the request** — while
+  Traefik re-creates a woken app's service it answers `500` in ~1ms with
+  `OriginStatus 0` (`_WAKE_TRANSIENT`, §9c). The wake loop always retried it, but
+  a *second* request whose **first** probe landed in that window was passed
+  straight through, because a first-probe `500` is normally the app's own.
+  **Signature:** a `fe-<app>` `500` of ~20ms with **no** `wake` line for it in
+  `web`'s log, beside a concurrent `wake <app>: served in …` for the same app
+  (bt-gateway, 2026-11-13T14:31:47Z — the day's only client-visible 5xx). Fixed
+  2026-11-14 (`web/server.py`): `_waking` holds each app's wake window — open
+  while a wake is in flight and for `WAKE_GRACE` (10s) after — and only inside it
+  is a first-probe `500` treated as not-ready, on the short gateway budget, for
+  HTTP and WebSocket alike. Outside it a `500` still passes through untouched.
 - **Stopped and deleted are different states, and the platform must never conflate
   them** — a slept container wakes, a deleted one can only be redeployed. Anything
   that answers "is this app OK" by looking at `docker ps` sees the same thing for
