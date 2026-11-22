@@ -4,6 +4,7 @@ Endpoints marked VERIFIED were exercised against the live 4.1.2 instance.
 The others are the documented shape but were not tested — if a deploy or env
 injection misbehaves, check these first against /docs in a browser.
 """
+import asyncio
 import base64
 import json
 import httpx
@@ -26,9 +27,42 @@ def _client() -> httpx.AsyncClient:
     )
 
 
+# Coolify throttles its API: `config/api.php` reads
+# `'rate_limit' => env('API_RATE_LIMIT', 200)`, i.e. 200 requests per minute per
+# token, and every response carries `x-ratelimit-limit: 200` /
+# `x-ratelimit-remaining` (read off the live 4.7.6 instance, 2026-11-22). On
+# 2026-11-21 nine `apps_env_set` calls on gepetel answered 500 within two minutes,
+# every one `POST /applications/<uuid>/envs -> 429`, because each set re-pushed the
+# app's whole env. sync_env no longer does that (see apply_envs), but a shared
+# env_set still walks every app, so a burst must SLOW DOWN rather than fail: wait
+# for the limiter and retry a few times. Capped, because this holds an app lock
+# and an MCP call open while it waits, and a limit that is still exhausted after
+# a minute is a real failure to report, not one to sit on.
+_RETRY_429 = 3
+_RETRY_WAIT_DEFAULT = 5.0
+_RETRY_WAIT_MAX = 30.0
+_sleep = asyncio.sleep  # indirection so tests can count waits without taking them
+
+
+def _retry_after(r: httpx.Response) -> float:
+    """Seconds Coolify (Laravel's throttle) asks us to wait, capped."""
+    raw = r.headers.get("retry-after")
+    try:
+        wait = float(raw) if raw is not None else _RETRY_WAIT_DEFAULT
+    except ValueError:
+        wait = _RETRY_WAIT_DEFAULT
+    return max(0.0, min(wait, _RETRY_WAIT_MAX))
+
+
 async def _request(method: str, path: str, **kw) -> dict | list | None:
-    async with _client() as c:
-        r = await c.request(method, path, **kw)
+    attempt = 0
+    while True:
+        async with _client() as c:
+            r = await c.request(method, path, **kw)
+        if r.status_code != 429 or attempt >= _RETRY_429:
+            break
+        attempt += 1
+        await _sleep(_retry_after(r))
     if r.status_code >= 400:
         raise CoolifyError(f"{method} {path} -> {r.status_code}: {r.text[:400]}")
     if not r.content:
@@ -140,9 +174,8 @@ async def set_image(uuid: str, image: str) -> None:
 
 
 async def set_env(uuid: str, key: str, value: str) -> None:
-    """UNVERIFIED shape. Tries create, falls back to update on conflict. Note the
-    self-deploy did NOT exercise this — paas-api has no env vars and no database,
-    so sync_env's loop was empty. The first real env_set is still the test."""
+    """Create a variable, falling back to update on conflict. Two calls for a key
+    that exists, so prefer apply_envs for anything more than one key."""
     body = {"key": key, "value": value, "is_preview": False}
     try:
         await _request("POST", f"/applications/{uuid}/envs", json=body)
@@ -154,9 +187,44 @@ async def set_env(uuid: str, key: str, value: str) -> None:
 
 
 async def list_envs(uuid: str) -> list[dict]:
-    """UNVERIFIED shape. Each item carries at least 'uuid', 'key' and 'value'."""
+    """VERIFIED 2026-11-22 against 4.7.6 (gepetel, 27 vars -> 56 rows). Each row
+    carries `uuid`, `key`, `value`, `real_value`, `is_preview` and a dozen flags.
+    `value` is the plaintext as last written (it matched `app_env`/`shared_env`
+    for all 27 production rows). Every key appears TWICE: a production row and an
+    `is_preview: true` twin, and the twins DRIFT — four of gepetel's held a value
+    that matched nothing in the registry. So anything comparing against this must
+    look at production rows only."""
     data = await _request("GET", f"/applications/{uuid}/envs")
     return data if isinstance(data, list) else []
+
+
+async def apply_envs(uuid: str, env: dict[str, str]) -> dict:
+    """Make Coolify's production env hold `env`, touching only what differs.
+
+    One GET, then a POST for each key Coolify does not have and a PATCH for each
+    whose value differs; an unchanged key costs nothing. The old shape posted
+    every key and PATCHed on the 409, so one changed key on a 27-var app cost
+    ~54 requests and four sets in a minute crossed the 200/min limit. Keys NOT in
+    `env` are left alone, exactly as before — removals go through delete_env.
+
+    Returns {"created": [...], "updated": [...], "unchanged": n}, key names only.
+    """
+    current = {e.get("key"): e.get("value") for e in await list_envs(uuid)
+               if not e.get("is_preview")}
+    created, updated, unchanged = [], [], 0
+    for key, value in env.items():
+        if key not in current:
+            # set_env keeps the PATCH-on-409 fallback, which covers a row that
+            # appeared between the list and the POST.
+            await set_env(uuid, key, value)
+            created.append(key)
+        elif current[key] != value:
+            await _request("PATCH", f"/applications/{uuid}/envs",
+                           json={"key": key, "value": value, "is_preview": False})
+            updated.append(key)
+        else:
+            unchanged += 1
+    return {"created": created, "updated": updated, "unchanged": unchanged}
 
 
 async def delete_env(uuid: str, key: str) -> None:

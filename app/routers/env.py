@@ -63,18 +63,71 @@ class EnvValue(BaseModel):
 _WITH_CONTAINER = "coolify_uuid IS NOT NULL"
 
 
+class _PushFailed(Exception):
+    """The registry was written, but Coolify refused the push or the redeploy.
+
+    Carries which half failed, because the two leave different states: a failed
+    sync means Coolify's config is behind the registry, a failed deploy means
+    the config is right and only the running container is behind."""
+
+    def __init__(self, app_id: str, stage: str, err: Exception):
+        super().__init__(f"{app_id}: {stage}: {err}")
+        self.app_id, self.stage, self.err = app_id, stage, err
+
+
 async def _apply(conn, row, redeploy: bool) -> None:
     """Recompose one app's full environment in Coolify, then optionally deploy.
 
     Serialised per app: an env change redeploys, and two overlapping Coolify
     deploys of one app fight rather than queue."""
     async with app_lock(row["id"]):
-        await envs.sync_env(conn, row["coolify_uuid"], row["id"], row["db_engine"],
-                            row["db_user"], row["db_password"], row["db_name"])
+        try:
+            await envs.sync_env(conn, row["coolify_uuid"], row["id"], row["db_engine"],
+                                row["db_user"], row["db_password"], row["db_name"])
+        except coolify.CoolifyError as e:
+            raise _PushFailed(row["id"], "push", e) from e
         if redeploy:
-            await coolify.deploy(
-                row["coolify_uuid"], app_id=row["id"],
-                reason="environment variables changed")
+            try:
+                await coolify.deploy(
+                    row["coolify_uuid"], app_id=row["id"],
+                    reason="environment variables changed")
+            except coolify.CoolifyError as e:
+                raise _PushFailed(row["id"], "redeploy", e) from e
+
+
+def _stored_but(what: str, failures: list[_PushFailed], done: list[str]) -> HTTPException:
+    """A 502 that says the write landed, so a caller does not retry it as lost.
+
+    Every route here writes the registry BEFORE talking to Coolify, so by the
+    time Coolify fails the change is already stored and will reach the app on
+    its next sync (any later env change, or the next image deploy, which syncs
+    before it deploys). A bare 500 hid that and invited a tight retry loop —
+    which, against a rate limit, is the one thing that keeps it failing. Same
+    rule as apps_detach_db's 502: a partial success must not read as a failure.
+    """
+    pushed = [f.app_id for f in failures if f.stage == "redeploy"]
+    unpushed = [f.app_id for f in failures if f.stage == "push"]
+    undeleted = [f.app_id for f in failures if f.stage == "delete"]
+    parts = [f"{what} was stored"]
+    if done:
+        parts.append(f"applied to {', '.join(done)}")
+    if undeleted:
+        # A sync only ever adds and updates, so nothing later will finish
+        # this — and a plain retry 404s, because the registry row is gone.
+        parts.append(f"but NOT removed from the Coolify config of "
+                     f"{', '.join(undeleted)}, and no later sync will remove it — "
+                     "to finish, set the variable again and then delete it again")
+    if unpushed:
+        parts.append(f"NOT yet pushed to {', '.join(unpushed)} — it will be on the "
+                     "next env change or image deploy, or set it again once the limit "
+                     "clears (a re-set writes only what differs)")
+    if pushed:
+        parts.append(f"pushed to {', '.join(pushed)} but the redeploy failed, so the "
+                     "running container is behind — set it again to redeploy")
+    errs = "; ".join(f"{f.app_id}: {f.err}" for f in failures)
+    return HTTPException(502, "; ".join(parts) + f". Coolify said: {errs}. "
+                              "Do not retry in a tight loop: if this was a 429, "
+                              "Coolify allows 200 requests a minute.")
 
 
 # --- shared: env_* ---------------------------------------------------------
@@ -119,8 +172,17 @@ async def env_set(key: str, body: EnvValue):
             key, body.value)
         apps = await c.fetch(
             f"SELECT {_APP_COLS} FROM apps WHERE {_WITH_CONTAINER} ORDER BY id")
+        done, failed = [], []
         for app in apps:
-            await _apply(c, app, body.redeploy)
+            # Keep going: the value is stored for every app already, and one
+            # app's Coolify failure is no reason to leave the rest unpushed.
+            try:
+                await _apply(c, app, body.redeploy)
+                done.append(app["id"])
+            except _PushFailed as f:
+                failed.append(f)
+    if failed:
+        raise _stored_but(f"shared variable {key}", failed, done)
 
     return {"key": key, "preview": envs.mask(body.value),
             "applied_to": [a["id"] for a in apps],
@@ -141,11 +203,21 @@ async def env_delete(key: str, redeploy: bool = True):
             raise HTTPException(404, "no such shared variable")
         apps = await c.fetch(
             f"SELECT {_APP_COLS} FROM apps WHERE {_WITH_CONTAINER} ORDER BY id")
+        done, failed = [], []
         for app in apps:
             # Drop it, then re-sync: an app with its own override gets that value
             # back, an app without one is left without the key.
-            await coolify.delete_env(app["coolify_uuid"], key)
-            await _apply(c, app, redeploy)
+            try:
+                try:
+                    await coolify.delete_env(app["coolify_uuid"], key)
+                except coolify.CoolifyError as e:
+                    raise _PushFailed(app["id"], "delete", e) from e
+                await _apply(c, app, redeploy)
+                done.append(app["id"])
+            except _PushFailed as f:
+                failed.append(f)
+    if failed:
+        raise _stored_but(f"removal of shared variable {key}", failed, done)
 
     return {"key": key, "removed_from": [a["id"] for a in apps],
             "redeployed": redeploy and bool(apps)}
@@ -233,7 +305,10 @@ async def apps_env_set(app_id: str, key: str, body: EnvValue):
             return {"app_id": app_id, "key": key,
                     "preview": envs.mask(body.value), "staged": True,
                     "redeployed": False, "note": _staged_note(row)}
-        await _apply(c, row, body.redeploy)
+        try:
+            await _apply(c, row, body.redeploy)
+        except _PushFailed as f:
+            raise _stored_but(f"{key} on {app_id}", [f], [])
 
     return {"app_id": app_id, "key": key, "preview": envs.mask(body.value),
             "staged": False, "redeployed": body.redeploy}
@@ -266,8 +341,14 @@ async def apps_env_delete(app_id: str, key: str, redeploy: bool = True):
                     "note": "removed before this app had a container, so it was "
                             "never pushed anywhere"}
         # Drop it, then re-sync so a shared default of the same name comes back.
-        await coolify.delete_env(row["coolify_uuid"], key)
-        await _apply(c, row, redeploy)
+        try:
+            try:
+                await coolify.delete_env(row["coolify_uuid"], key)
+            except coolify.CoolifyError as e:
+                raise _PushFailed(app_id, "delete", e) from e
+            await _apply(c, row, redeploy)
+        except _PushFailed as f:
+            raise _stored_but(f"removal of {key} from {app_id}", [f], [])
 
     return {"app_id": app_id, "key": key, "staged": False,
             "redeployed": redeploy}
