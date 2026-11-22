@@ -82,18 +82,19 @@ async def internal_urls(conn) -> dict[str, str]:
 
 
 async def sync_env(conn, uuid: str, app_id: str, db_engine, db_user,
-                   db_password, db_name) -> None:
+                   db_password, db_name) -> dict:
     """Push an app's full desired env into Coolify: every shared/app variable,
     plus a freshly composed DATABASE_URL when the app has a database, plus the
-    address of every internal service. Idempotent — it upserts, so calling it on
-    every deploy keeps the container's env in step with the registry. It does
-    not deploy; the caller decides when to."""
-    for key, value in (await desired_env(conn, app_id)).items():
-        await coolify.set_env(uuid, key, value)
+    address of every internal service. Idempotent, and cheap when nothing
+    changed: coolify.apply_envs reads Coolify's env once and writes only the keys
+    that differ, so a one-key change is ~2 Coolify requests, not two per key.
+    It does not deploy; the caller decides when to. Returns apply_envs' summary.
+    """
+    env = dict(await desired_env(conn, app_id))
     if db_engine:
-        url = await provision.compose_url(db_engine, db_user, db_password, db_name)
-        await coolify.set_env(uuid, "DATABASE_URL", url)
+        env["DATABASE_URL"] = await provision.compose_url(
+            db_engine, db_user, db_password, db_name)
     # Last, so they win. A user variable of the same name cannot shadow a
     # platform-managed address into pointing somewhere else.
-    for key, value in (await internal_urls(conn)).items():
-        await coolify.set_env(uuid, key, value)
+    env.update(await internal_urls(conn))
+    return await coolify.apply_envs(uuid, env)
